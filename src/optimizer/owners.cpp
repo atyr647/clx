@@ -266,6 +266,7 @@ void pass_name_scans(const ASTContext &ctx, AnalysisState &state, PassScratch &s
 
 //------------------ pass_local_hygiene: goto-crossed locals, definite-table locals, dead literal tables
 void pass_local_hygiene(const ASTContext &ctx, AnalysisState &state, uint32_t root_node) {
+    state.goto_crossed_locals.clear();
     //------------------ Goto-crossed locals: a goto can skip the initializer, so later uses cannot trust it; exclude from table_typed_locals.
     std::set<std::string_view> goto_crossed;
     {
@@ -290,9 +291,12 @@ void pass_local_hygiene(const ASTContext &ctx, AnalysisState &state, uint32_t ro
                 if (after_goto && sn.type == NodeType::LocalDecl) {
                     for (uint32_t j = 0; j < sn.as.local_decl.ident_count; ++j) {
                         uint32_t idi = ctx.block_statements[sn.as.local_decl.first_ident + j];
-                        if (ctx.nodes[idi].type == NodeType::Identifier)
+                        if (ctx.nodes[idi].type == NodeType::Identifier) {
                             goto_crossed.insert(
                                 std::string_view(ctx.nodes[idi].as.ident.name, ctx.nodes[idi].as.ident.length));
+                            state.goto_crossed_locals.insert(
+                                std::string_view(ctx.nodes[idi].as.ident.name, ctx.nodes[idi].as.ident.length));
+                        }
                     }
                 }
                 if (sn.type == NodeType::Block)

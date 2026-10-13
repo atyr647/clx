@@ -104,6 +104,11 @@ inline bool yields_number(const ASTContext &ctx, const AnalysisState &state, uin
 
         if (tbl_idx < ctx.nodes.size() && ctx.nodes[tbl_idx].type == NodeType::Identifier) {
             std::string_view tn(ctx.nodes[tbl_idx].as.ident.name, ctx.nodes[tbl_idx].as.ident.length);
+            FieldKind _sfk = struct_field_kind(ctx, state, node_idx);
+            if (_sfk == FieldKind::Int || _sfk == FieldKind::Double) {
+                result = true;
+                goto done;
+            }
             if (state.pure_numeric_arrays.count(tn)) {
 
                 result

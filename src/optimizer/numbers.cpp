@@ -29,6 +29,7 @@ void pass_constants_and_bounds(const ASTContext &ctx, AnalysisState &state, Pass
     auto &array_bounds = sk.array_bounds;
     auto &loop_limits = sk.loop_limits;
     auto &loop_limit_conflicts = sk.loop_limit_conflicts;
+    auto &param_names = sk.param_names;
     state.constant_upvalues.clear();
     for (const auto &node : ctx.nodes) {
         if (node.type == NodeType::Identifier && node.as.ident.is_captured) {
@@ -244,16 +245,7 @@ void pass_constants_and_bounds(const ASTContext &ctx, AnalysisState &state, Pass
             }
         }
     }
-}
 
-//------------------ pass_numeric_params: numeric parameter detection and native_numbers finalization
-void pass_numeric_params(const ASTContext &ctx, AnalysisState &state, PassScratch &sk, uint32_t root_node) {
-    auto &known_numbers = sk.known_numbers;
-    auto &disqualified = sk.disqualified;
-    auto &param_names = sk.param_names;
-    state.param_numbers.clear();
-
-    std::set<std::string> numeric_params;
     for (const auto &nd : ctx.nodes) {
         if (nd.type == NodeType::FunctionDef) {
             for (size_t p = 0; p < nd.as.func_def.param_count; ++p) {
@@ -265,6 +257,45 @@ void pass_numeric_params(const ASTContext &ctx, AnalysisState &state, PassScratc
             }
         }
     }
+
+    for (uint32_t ni = 0; ni < ctx.nodes.size(); ++ni) {
+        const auto &node = ctx.nodes[ni];
+        if (node.type != NodeType::ForStatement)
+            continue;
+        uint32_t var = node.as.for_stmt.var_ident;
+        if (var >= ctx.nodes.size() || ctx.nodes[var].type != NodeType::Identifier)
+            continue;
+        auto nm = std::string_view(ctx.nodes[var].as.ident.name, ctx.nodes[var].as.ident.length);
+        if (param_names.count(nm))
+            continue;
+        double sd = 0;
+        int64_t si = 0;
+        bool sint = false;
+        bool int_start = is_literal_number(ctx, node.as.for_stmt.start_expr, sd, si, sint) && sint;
+        bool int_step = node.as.for_stmt.step_expr == 0xFFFFFFFF;
+        if (!int_step) {
+            double td = 0;
+            int64_t ti = 0;
+            bool tint = false;
+            int_step = is_literal_number(ctx, node.as.for_stmt.step_expr, td, ti, tint) && tint;
+        }
+        if (int_start && int_step) {
+            std::string s(nm);
+            if (!state.native_integers.count(s))
+                state.native_integers.insert(s);
+            state.for_counter_int.insert(s);
+        }
+    }
+}
+
+//------------------ pass_numeric_params: numeric parameter detection and native_numbers finalization
+void pass_numeric_params(const ASTContext &ctx, AnalysisState &state, PassScratch &sk, uint32_t root_node) {
+    auto &known_numbers = sk.known_numbers;
+    auto &disqualified = sk.disqualified;
+    auto &param_names = sk.param_names;
+    state.param_numbers.clear();
+
+    std::set<std::string> numeric_params;
 
     for (uint32_t node_idx = 0; node_idx < ctx.nodes.size(); ++node_idx) {
         const auto &node = ctx.nodes[node_idx];
@@ -296,37 +327,6 @@ void pass_numeric_params(const ASTContext &ctx, AnalysisState &state, PassScratc
                         state.native_integers.insert(std::string(nm));
                 }
             }
-        }
-    }
-
-    //------------------ integer-typed numeric-for counters: with integer start and step the counter
-
-    for (uint32_t ni = 0; ni < ctx.nodes.size(); ++ni) {
-        const auto &node = ctx.nodes[ni];
-        if (node.type != NodeType::ForStatement)
-            continue;
-        uint32_t var = node.as.for_stmt.var_ident;
-        if (var >= ctx.nodes.size() || ctx.nodes[var].type != NodeType::Identifier)
-            continue;
-        auto nm = std::string_view(ctx.nodes[var].as.ident.name, ctx.nodes[var].as.ident.length);
-        if (param_names.count(nm))
-            continue;
-        double sd = 0;
-        int64_t si = 0;
-        bool sint = false;
-        bool int_start = is_literal_number(ctx, node.as.for_stmt.start_expr, sd, si, sint) && sint;
-        bool int_step = node.as.for_stmt.step_expr == 0xFFFFFFFF;
-        if (!int_step) {
-            double td = 0;
-            int64_t ti = 0;
-            bool tint = false;
-            int_step = is_literal_number(ctx, node.as.for_stmt.step_expr, td, ti, tint) && tint;
-        }
-        if (int_start && int_step) {
-            std::string s(nm);
-            if (!state.native_integers.count(s))
-                state.native_integers.insert(s);
-            state.for_counter_int.insert(s);
         }
     }
 

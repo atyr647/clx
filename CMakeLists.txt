@@ -107,6 +107,9 @@ endif()
 if(EXISTS "${CLX_VENDORED_LUA_DIR}/CMakeLists.txt" AND
    "${CLX_LUA_SOURCES_DIR}" STREQUAL "${CLX_VENDORED_LUA_DIR}/src")
     # Build the in-tree Lua wrapper by default so clx --dynamic can find libclx_lua.a without adding a Lua-VM dependency to the default runtime.
+    if(MSVC)
+        add_compile_options(/utf-8)
+    endif()
     add_subdirectory("${CLX_VENDORED_LUA_DIR}"
                      "${CMAKE_BINARY_DIR}/clx_lua")
 else()
@@ -221,6 +224,7 @@ set(SOURCES
     src/optimizer/numbers.cpp
     src/optimizer/functions.cpp
     src/optimizer/tables.cpp
+    src/optimizer/structs.cpp
     src/codegen/codegen.cpp
     src/codegen/helpers.cpp
     src/codegen/expressions.cpp

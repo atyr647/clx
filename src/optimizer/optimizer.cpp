@@ -180,6 +180,7 @@ void Optimizer::run(const ASTContext &ctx, uint32_t root_node) {
     pass_arena(ctx, state, root_node);
     pass_int_returns_masks(ctx, state, scratch, root_node);
     pass_local_hygiene(ctx, state, root_node);
+    pass_struct_locals(ctx, state, scratch, root_node);
 }
 
 }

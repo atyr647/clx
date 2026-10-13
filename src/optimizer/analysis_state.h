@@ -19,6 +19,25 @@
 
 namespace clx {
 
+//------------------ FieldKind: statically known kind of a promoted struct field value
+enum class FieldKind : uint8_t { Unknown = 0, Int, Double, Str };
+
+//------------------ StructLocal: record local compiled to a native C++ struct — ordered fields with kinds
+struct StructLocal {
+    std::vector<std::string> fields;
+    std::vector<FieldKind> kinds;
+    std::vector<bool> late;
+    uint32_t decl_node = 0xFFFFFFFF;
+};
+
+//------------------ StructShape: one emitted C++ struct type — ordered members shared by same-shaped locals
+struct StructShape {
+    std::string name;
+    std::vector<std::string> fields;
+    std::vector<FieldKind> kinds;
+    std::vector<bool> late;
+};
+
 struct AnalysisState {
     //------------------ Whole-program facts discovered by the optimizer
     std::vector<std::string_view> native_numbers;
@@ -48,6 +67,15 @@ struct AnalysisState {
 
     //------------------ Per-function analysis data
     std::map<std::pair<uint32_t, std::string_view>, std::set<std::string_view>> numeric_table_fields;
+    //------------------ struct promotion: locals compiled to native structs instead of LTable
+    //------------------ (key owns its name: candidate vectors are destroyed after the pass)
+    std::map<std::pair<uint32_t, std::string>, StructLocal> struct_locals;
+    //------------------ goto_crossed_locals: locals whose initializer can be skipped by a goto (from pass_local_hygiene)
+    std::set<std::string_view> goto_crossed_locals;
+    //------------------ struct_proven_reads: late-field read nodes with a dominating earlier write
+    std::set<uint32_t> struct_proven_reads;
+    //------------------ struct_shapes: per distinct shape, type name + members for declaration emission
+    std::map<std::string, StructShape> struct_shapes;
     //------------------ zero_index_tables: fresh {__index=0}-metatable locals; fused t[k]=t[k]<op>const skips __index on miss.
     std::set<std::pair<uint32_t, std::string_view>> zero_index_tables;
     //------------------ dead_stmts: single-occurrence literal-only table decls, never observable; codegen drops them.
@@ -97,6 +125,50 @@ struct AnalysisState {
     uint32_t current_func_idx = 0xFFFFFFFF;
 };
 
+//------------------ struct_shape_key: canonical shape key for a struct local's field/kind/late layout
+inline std::string struct_shape_key(const StructLocal& sl)
+{
+    std::string k;
+    for (size_t i = 0; i < sl.fields.size(); ++i) {
+        if (i)
+            k += '|';
+        k += sl.fields[i];
+        k += ':';
+        k += (sl.kinds[i] == FieldKind::Int ? 'i' : (sl.kinds[i] == FieldKind::Double ? 'd' : 's'));
+        if (sl.late[i])
+            k += '+';
+    }
+    return k;
+}
+
+//------------------ struct_field_kind: kind of a `p.f` read for a promoted struct local, else Unknown
+inline FieldKind struct_field_kind(const ASTContext& ctx, const AnalysisState& state, uint32_t node_idx)
+{
+    if (node_idx >= ctx.nodes.size() || ctx.nodes[node_idx].type != NodeType::TableAccess)
+        return FieldKind::Unknown;
+    const auto& ta = ctx.nodes[node_idx].as.table_access;
+    if (ta.table >= ctx.nodes.size() || ctx.nodes[ta.table].type != NodeType::Identifier)
+        return FieldKind::Unknown;
+    if (ta.key >= ctx.nodes.size() || ctx.nodes[ta.key].type != NodeType::String)
+        return FieldKind::Unknown;
+    std::string_view tn(ctx.nodes[ta.table].as.ident.name, ctx.nodes[ta.table].as.ident.length);
+    auto oit = state.node_func_owner.find(node_idx);
+    uint32_t owner = oit != state.node_func_owner.end() ? oit->second : 0xFFFFFFFFu;
+    auto it = state.struct_locals.find({ owner, std::string(tn) });
+    if (it == state.struct_locals.end())
+        return FieldKind::Unknown;
+    std::string_view fn(ctx.nodes[ta.key].as.string.text, ctx.nodes[ta.key].as.string.length);
+    for (size_t i = 0; i < it->second.fields.size(); ++i) {
+        if (it->second.fields[i] == fn) {
+            //------------------ an unproven late read may be nil, so it is not a statically known kind
+            if (it->second.late[i] && !state.struct_proven_reads.count(node_idx))
+                return FieldKind::Unknown;
+            return it->second.kinds[i];
+        }
+    }
+    return FieldKind::Unknown;
+}
+
 //------------------ is_purely_integer_expr: returns true if a node always evaluates to an integer
 inline bool is_purely_integer_expr(const ASTContext& ctx, const AnalysisState& state, uint32_t node_idx)
 {
@@ -127,6 +199,17 @@ inline bool is_purely_integer_expr(const ASTContext& ctx, const AnalysisState& s
         return is_purely_integer_expr(ctx, state, n.as.unary_op.expr);
     if (n.type == NodeType::ParenExpression)
         return is_purely_integer_expr(ctx, state, n.as.paren_expr.expr);
+    if (n.type == NodeType::TableAccess) {
+        if (struct_field_kind(ctx, state, node_idx) == FieldKind::Int)
+            return true;
+        if (ctx.nodes[n.as.table_access.table].type == NodeType::Identifier) {
+            std::string_view an(ctx.nodes[n.as.table_access.table].as.ident.name,
+                ctx.nodes[n.as.table_access.table].as.ident.length);
+            return state.int_numeric_arrays.count(an) > 0
+                && is_purely_integer_expr(ctx, state, n.as.table_access.key);
+        }
+        return false;
+    }
     return false;
 }
 
@@ -185,6 +268,28 @@ inline bool is_integer_typed_expr(const ASTContext& ctx, const AnalysisState& st
         return is_integer_typed_expr(ctx, state, n.as.unary_op.expr);
     if (n.type == NodeType::ParenExpression)
         return is_integer_typed_expr(ctx, state, n.as.paren_expr.expr);
+    if (n.type == NodeType::UnaryOp && n.as.unary_op.op == static_cast<int>(UnaryOp::Len))
+        return true;
+    if (n.type == NodeType::CallExpression) {
+        uint32_t cti = n.as.call_expr.target;
+        if (cti < ctx.nodes.size() && ctx.nodes[cti].type == NodeType::Identifier) {
+            std::string_view fname(ctx.nodes[cti].as.ident.name, ctx.nodes[cti].as.ident.length);
+            if (state.int_returning_funcs.count(fname))
+                return true;
+        }
+        return false;
+    }
+    if (n.type == NodeType::TableAccess) {
+        if (struct_field_kind(ctx, state, node_idx) == FieldKind::Int)
+            return true;
+        if (ctx.nodes[n.as.table_access.table].type == NodeType::Identifier) {
+            std::string_view an(ctx.nodes[n.as.table_access.table].as.ident.name,
+                ctx.nodes[n.as.table_access.table].as.ident.length);
+            return state.int_numeric_arrays.count(an) > 0
+                && is_integer_typed_expr(ctx, state, n.as.table_access.key);
+        }
+        return false;
+    }
     return false;
 }
 

@@ -312,6 +312,9 @@ void CodeEmitter::emit(uint32_t root_node, std::string_view module_name) {
     state.hoisted_locals.clear();
     state.pure_numeric_arrays.clear();
     state.numeric_table_fields.clear();
+    state.struct_locals.clear();
+    state.struct_proven_reads.clear();
+    state.struct_shapes.clear();
     state.native_integers.clear();
     state.emit_raw_lambda = false;
     state.emit_fast_lambda = false;
@@ -486,6 +489,24 @@ void CodeEmitter::emit(uint32_t root_node, std::string_view module_name) {
         out << "static clx::LValue cstr_[" << state.string_pool.size() << "];\n";
     }
     out << "static inline clx::LValue clx_gettable_safe(clx::LValue val) { return val; }\n\n";
+
+    for (const auto &_sskv : state.struct_shapes) {
+        const StructShape &_ss = _sskv.second;
+        out << "struct " << _ss.name << " {";
+        for (size_t _si = 0; _si < _ss.fields.size(); ++_si) {
+            if (_ss.kinds[_si] == FieldKind::Int)
+                out << " int64_t " << _ss.fields[_si] << ";";
+            else if (_ss.kinds[_si] == FieldKind::Double)
+                out << " double " << _ss.fields[_si] << ";";
+            else
+                out << " const clx::LValue* " << _ss.fields[_si] << ";";
+            if (_ss.late[_si])
+                out << " bool has_" << _ss.fields[_si] << ";";
+        }
+        out << " };\n";
+    }
+    if (!state.struct_shapes.empty())
+        out << "\n";
 
     out << "CLX_API clx::LValue luaopen_" << module_name << "(clx::LState* L) {\n";
     out << "    clx::LValue _ENV(clx::ValueType::Table, L->_G);\n";

@@ -294,17 +294,17 @@ static MultiValue math_randomseed(LState* L, const LValue* args, size_t count)
     return MultiValue({ clx::integer(x), clx::integer(y) });
 }
 
-//------------------ math_type: returns "integer" or "float" for a number
+//------------------ math_type: returns "integer"/"float" for numbers, nil for any other value (1 value, never 0)
 static MultiValue math_type(LState* L, const LValue* args, size_t count)
 {
     if (count == 0)
-        return MultiValue();
+        clx::error(L, "bad argument #1 to 'type' (value expected)");
     ValueType t = args[0].type;
     if (t == Int64)
         return MultiValue(LValue(L->intern_string("integer")));
     if (t == Double)
         return MultiValue(LValue(L->intern_string("float")));
-    return MultiValue();
+    return MultiValue(LValue());
 }
 
 //------------------ math_ult: unsigned less-than comparison of integers

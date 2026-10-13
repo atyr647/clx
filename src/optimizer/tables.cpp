@@ -968,24 +968,24 @@ void pass_array_safety(const ASTContext &ctx, AnalysisState &state, PassScratch 
                         self(self, ctx.block_statements[n.as.assign.first_value + vi]);
                     return;
                 }
-                if (n.type == NodeType::LocalDecl || n.type == NodeType::GlobalDeclStatement) {
-                    uint32_t v_count
-                        = (n.type == NodeType::LocalDecl) ? n.as.local_decl.value_count : n.as.global_decl.value_count;
-                    for (uint32_t vi = 0; vi < v_count; ++vi) {
-                        uint32_t v = (n.type == NodeType::LocalDecl)
-                            ? ctx.block_statements[n.as.local_decl.first_value + vi]
-                            : ctx.block_statements[n.as.global_decl.first_value + vi];
-                        self(self, v);
-                    }
-                    return;
+            if (n.type == NodeType::LocalDecl || n.type == NodeType::GlobalDeclStatement) {
+                uint32_t v_count
+                    = (n.type == NodeType::LocalDecl) ? n.as.local_decl.value_count : n.as.global_decl.value_count;
+                for (uint32_t vi = 0; vi < v_count; ++vi) {
+                    uint32_t v = (n.type == NodeType::LocalDecl)
+                        ? ctx.block_statements[n.as.local_decl.first_value + vi]
+                        : ctx.block_statements[n.as.global_decl.first_value + vi];
+                    self(self, v);
                 }
-                if (n.type == NodeType::ReturnStatement) {
-                    for (uint32_t vi = 0; vi < n.as.return_stmt.value_count; ++vi)
-                        self(self, ctx.block_statements[n.as.return_stmt.first_value + vi]);
-                    return;
-                }
-                if (n.type == NodeType::IfStatement) {
-                    self(self, n.as.if_stmt.condition);
+                return;
+            }
+            if (n.type == NodeType::ReturnStatement) {
+                for (uint32_t vi = 0; vi < n.as.return_stmt.value_count; ++vi)
+                    self(self, ctx.block_statements[n.as.return_stmt.first_value + vi]);
+                return;
+            }
+            if (n.type == NodeType::IfStatement) {
+                self(self, n.as.if_stmt.condition);
                     if (n.as.if_stmt.then_block != 0xFFFFFFFF)
                         self(self, n.as.if_stmt.then_block);
                     if (n.as.if_stmt.else_block != 0xFFFFFFFF)
@@ -1073,6 +1073,17 @@ void pass_array_safety(const ASTContext &ctx, AnalysisState &state, PassScratch 
         for (const auto &nm : state.pure_numeric_arrays)
             int_arrays.insert(nm);
         std::set<std::string_view> violate_int;
+        auto ctor_violates_int = [&](uint32_t ctor) -> bool {
+            if (ctor == 0xFFFFFFFF || ctor >= ctx.nodes.size() || ctx.nodes[ctor].type != NodeType::TableConstructor)
+                return false;
+            const auto &cn = ctx.nodes[ctor];
+            for (uint32_t ei = 0; ei < cn.as.table_cons.count; ++ei) {
+                uint32_t vi = ctx.block_statements[cn.as.table_cons.first_item + ei * 2 + 1];
+                if (vi == 0xFFFFFFFF || !is_purely_integer_expr(ctx, state, vi))
+                    return true;
+            }
+            return false;
+        };
         auto walk_int = [&](auto &self, uint32_t idx) -> void {
             if (idx == 0xFFFFFFFF || idx >= ctx.nodes.size() || violate_int.size() == int_arrays.size())
                 return;
@@ -1092,6 +1103,12 @@ void pass_array_safety(const ASTContext &ctx, AnalysisState &state, PassScratch 
                                     violate_int.insert(tn);
                             }
                         }
+                    } else if (t < ctx.nodes.size() && ctx.nodes[t].type == NodeType::Identifier
+                        && n.as.assign.value_count == 1) {
+                        std::string_view tn(ctx.nodes[t].as.ident.name, ctx.nodes[t].as.ident.length);
+                        uint32_t v = ctx.block_statements[n.as.assign.first_value];
+                        if (int_arrays.count(tn) && !violate_int.count(tn) && ctor_violates_int(v))
+                            violate_int.insert(tn);
                     }
                 }
                 for (uint32_t vi = 0; vi < n.as.assign.value_count; ++vi)
@@ -1110,10 +1127,23 @@ void pass_array_safety(const ASTContext &ctx, AnalysisState &state, PassScratch 
             if (n.type == NodeType::LocalDecl || n.type == NodeType::GlobalDeclStatement) {
                 uint32_t v_count
                     = (n.type == NodeType::LocalDecl) ? n.as.local_decl.value_count : n.as.global_decl.value_count;
+                uint32_t id_count
+                    = (n.type == NodeType::LocalDecl) ? n.as.local_decl.ident_count : n.as.global_decl.ident_count;
                 for (uint32_t vi = 0; vi < v_count; ++vi) {
                     uint32_t v = (n.type == NodeType::LocalDecl)
                         ? ctx.block_statements[n.as.local_decl.first_value + vi]
                         : ctx.block_statements[n.as.global_decl.first_value + vi];
+                    if (vi < id_count) {
+                        uint32_t idi = ctx.block_statements[((n.type == NodeType::LocalDecl)
+                                                                ? n.as.local_decl.first_ident
+                                                                : n.as.global_decl.first_ident)
+                            + vi];
+                        if (idi < ctx.nodes.size() && ctx.nodes[idi].type == NodeType::Identifier) {
+                            std::string_view nm(ctx.nodes[idi].as.ident.name, ctx.nodes[idi].as.ident.length);
+                            if (int_arrays.count(nm) && !violate_int.count(nm) && ctor_violates_int(v))
+                                violate_int.insert(nm);
+                        }
+                    }
                     self(self, v);
                 }
                 return;
@@ -1196,6 +1226,44 @@ void pass_array_safety(const ASTContext &ctx, AnalysisState &state, PassScratch 
             int_arrays.erase(tn);
         for (const auto &nm : int_arrays)
             state.int_numeric_arrays.insert(nm);
+    }
+}
+
+//------------------ write_stores_non_number: true if an assignment value statically must hold a
+//------------------ non-number (declared above the drop scan that uses it; see comment there)
+static bool write_stores_non_number(const ASTContext &ctx, uint32_t node_idx, int depth = 0)
+{
+    if (depth > 32 || node_idx == 0xFFFFFFFF || node_idx >= ctx.nodes.size())
+        return false;
+    const auto &n = ctx.nodes[node_idx];
+    switch (n.type) {
+    case NodeType::String:
+    case NodeType::TrueLiteral:
+    case NodeType::FalseLiteral:
+    case NodeType::NilLiteral:
+    case NodeType::TableConstructor:
+    case NodeType::FunctionDef:
+        return true;
+    case NodeType::ParenExpression:
+        return write_stores_non_number(ctx, n.as.paren_expr.expr, depth + 1);
+    case NodeType::UnaryOp:
+        if (n.as.unary_op.op == static_cast<int>(UnaryOp::Not))
+            return true;
+        return false;
+    case NodeType::BinaryOp: {
+        int op = n.as.bin_op.op;
+        if (op == static_cast<int>(BinaryOp::Concat) || op == static_cast<int>(BinaryOp::Eq)
+            || op == static_cast<int>(BinaryOp::Ne) || op == static_cast<int>(BinaryOp::Lt)
+            || op == static_cast<int>(BinaryOp::Le) || op == static_cast<int>(BinaryOp::Gt)
+            || op == static_cast<int>(BinaryOp::Ge))
+            return true;
+        if (op == static_cast<int>(BinaryOp::And) || op == static_cast<int>(BinaryOp::Or))
+            return write_stores_non_number(ctx, n.as.bin_op.left, depth + 1)
+                || write_stores_non_number(ctx, n.as.bin_op.right, depth + 1);
+        return false;
+    }
+    default:
+        return false;
     }
 }
 
@@ -1629,6 +1697,72 @@ void pass_table_fields(const ASTContext &ctx, AnalysisState &state, PassScratch 
                 bool ln_reassigned = rit_c2 != reassigned_names.end() && rit_c2->second.count(ln);
                 if (!ln_reassigned && !state.numeric_table_fields.count({ nd_idx, ln })) {
                     state.numeric_table_fields[{ nd_idx, ln }] = it->second;
+                }
+            }
+        }
+    }
+    //------------------ drop a field from numeric_table_fields when any write to it stores a provable
+    //------------------ non-number: the native read path would otherwise swallow string/nil writes
+    //------------------ (as_number() maps strings to 0.0) instead of erroring like Lua.
+    //------------------ Over-dropping from name collisions is only conservative (generic path = Lua semantics).
+    {
+        std::set<std::string_view> captured_entry_names;
+        for (const auto &node : ctx.nodes) {
+            if (node.type != NodeType::LocalDecl)
+                continue;
+            for (uint32_t ii = 0; ii < node.as.local_decl.ident_count; ++ii) {
+                uint32_t idi = ctx.block_statements[node.as.local_decl.first_ident + ii];
+                if (idi >= ctx.nodes.size() || ctx.nodes[idi].type != NodeType::Identifier)
+                    continue;
+                if (!ctx.nodes[idi].as.ident.is_captured)
+                    continue;
+                std::string_view cn(ctx.nodes[idi].as.ident.name, ctx.nodes[idi].as.ident.length);
+                if (state.numeric_table_fields.count({ owner_of_node(state, idi), cn }))
+                    captured_entry_names.insert(cn);
+            }
+        }
+        auto drop_field = [&](uint32_t owner, std::string_view nm, std::string_view fld) {
+            auto it = state.numeric_table_fields.find({ owner, nm });
+            if (it != state.numeric_table_fields.end()) {
+                it->second.erase(fld);
+                if (it->second.empty())
+                    state.numeric_table_fields.erase(it);
+            }
+        };
+        for (const auto &node : ctx.nodes) {
+            if (node.type != NodeType::Assignment)
+                continue;
+            for (uint32_t ti = 0; ti < node.as.assign.target_count; ++ti) {
+                uint32_t tgt = ctx.block_statements[node.as.assign.first_target + ti];
+                if (tgt >= ctx.nodes.size() || ctx.nodes[tgt].type != NodeType::TableAccess)
+                    continue;
+                uint32_t t_tbl = ctx.nodes[tgt].as.table_access.table;
+                uint32_t t_key = ctx.nodes[tgt].as.table_access.key;
+                if (t_tbl >= ctx.nodes.size() || ctx.nodes[t_tbl].type != NodeType::Identifier)
+                    continue;
+                if (ctx.nodes[t_tbl].as.ident.is_global)
+                    continue;
+                if (t_key >= ctx.nodes.size() || ctx.nodes[t_key].type != NodeType::String)
+                    continue;
+                uint32_t vi = (ti < node.as.assign.value_count)
+                    ? ctx.block_statements[node.as.assign.first_value + ti]
+                    : 0xFFFFFFFF;
+                if (vi != 0xFFFFFFFF && !write_stores_non_number(ctx, vi))
+                    continue;
+                std::string_view nm(ctx.nodes[t_tbl].as.ident.name, ctx.nodes[t_tbl].as.ident.length);
+                std::string_view fld(ctx.nodes[t_key].as.string.text, ctx.nodes[t_key].as.string.length);
+                drop_field(owner_of_node(state, tgt), nm, fld);
+                if (captured_entry_names.count(nm)) {
+                    for (auto eit = state.numeric_table_fields.begin(); eit != state.numeric_table_fields.end();) {
+                        if (eit->first.second == nm) {
+                            eit->second.erase(fld);
+                            if (eit->second.empty()) {
+                                eit = state.numeric_table_fields.erase(eit);
+                                continue;
+                            }
+                        }
+                        ++eit;
+                    }
                 }
             }
         }

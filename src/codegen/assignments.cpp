@@ -94,6 +94,49 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
             last_is_call = true;
     }
 
+    if (is_local && t_count == 1 && v_count == 1) {
+        uint32_t _dt = ctx.block_statements[first_t];
+        uint32_t _dv = ctx.block_statements[first_v];
+        if (_dt < ctx.nodes.size() && ctx.nodes[_dt].type == NodeType::Identifier
+            && !ctx.nodes[_dt].as.ident.is_global && _dv < ctx.nodes.size()
+            && ctx.nodes[_dv].type == NodeType::TableConstructor) {
+            std::string_view _dn(ctx.nodes[_dt].as.ident.name, ctx.nodes[_dt].as.ident.length);
+            auto _dsit = state.struct_locals.find({ owner_of_node(state, node_idx), std::string(_dn) });
+            if (_dsit != state.struct_locals.end()) {
+                const StructLocal &_sl = _dsit->second;
+                auto _ssit = state.struct_shapes.find(struct_shape_key(_sl));
+                if (_ssit != state.struct_shapes.end()) {
+                    const auto &_tcx = ctx.nodes[_dv].as.table_cons;
+                    out << _ssit->second.name << " l_" << _dn << "{";
+                    bool _firsti = true;
+                    for (size_t _k = 0; _k < _sl.fields.size() && !_sl.late[_k]; ++_k) {
+                        uint32_t _vv = ctx.block_statements[_tcx.first_item + _k * 2 + 1];
+                        if (!_firsti)
+                            out << ", ";
+                        _firsti = false;
+                        if (_sl.kinds[_k] == FieldKind::Str) {
+                            out << "&cstr_["
+                                << state.string_pool_index.at(std::string_view(ctx.nodes[_vv].as.string.text,
+                                       ctx.nodes[_vv].as.string.length))
+                                << "]";
+                        } else if (_sl.kinds[_k] == FieldKind::Int) {
+                            out << "static_cast<int64_t>(";
+                            emit_native(_vv);
+                            out << ")";
+                        } else {
+                            out << "static_cast<double>(";
+                            emit_native(_vv);
+                            out << ")";
+                        }
+                    }
+                    out << "};\n";
+                    locals.push_back({ _dn, false });
+                    return;
+                }
+            }
+        }
+    }
+
     bool is_single_native = false;
     std::string_view single_name;
     if (t_count == 1 && !last_is_call) {
@@ -936,6 +979,40 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                     ctx.nodes[t_node.as.table_access.table].as.ident.length);
             }
 
+            if (!t_name.empty() && v_count > 0 && t_node.as.table_access.key < ctx.nodes.size()
+                && ctx.nodes[t_node.as.table_access.key].type == NodeType::String) {
+                auto _wsit = state.struct_locals.find({ owner_of_node(state, node_idx), std::string(t_name) });
+                if (_wsit != state.struct_locals.end()) {
+                    const StructLocal &_sl = _wsit->second;
+                    std::string_view _fk(ctx.nodes[t_node.as.table_access.key].as.string.text,
+                        ctx.nodes[t_node.as.table_access.key].as.string.length);
+                    for (size_t _fi = 0; _fi < _sl.fields.size(); ++_fi) {
+                        if (_sl.fields[_fi] != _fk)
+                            continue;
+                        uint32_t _wv = ctx.block_statements[first_v];
+                        out << "l_" << t_name << "." << _sl.fields[_fi] << " = ";
+                        if (_sl.kinds[_fi] == FieldKind::Str) {
+                            out << "&cstr_["
+                                << state.string_pool_index.at(std::string_view(ctx.nodes[_wv].as.string.text,
+                                       ctx.nodes[_wv].as.string.length))
+                                << "]";
+                        } else if (_sl.kinds[_fi] == FieldKind::Int) {
+                            out << "static_cast<int64_t>(";
+                            emit_native(_wv);
+                            out << ")";
+                        } else {
+                            out << "static_cast<double>(";
+                            emit_native(_wv);
+                            out << ")";
+                        }
+                        out << ";\n";
+                        if (_sl.late[_fi])
+                            out << "l_" << t_name << ".has_" << _sl.fields[_fi] << " = true;\n";
+                        return;
+                    }
+                }
+            }
+
             if (v_count == 1) {
                 uint32_t v_idx = ctx.block_statements[first_v];
                 if (v_idx < ctx.nodes.size() && ctx.nodes[v_idx].type == NodeType::BinaryOp) {
@@ -1641,8 +1718,45 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                     ctx.nodes[t_node.as.table_access.table].as.ident.length);
             }
 
+            bool _struct_done = false;
+            if (!t_name.empty() && i < v_count && t_node.as.table_access.key < ctx.nodes.size()
+                && ctx.nodes[t_node.as.table_access.key].type == NodeType::String) {
+                auto _wsit = state.struct_locals.find({ owner_of_node(state, t_idx), std::string(t_name) });
+                if (_wsit != state.struct_locals.end()) {
+                    const StructLocal &_sl = _wsit->second;
+                    std::string_view _fk(ctx.nodes[t_node.as.table_access.key].as.string.text,
+                        ctx.nodes[t_node.as.table_access.key].as.string.length);
+                    for (size_t _fi = 0; _fi < _sl.fields.size(); ++_fi) {
+                        if (_sl.fields[_fi] != _fk)
+                            continue;
+                        uint32_t _wv = ctx.block_statements[first_v + i];
+                        bool _str_lit = _sl.kinds[_fi] == FieldKind::Str && _wv < ctx.nodes.size()
+                            && ctx.nodes[_wv].type == NodeType::String;
+                        if (_sl.kinds[_fi] == FieldKind::Str && !_str_lit)
+                            break;
+                        out << "l_" << t_name << "." << _sl.fields[_fi] << " = ";
+                        if (_str_lit) {
+                            out << "&cstr_["
+                                << state.string_pool_index.at(std::string_view(ctx.nodes[_wv].as.string.text,
+                                       ctx.nodes[_wv].as.string.length))
+                                << "]";
+                        } else if (_sl.kinds[_fi] == FieldKind::Int) {
+                            out << "(" << val_str << ").as_integer()";
+                        } else {
+                            out << "(" << val_str << ").as_number()";
+                        }
+                        out << ";\n";
+                        if (_sl.late[_fi])
+                            out << "l_" << t_name << ".has_" << _sl.fields[_fi] << " = true;\n";
+                        _struct_done = true;
+                        break;
+                    }
+                }
+            }
+
             std::string _hpt = hoisted_table_ptr(t_node.as.table_access.table);
-            if (!t_name.empty() && state.pure_numeric_arrays.count(t_name)) {
+            if (_struct_done) {
+            } else if (!t_name.empty() && state.pure_numeric_arrays.count(t_name)) {
                 out << "l_" << t_name << "[static_cast<size_t>(";
                 emit_native(t_node.as.table_access.key);
                 out << ") - 1] = " << num_str << ";\n";

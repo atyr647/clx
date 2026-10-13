@@ -247,10 +247,13 @@ CLX_INLINE const void* topointer(const LValue& v)
     return v.as_pointer();
 }
 
-//------------------ Converts string to number
+//------------------ Converts string to number (integer-preserving like stock luaO_str2num)
 CLX_INLINE_HOT LValue stringtonumber(LState* L, const char* s)
 {
     LValue v = string(L, s);
+    int64_t iv;
+    if (to_integer_coerced(v, iv))
+        return integer(iv);
     double d;
     if (v.to_number(d))
         return number(d);

@@ -8,6 +8,7 @@
 #ifndef CLX_RUNTIME_H
 #define CLX_RUNTIME_H
 
+#include <cctype>
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
@@ -2107,6 +2108,53 @@ CLX_INLINE_HOT LValue int_neg_lv(double v, bool is_int) {
     return LValue(-static_cast<int64_t>(v));
 }
 
+//------------------ to_integer_coerced: exact integer coercion (stock l_str2int). Int64 passes
+//------------------ through; strings parse decimal/hex with wrap-on-hex-overflow; Doubles never coerce
+CLX_INLINE bool to_integer_coerced(const LValue &v, int64_t &out) {
+    if (v.type == ValueType::Int64) {
+        out = v.val.payload.i64;
+        return true;
+    }
+    if (v.type != ValueType::String)
+        return false;
+    const char *s = v.as_string();
+    while (std::isspace(static_cast<unsigned char>(*s)))
+        s++;
+    bool neg = false;
+    if (*s == '-') {
+        neg = true;
+        s++;
+    } else if (*s == '+')
+        s++;
+    uint64_t a = 0;
+    bool empty = true;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        s += 2;
+        for (; std::isxdigit(static_cast<unsigned char>(*s)); s++) {
+            char c = static_cast<char>(*s | 0x20);
+            int d = (c >= '0' && c <= '9') ? c - '0' : c - 'a' + 10;
+            a = a * 16 + static_cast<uint64_t>(d);
+            empty = false;
+        }
+    } else {
+        const uint64_t max_by10 = static_cast<uint64_t>(INT64_MAX) / 10;
+        const int max_lastd = static_cast<int>(INT64_MAX % 10);
+        for (; std::isdigit(static_cast<unsigned char>(*s)); s++) {
+            int d = *s - '0';
+            if (a >= max_by10 && (a > max_by10 || d > max_lastd + (neg ? 1 : 0)))
+                return false;
+            a = a * 10 + static_cast<uint64_t>(d);
+            empty = false;
+        }
+    }
+    while (std::isspace(static_cast<unsigned char>(*s)))
+        s++;
+    if (empty || *s != '\0')
+        return false;
+    out = neg ? static_cast<int64_t>(0ull - a) : static_cast<int64_t>(a);
+    return true;
+}
+
 //------------------ Addition with metamethod fallback
 CLX_INLINE_HOT LValue add(LState *L, const LValue &a, const LValue &b) {
     if (a.type == ValueType::Int64 && b.type == ValueType::Int64) [[likely]]
@@ -2117,6 +2165,9 @@ CLX_INLINE_HOT LValue add(LState *L, const LValue &a, const LValue &b) {
         double r = (b.type == ValueType::Int64) ? static_cast<double>(b.val.payload.i64) : b.val.payload.f64;
         return LValue(l + r);
     }
+    int64_t li, ri;
+    if (to_integer_coerced(a, li) && to_integer_coerced(b, ri))
+        return int_add_lv(li, ri);
     double l, r;
     if (a.to_number(l) && b.to_number(r))
         return LValue(l + r);
@@ -2132,6 +2183,9 @@ CLX_INLINE_HOT LValue sub(LState *L, const LValue &a, const LValue &b) {
         double r = (b.type == ValueType::Int64) ? static_cast<double>(b.val.payload.i64) : b.val.payload.f64;
         return LValue(l - r);
     }
+    int64_t li, ri;
+    if (to_integer_coerced(a, li) && to_integer_coerced(b, ri))
+        return int_sub_lv(li, ri);
     double l, r;
     if (a.to_number(l) && b.to_number(r))
         return LValue(l - r);
@@ -2147,6 +2201,9 @@ CLX_INLINE_HOT LValue mul(LState *L, const LValue &a, const LValue &b) {
         double r = (b.type == ValueType::Int64) ? static_cast<double>(b.val.payload.i64) : b.val.payload.f64;
         return LValue(l * r);
     }
+    int64_t li, ri;
+    if (to_integer_coerced(a, li) && to_integer_coerced(b, ri))
+        return int_mul_lv(li, ri);
     double l, r;
     if (a.to_number(l) && b.to_number(r))
         return LValue(l * r);
@@ -2229,14 +2286,29 @@ CLX_INLINE bool flt_to_integer(double d, int64_t &out) {
     return false;
 }
 
-//------------------ Full-parse a numeric string (Lua tonumber/toint semantics).
+//------------------ Full-parse a numeric string (Lua tonumber/toint semantics: l_str2d).
 CLX_INLINE bool parse_num_string(const char *s, double &out) {
-    if (std::strpbrk(s, "nN") != nullptr)
+    const char *pmode = std::strpbrk(s, ".xXnN");
+    char mode = pmode ? static_cast<char>(std::tolower(static_cast<unsigned char>(*pmode))) : 0;
+    if (mode == 'n')
         return false;
+    if (mode == 'x') {
+        const char *p = s;
+        while (std::isspace(static_cast<unsigned char>(*p)))
+            p++;
+        if (*p == '+' || *p == '-')
+            p++;
+        if (!(p[0] == '0' && (p[1] == 'x' || p[1] == 'X')))
+            return false;
+    }
     char *end;
     errno = 0;
     double d = std::strtod(s, &end);
-    if (end == s || *end != '\0')
+    if (end == s)
+        return false;
+    while (std::isspace(static_cast<unsigned char>(*end)))
+        end++;
+    if (*end != '\0')
         return false;
     out = d;
     return true;
@@ -2251,6 +2323,11 @@ CLX_INLINE bool to_integer(const LValue &v, int64_t &out) {
     if (v.type == ValueType::Double)
         return flt_to_integer(v.val.payload.f64, out);
     if (v.type == ValueType::String) {
+        int64_t iv;
+        if (to_integer_coerced(v, iv)) {
+            out = iv;
+            return true;
+        }
         double d;
         if (parse_num_string(v.as_string(), d))
             return flt_to_integer(d, out);
@@ -2425,6 +2502,9 @@ CLX_INLINE LValue mod(LState *L, const LValue &a, const LValue &b) {
         double r = (b.type == ValueType::Int64) ? static_cast<double>(b.val.payload.i64) : b.val.payload.f64;
         return LValue(l - std::floor(l / r) * r);
     }
+    int64_t li, ri;
+    if (to_integer_coerced(a, li) && to_integer_coerced(b, ri))
+        return LValue(int_floor_mod(li, ri));
     double l, r;
     if (a.to_number(l) && b.to_number(r))
         return LValue(l - std::floor(l / r) * r);
@@ -2447,6 +2527,14 @@ CLX_INLINE LValue idiv(LState *L, const LValue &a, const LValue &b) {
         double l = (a.type == ValueType::Int64) ? static_cast<double>(a.val.payload.i64) : a.val.payload.f64;
         double r = (b.type == ValueType::Int64) ? static_cast<double>(b.val.payload.i64) : b.val.payload.f64;
         return LValue(std::floor(l / r));
+    }
+    int64_t li, ri;
+    if (to_integer_coerced(a, li) && to_integer_coerced(b, ri)) {
+        if (ri == 0)
+            return LValue(static_cast<double>(li) / 0.0);
+        if (ri == -1)
+            return LValue(static_cast<int64_t>(-static_cast<uint64_t>(li)));
+        return LValue(li / ri);
     }
     double l, r;
     if (a.to_number(l) && b.to_number(r))
@@ -2478,6 +2566,12 @@ CLX_INLINE LValue unm(LState *L, const LValue &a) {
     }
     if (a.type == ValueType::Double)
         return LValue(-a.val.payload.f64);
+    int64_t iv;
+    if (to_integer_coerced(a, iv)) {
+        if (iv == INT64_MIN)
+            return LValue(iv);
+        return LValue(-iv);
+    }
     double d;
     if (a.to_number(d))
         return LValue(-d);

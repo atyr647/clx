@@ -312,6 +312,9 @@ static MultiValue tonumber(LState* L, const LValue* args, size_t count)
     if (v.type == Double || v.type == Int64)
         return MultiValue(v);
     if (clx::is_string(v)) {
+        int64_t iv;
+        if (clx::to_integer_coerced(v, iv))
+            return MultiValue(clx::integer(iv));
         double d;
         if (v.to_number(d))
             return MultiValue(clx::number(d));

@@ -27,7 +27,7 @@ if "%DIALECT%"=="ClangCL" set ISMSVC=1
 echo Compiling sokol_clx module with %DIALECT%...
 
 if "!ISMSVC!"=="1" (
-    cl.exe /nologo /std:c++20 /MD /O1 /GL /EHsc /Gy /I..\..\include /I.\sokol /c sokol_clx.cpp /Fosokol_clx.obj
+    cl.exe /nologo /std:c++20 /MD /O1 /GL /utf-8 /EHsc /Gy /I..\..\include /I.\sokol /c sokol_clx.cpp /Fosokol_clx.obj
     if errorlevel 1 (
         echo Error: compiling sokol_clx.cpp failed
         exit /b 1

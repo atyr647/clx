@@ -19,8 +19,7 @@
 namespace clx {
 
 //------------------ get_string — extract string arg with bounds/type checking
-static const char* get_string(LState* L, const LValue* args, size_t count, size_t& len, int idx)
-{
+static const char *get_string(LState *L, const LValue *args, size_t count, size_t &len, int idx) {
     if (idx < 1 || idx > (int)count) {
         char buf[128];
         std::snprintf(buf, sizeof(buf), "bad argument #%d to a string function (string expected, got no value)", idx);
@@ -36,29 +35,30 @@ static const char* get_string(LState* L, const LValue* args, size_t count, size_
     return args[idx - 1].as_string();
 }
 
-//------------------ get_integer — extract integer arg with type coercion
-static int64_t get_integer(LState* L, const LValue* args, size_t count, int idx)
-{
+//------------------ get_integer — extract integer arg; errors like stock luaL_checkinteger on lossy floats
+static int64_t get_integer(LState *L, const LValue *args, size_t count, int idx, const char *fname) {
     if (idx < 1 || idx > (int)count) {
         char buf[128];
-        std::snprintf(buf, sizeof(buf), "bad argument #%d to a string function (number expected, got no value)", idx);
+        std::snprintf(buf, sizeof(buf), "bad argument #%d to '%s' (number expected, got no value)", idx, fname);
         throw_runtime_error(buf);
     }
     int64_t i;
     if (to_integer(args[idx - 1], i))
         return i;
     double d;
-    if (args[idx - 1].to_number(d))
-        return (int64_t)d;
+    if (args[idx - 1].to_number(d)) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "bad argument #%d to '%s' (number has no integer representation)", idx, fname);
+        throw_runtime_error(buf);
+    }
     char buf[128];
-    std::snprintf(buf, sizeof(buf), "bad argument #%d to a string function (number expected, got %s)", idx,
+    std::snprintf(buf, sizeof(buf), "bad argument #%d to '%s' (number expected, got %s)", idx, fname,
         args[idx - 1].type == String ? "string" : "table");
     throw_runtime_error(buf);
 }
 
 //------------------ posrelat — convert relative position to absolute (1-based)
-static size_t posrelat(int64_t pos, size_t len)
-{
+static size_t posrelat(int64_t pos, size_t len) {
     if (pos > 0)
         return (size_t)pos;
     else if (pos == 0)
@@ -70,8 +70,7 @@ static size_t posrelat(int64_t pos, size_t len)
 }
 
 //------------------ getendpos — convert relative end position to absolute
-static size_t getendpos(int64_t pos, size_t len)
-{
+static size_t getendpos(int64_t pos, size_t len) {
     if (pos > (int64_t)len)
         return len;
     else if (pos >= 0)
@@ -83,8 +82,7 @@ static size_t getendpos(int64_t pos, size_t len)
 }
 
 //------------------ str_len — string.len: return string length
-MultiValue str_len(LState* L, const LValue* args, size_t count)
-{
+MultiValue str_len(LState *L, const LValue *args, size_t count) {
     if (count == 0)
         throw_runtime_error("bad argument #1 to 'len' (string expected, got no value)");
     size_t l;
@@ -93,12 +91,11 @@ MultiValue str_len(LState* L, const LValue* args, size_t count)
 }
 
 //------------------ str_sub — string.sub: extract substring by range
-MultiValue str_sub(LState* L, const LValue* args, size_t count)
-{
+MultiValue str_sub(LState *L, const LValue *args, size_t count) {
     size_t l;
-    const char* s = get_string(L, args, count, l, 1);
-    int64_t start_i = (count >= 2 && args[1].type != Nil) ? get_integer(L, args, count, 2) : 1;
-    int64_t end_i = (count >= 3 && args[2].type != Nil) ? get_integer(L, args, count, 3) : (int64_t)l;
+    const char *s = get_string(L, args, count, l, 1);
+    int64_t start_i = (count >= 2 && args[1].type != Nil) ? get_integer(L, args, count, 2, "string.sub") : 1;
+    int64_t end_i = (count >= 3 && args[2].type != Nil) ? get_integer(L, args, count, 3, "string.sub") : (int64_t)l;
 
     size_t start, end;
     if (start_i >= 1 && end_i >= start_i && (size_t)end_i <= l) {
@@ -111,7 +108,7 @@ MultiValue str_sub(LState* L, const LValue* args, size_t count)
 
     if (start <= end) {
         size_t subl = end - start + 1;
-        const char* src = s + start - 1;
+        const char *src = s + start - 1;
 
         return MultiValue(make_string_pooled(L, src, subl));
     } else {
@@ -120,17 +117,16 @@ MultiValue str_sub(LState* L, const LValue* args, size_t count)
 }
 
 //------------------ str_reverse — string.reverse: reverse string characters
-MultiValue str_reverse(LState* L, const LValue* args, size_t count)
-{
+MultiValue str_reverse(LState *L, const LValue *args, size_t count) {
     size_t l;
-    const char* s = get_string(L, args, count, l, 1);
+    const char *s = get_string(L, args, count, l, 1);
     if (l <= 6) {
         char buf[8];
         for (size_t i = 0; i < l; i++)
             buf[i] = s[l - i - 1];
         return MultiValue(LValue::istr(buf, static_cast<uint32_t>(l)));
     }
-    char* dst = new char[l + 1];
+    char *dst = new char[l + 1];
     clx_reverse_bytes(dst, s, l);
     dst[l] = '\0';
     MultiValue result = MultiValue(make_string_pooled(L, dst, l));
@@ -139,16 +135,15 @@ MultiValue str_reverse(LState* L, const LValue* args, size_t count)
 }
 
 //------------------ str_lower — string.lower: convert to lowercase
-MultiValue str_lower(LState* L, const LValue* args, size_t count)
-{
+MultiValue str_lower(LState *L, const LValue *args, size_t count) {
     size_t l;
-    const char* s = get_string(L, args, count, l, 1);
+    const char *s = get_string(L, args, count, l, 1);
     if (l <= 6) {
         char buf[8];
         clx_case_fold(buf, s, l, 1);
         return MultiValue(LValue::istr(buf, static_cast<uint32_t>(l)));
     }
-    char* dst = new char[l + 1];
+    char *dst = new char[l + 1];
     clx_case_fold(dst, s, l, 1);
     dst[l] = '\0';
     MultiValue result = MultiValue(make_string_pooled(L, dst, l));
@@ -157,16 +152,15 @@ MultiValue str_lower(LState* L, const LValue* args, size_t count)
 }
 
 //------------------ str_upper — string.upper: convert to uppercase
-MultiValue str_upper(LState* L, const LValue* args, size_t count)
-{
+MultiValue str_upper(LState *L, const LValue *args, size_t count) {
     size_t l;
-    const char* s = get_string(L, args, count, l, 1);
+    const char *s = get_string(L, args, count, l, 1);
     if (l <= 6) {
         char buf[8];
         clx_case_fold(buf, s, l, 0);
         return MultiValue(LValue::istr(buf, static_cast<uint32_t>(l)));
     }
-    char* dst = new char[l + 1];
+    char *dst = new char[l + 1];
     clx_case_fold(dst, s, l, 0);
     dst[l] = '\0';
     MultiValue result = MultiValue(make_string_pooled(L, dst, l));
@@ -175,13 +169,12 @@ MultiValue str_upper(LState* L, const LValue* args, size_t count)
 }
 
 //------------------ str_rep — string.rep: repeat string N times with optional separator
-MultiValue str_rep(LState* L, const LValue* args, size_t count)
-{
+MultiValue str_rep(LState *L, const LValue *args, size_t count) {
     size_t len;
-    const char* s = get_string(L, args, count, len, 1);
-    int64_t n = (count >= 2 && args[1].type != Nil) ? get_integer(L, args, count, 2) : 1;
+    const char *s = get_string(L, args, count, len, 1);
+    int64_t n = (count >= 2 && args[1].type != Nil) ? get_integer(L, args, count, 2, "string.rep") : 1;
     size_t lsep = 0;
-    const char* sep = "";
+    const char *sep = "";
     if (count >= 3 && args[2].type == String) {
         sep = args[2].as_string();
         lsep = args[2].string_len();
@@ -191,7 +184,7 @@ MultiValue str_rep(LState* L, const LValue* args, size_t count)
     size_t totallen = ((size_t)n * (len + lsep)) - lsep;
     if (totallen <= 6) {
         char buf[8];
-        char* bp = buf;
+        char *bp = buf;
         for (int64_t i = 0; i < n - 1; i++) {
             std::memcpy(bp, s, len);
             bp += len;
@@ -203,8 +196,8 @@ MultiValue str_rep(LState* L, const LValue* args, size_t count)
         std::memcpy(bp, s, len);
         return MultiValue(LValue::istr(buf, static_cast<uint32_t>(totallen)));
     }
-    char* dst = new char[totallen + 1];
-    char* p = dst;
+    char *dst = new char[totallen + 1];
+    char *p = dst;
     for (int64_t i = 0; i < n - 1; i++) {
         std::memcpy(p, s, len);
         p += len;
@@ -221,19 +214,18 @@ MultiValue str_rep(LState* L, const LValue* args, size_t count)
 }
 
 //------------------ str_byte — string.byte: get byte codes of substring
-MultiValue str_byte(LState* L, const LValue* args, size_t count)
-{
+MultiValue str_byte(LState *L, const LValue *args, size_t count) {
     size_t l;
-    const char* s = get_string(L, args, count, l, 1);
-    int64_t pi = (count >= 2 && args[1].type != Nil) ? get_integer(L, args, count, 2) : 1;
+    const char *s = get_string(L, args, count, l, 1);
+    int64_t pi = (count >= 2 && args[1].type != Nil) ? get_integer(L, args, count, 2, "string.byte") : 1;
     size_t posi = posrelat(pi, l);
-    int64_t pe = (count >= 3 && args[2].type != Nil) ? get_integer(L, args, count, 3) : pi;
+    int64_t pe = (count >= 3 && args[2].type != Nil) ? get_integer(L, args, count, 3, "string.byte") : pi;
     size_t pose = getendpos(pe, l);
     if (posi > pose)
         return MultiValue();
     int n = (int)(pose - posi) + 1;
     LValue vals[8];
-    LValue* vals_ptr = vals;
+    LValue *vals_ptr = vals;
     std::vector<LValue> large_vals;
     if (n > 8) {
         large_vals.resize(n);
@@ -247,8 +239,7 @@ MultiValue str_byte(LState* L, const LValue* args, size_t count)
 }
 
 //------------------ str_char — string.char: build string from byte values
-MultiValue str_char(LState* L, const LValue* args, size_t count)
-{
+MultiValue str_char(LState *L, const LValue *args, size_t count) {
     if (count <= 6) {
         char buf[8];
         for (size_t i = 0; i < count; i++) {
@@ -262,7 +253,7 @@ MultiValue str_char(LState* L, const LValue* args, size_t count)
         }
         return MultiValue(LValue::istr(buf, count));
     }
-    char* dst = new char[count + 1];
+    char *dst = new char[count + 1];
     for (size_t i = 0; i < count; i++) {
         int64_t c;
         if (!to_integer(args[i], c) || c < 0 || c > 255) {
@@ -280,108 +271,136 @@ MultiValue str_char(LState* L, const LValue* args, size_t count)
 }
 
 //------------------ str_dump — string.dump: stub (not supported)
-MultiValue str_dump(LState* L, const LValue* args, size_t count)
-{
+MultiValue str_dump(LState *L, const LValue *args, size_t count) {
     throw_runtime_error("string.dump not supported");
 }
 
-//------------------ str_format — string.format: printf-style formatting
-MultiValue str_format(LState* L, const LValue* args, size_t count)
-{
+//------------------ get2digits — skip up to 2 decimal digits (stock lstrlib.c)
+static const char *get2digits(const char *s) {
+    if (std::isdigit((unsigned char)*s))
+        s++;
+    if (std::isdigit((unsigned char)*s))
+        s++;
+    return s;
+}
+
+//---------- checkformat — validate flags/width/precision of a conversion form (stock lstrlib.c)
+static void checkformat(const char *form, const char *flags, bool precision) {
+    const char *spec = form + 1;
+    spec += std::strspn(spec, flags);
+    if (*spec != '0') {
+        spec = get2digits(spec);
+        if (*spec == '.' && precision) {
+            spec++;
+            spec = get2digits(spec);
+        }
+    }
+    if (!std::isalpha((unsigned char)*spec)) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "invalid conversion specification: '%s'", form);
+        throw_runtime_error(buf);
+    }
+}
+
+//------------------ addlenmod — insert a length modifier before the conversion char (stock lstrlib.c)
+static void addlenmod(char *form, const char *lenmod) {
+    size_t l = std::strlen(form);
+    size_t lm = std::strlen(lenmod);
+    char spec = form[l - 1];
+    std::memcpy(form + l - 1, lenmod, lm);
+    form[l + lm - 1] = spec;
+    form[l + lm] = '\0';
+}
+
+//---------- throw_format_arg_error — stock luaL_argerror wording for string.format
+static void throw_format_arg_error(int idx, const char *what) {
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "bad argument #%d to 'string.format' (%s)", idx, what);
+    throw_runtime_error(buf);
+}
+
+//------------------ str_format — string.format: printf-style formatting (stock lstrlib.c semantics)
+MultiValue str_format(LState *L, const LValue *args, size_t count) {
     size_t sfl;
-    const char* strfrmt = get_string(L, args, count, sfl, 1);
-    const char* end = strfrmt + sfl;
-    int arg = 2;
+    const char *strfrmt = get_string(L, args, count, sfl, 1);
+    const char *end = strfrmt + sfl;
+    int arg = 1;
 
     StringBuilder result;
     if (sfl > 32)
         result.reserve(sfl / 4 + 8);
     while (strfrmt < end) {
         if (*strfrmt != '%') {
-
-            const char* lit = strfrmt;
+            const char *lit = strfrmt;
             while (strfrmt < end && *strfrmt != '%')
                 strfrmt++;
             result.append(lit, static_cast<uint32_t>(strfrmt - lit));
             continue;
         }
         strfrmt++;
-        if (*strfrmt == '%') {
+        if (strfrmt < end && *strfrmt == '%') {
             result.append("%", 1);
             strfrmt++;
             continue;
         }
+        if (++arg > (int)count)
+            throw_format_arg_error(arg, "no value");
 
-        char fmt_buf[64];
-        int fmt_pos = 0;
-        fmt_buf[fmt_pos++] = '%';
-
-        while (*strfrmt && std::strchr("-+#0 ", *strfrmt) && fmt_pos < 62)
-            fmt_buf[fmt_pos++] = *strfrmt++;
-
-        if (*strfrmt == '*') {
-            if (arg > (int)count)
-                throw_runtime_error("no value for format width");
-            arg++;
-            strfrmt++;
-        } else {
-            while (*strfrmt && std::isdigit((unsigned char)*strfrmt) && fmt_pos < 62)
-                fmt_buf[fmt_pos++] = *strfrmt++;
-        }
-
-        if (*strfrmt == '.') {
-            fmt_buf[fmt_pos++] = '.';
-            strfrmt++;
-            if (*strfrmt == '*') {
-                if (arg > (int)count)
-                    throw_runtime_error("no value for format precision");
-                arg++;
-                strfrmt++;
-            } else {
-                while (*strfrmt && std::isdigit((unsigned char)*strfrmt) && fmt_pos < 62)
-                    fmt_buf[fmt_pos++] = *strfrmt++;
-            }
-        }
-
-        if (*strfrmt && std::strchr("hlLjzt", *strfrmt)) {
-            if (*strfrmt == 'l' && *(strfrmt + 1) == 'l') {
-                if (fmt_pos + 2 < 64) {
-                    fmt_buf[fmt_pos++] = 'l';
-                    fmt_buf[fmt_pos++] = 'l';
-                }
-                strfrmt += 2;
-            } else {
-                fmt_buf[fmt_pos++] = *strfrmt++;
-            }
-        }
-
-        char spec = *strfrmt++;
-        fmt_buf[fmt_pos++] = spec;
-        fmt_buf[fmt_pos] = '\0';
-
-        if (arg > (int)count)
-            throw_runtime_error("no value for format argument");
+        static const char kSpanChars[] = "-+#0 123456789.";
+        size_t span = 0;
+        while (strfrmt + span < end && strfrmt[span] != '\0' && std::strchr(kSpanChars, strfrmt[span]))
+            span++;
+        char form[64];
+        if (span + 1 >= 22)
+            throw_runtime_error("invalid format (too long)");
+        form[0] = '%';
+        std::memcpy(form + 1, strfrmt, span);
+        char spec = (strfrmt + span < end) ? strfrmt[span] : '\0';
+        form[span + 1] = spec;
+        form[span + 2] = '\0';
+        strfrmt = (strfrmt + span + 1 <= end) ? strfrmt + span + 1 : end;
 
         char buf[512];
         int written = 0;
 
         switch (spec) {
+        case 'c': {
+            checkformat(form, "-", false);
+            int64_t n = get_integer(L, args, count, arg, "string.format");
+            written = std::snprintf(buf, sizeof(buf), form, (int)n);
+            break;
+        }
         case 'd':
         case 'i': {
-            int64_t n = get_integer(L, args, count, arg++);
-            written = std::snprintf(buf, sizeof(buf), fmt_buf, (long long)n);
+            int64_t n = get_integer(L, args, count, arg, "string.format");
+            checkformat(form, "-+0 ", true);
+            addlenmod(form, "ll");
+            written = std::snprintf(buf, sizeof(buf), form, (long long)n);
             break;
         }
         case 'u': {
-            int64_t n = get_integer(L, args, count, arg++);
-            written = std::snprintf(buf, sizeof(buf), fmt_buf, (unsigned long long)n);
+            int64_t n = get_integer(L, args, count, arg, "string.format");
+            checkformat(form, "-0", true);
+            addlenmod(form, "ll");
+            written = std::snprintf(buf, sizeof(buf), form, (unsigned long long)n);
             break;
         }
         case 'o':
         case 'x':
         case 'X': {
-            int64_t n = get_integer(L, args, count, arg++);
-            written = std::snprintf(buf, sizeof(buf), fmt_buf, (unsigned long long)n);
+            int64_t n = get_integer(L, args, count, arg, "string.format");
+            checkformat(form, "-#0", true);
+            addlenmod(form, "ll");
+            written = std::snprintf(buf, sizeof(buf), form, (unsigned long long)n);
+            break;
+        }
+        case 'a':
+        case 'A': {
+            checkformat(form, "-+#0 ", true);
+            double d;
+            if (!args[arg - 1].to_number(d))
+                throw_format_arg_error(arg, "number expected");
+            written = std::snprintf(buf, sizeof(buf), form, d);
             break;
         }
         case 'f':
@@ -390,35 +409,31 @@ MultiValue str_format(LState* L, const LValue* args, size_t count)
         case 'g':
         case 'G': {
             double d;
-            if (!args[arg - 1].to_number(d)) {
-                char ebuf[128];
-                std::snprintf(ebuf, sizeof(ebuf), "bad argument #%d to 'format' (number expected)", arg);
-                throw_runtime_error(ebuf);
-            }
-            arg++;
-            written = std::snprintf(buf, sizeof(buf), fmt_buf, d);
-            break;
-        }
-        case 'c': {
-            int64_t n = get_integer(L, args, count, arg++);
-            written = std::snprintf(buf, sizeof(buf), fmt_buf, (int)n);
-            break;
-        }
-        case 's': {
-            std::string sv = args[arg - 1].to_string(L);
-            arg++;
-            written = std::snprintf(buf, sizeof(buf), fmt_buf, sv.c_str());
+            if (!args[arg - 1].to_number(d))
+                throw_format_arg_error(arg, "number expected");
+            checkformat(form, "-+#0 ", true);
+            written = std::snprintf(buf, sizeof(buf), form, d);
             break;
         }
         case 'p': {
-            void* ptr = (void*)0xDEAD;
-            written = std::snprintf(buf, sizeof(buf), fmt_buf, ptr);
-            arg++;
+            checkformat(form, "-", false);
+            const void *ptr = nullptr;
+            if (args[arg - 1].type == String)
+                ptr = args[arg - 1].as_string();
+            else if (args[arg - 1].type == ValueType::Table)
+                ptr = args[arg - 1].as_pointer();
+            if (ptr == nullptr) {
+                ptr = "(null)";
+                form[std::strlen(form) - 1] = 's';
+            }
+            written = std::snprintf(buf, sizeof(buf), form, ptr);
             break;
         }
         case 'q': {
+            if (form[2] != '\0')
+                throw_runtime_error("specifier '%q' cannot have modifiers");
             size_t slen;
-            const char* ss = get_string(L, args, count, slen, arg++);
+            const char *ss = get_string(L, args, count, slen, arg);
             result.append("\"", 1);
             for (size_t i = 0; i < slen; i++) {
                 unsigned char qc = (unsigned char)ss[i];
@@ -436,12 +451,29 @@ MultiValue str_format(LState* L, const LValue* args, size_t count)
                 }
             }
             result.append("\"", 1);
-            written = 0;
             break;
         }
-        default:
-            result.append_owned(fmt_buf, static_cast<uint32_t>(fmt_pos));
-            continue;
+        case 's': {
+            std::string sv = args[arg - 1].to_string(L);
+            size_t l = sv.size();
+            if (form[2] == '\0') {
+                result.append_owned(sv.data(), static_cast<uint32_t>(l));
+                break;
+            }
+            if (std::memchr(sv.data(), 0, l) != nullptr)
+                throw_format_arg_error(arg, "string contains zeros");
+            checkformat(form, "-", true);
+            if (std::strchr(form, '.') == nullptr && l >= 100) {
+                result.append_owned(sv.data(), static_cast<uint32_t>(l));
+                break;
+            }
+            written = std::snprintf(buf, sizeof(buf), form, sv.c_str());
+            break;
+        }
+        default: {
+            std::string msg = "invalid conversion '" + std::string(form) + "' to 'format'";
+            throw_runtime_error(msg.c_str());
+        }
         }
         if (written > 0)
             result.append_owned(buf, static_cast<uint32_t>(written));
@@ -458,22 +490,21 @@ MultiValue str_format(LState* L, const LValue* args, size_t count)
 
 //------------------ MatchState — pattern-matching state (captures, depth, bounds)
 struct MatchState {
-    const char* src_init;
-    const char* src_end;
-    const char* p_end;
-    LState* L;
+    const char *src_init;
+    const char *src_end;
+    const char *p_end;
+    LState *L;
     int matchdepth;
     int level;
 
     struct {
-        const char* init;
+        const char *init;
         ptrdiff_t len;
     } capture[LUA_MAXCAPTURES];
 };
 
 //------------------ check_capture — validate capture index, throw if invalid
-static int check_capture(MatchState* ms, int l)
-{
+static int check_capture(MatchState *ms, int l) {
     l -= '1';
     if (l < 0 || l >= ms->level || ms->capture[l].len == CAP_UNFINISHED) {
         char buf[64];
@@ -484,8 +515,7 @@ static int check_capture(MatchState* ms, int l)
 }
 
 //------------------ capture_to_close — find nearest unfinished capture
-static int capture_to_close(MatchState* ms)
-{
+static int capture_to_close(MatchState *ms) {
     int level = ms->level;
     for (level--; level >= 0; level--)
         if (ms->capture[level].len == CAP_UNFINISHED)
@@ -493,11 +523,10 @@ static int capture_to_close(MatchState* ms)
     throw_runtime_error("invalid pattern capture");
 }
 
-static const char* match(MatchState* ms, const char* s, const char* p);
+static const char *match(MatchState *ms, const char *s, const char *p);
 
 //------------------ classend — skip past a character class (incl. brackets/escapes)
-static const char* classend(MatchState* ms, const char* p)
-{
+static const char *classend(MatchState *ms, const char *p) {
     switch (*p++) {
     case L_ESC:
         if (p == ms->p_end)
@@ -523,8 +552,7 @@ static const char* classend(MatchState* ms, const char* p)
 struct MatchClassTable {
     unsigned short bit[256];
 
-    MatchClassTable()
-    {
+    MatchClassTable() {
         for (int c = 0; c < 256; ++c) {
             unsigned short b = 0;
             if (std::isalpha(c))
@@ -552,8 +580,7 @@ struct MatchClassTable {
     }
 };
 
-static int match_class(int c, int cl)
-{
+static int match_class(int c, int cl) {
     static const MatchClassTable tbl;
     int res;
     switch (std::tolower(cl)) {
@@ -597,8 +624,7 @@ static int match_class(int c, int cl)
 }
 
 //------------------ matchbracketclass — test char against [...] bracket expression
-static int matchbracketclass(int c, const char* p, const char* ec)
-{
+static int matchbracketclass(int c, const char *p, const char *ec) {
     int sig = 1;
     if (*(p + 1) == '^') {
         sig = 0;
@@ -620,8 +646,7 @@ static int matchbracketclass(int c, const char* p, const char* ec)
 }
 
 //------------------ singlematch — match one character against a class (no quantifier)
-static int singlematch(MatchState* ms, const char* s, const char* p, const char* ep)
-{
+static int singlematch(MatchState *ms, const char *s, const char *p, const char *ep) {
     if (s >= ms->src_end)
         return 0;
     int c = (unsigned char)*s;
@@ -638,8 +663,7 @@ static int singlematch(MatchState* ms, const char* s, const char* p, const char*
 }
 
 //------------------ matchbalance — match %bxy balanced pair
-static const char* matchbalance(MatchState* ms, const char* s, const char* p)
-{
+static const char *matchbalance(MatchState *ms, const char *s, const char *p) {
     if (p >= ms->p_end - 1)
         throw_runtime_error("malformed pattern (missing arguments to '%b')");
     if (*s != *p)
@@ -658,13 +682,12 @@ static const char* matchbalance(MatchState* ms, const char* s, const char* p)
 }
 
 //------------------ max_expand — greedy quantifier (*) match
-static const char* max_expand(MatchState* ms, const char* s, const char* p, const char* ep)
-{
+static const char *max_expand(MatchState *ms, const char *s, const char *p, const char *ep) {
     ptrdiff_t i = 0;
     while (singlematch(ms, s + i, p, ep))
         i++;
     while (i >= 0) {
-        const char* res = match(ms, s + i, ep + 1);
+        const char *res = match(ms, s + i, ep + 1);
         if (res)
             return res;
         i--;
@@ -673,10 +696,9 @@ static const char* max_expand(MatchState* ms, const char* s, const char* p, cons
 }
 
 //------------------ min_expand — non-greedy quantifier (-) match
-static const char* min_expand(MatchState* ms, const char* s, const char* p, const char* ep)
-{
+static const char *min_expand(MatchState *ms, const char *s, const char *p, const char *ep) {
     for (;;) {
-        const char* res = match(ms, s, ep + 1);
+        const char *res = match(ms, s, ep + 1);
         if (res)
             return res;
         else if (singlematch(ms, s, p, ep))
@@ -687,34 +709,31 @@ static const char* min_expand(MatchState* ms, const char* s, const char* p, cons
 }
 
 //------------------ start_capture — begin a capture group (open paren)
-static const char* start_capture(MatchState* ms, const char* s, const char* p, int what)
-{
+static const char *start_capture(MatchState *ms, const char *s, const char *p, int what) {
     int level = ms->level;
     if (level >= LUA_MAXCAPTURES)
         throw_runtime_error("too many captures");
     ms->capture[level].init = s;
     ms->capture[level].len = what;
     ms->level = level + 1;
-    const char* res = match(ms, s, p);
+    const char *res = match(ms, s, p);
     if (res == NULL)
         ms->level--;
     return res;
 }
 
 //------------------ end_capture — close a capture group (close paren)
-static const char* end_capture(MatchState* ms, const char* s, const char* p)
-{
+static const char *end_capture(MatchState *ms, const char *s, const char *p) {
     int l = capture_to_close(ms);
     ms->capture[l].len = s - ms->capture[l].init;
-    const char* res = match(ms, s, p);
+    const char *res = match(ms, s, p);
     if (res == NULL)
         ms->capture[l].len = CAP_UNFINISHED;
     return res;
 }
 
 //------------------ match_capture — match previously captured group (%1..%9)
-static const char* match_capture(MatchState* ms, const char* s, int l)
-{
+static const char *match_capture(MatchState *ms, const char *s, int l) {
     l = check_capture(ms, l);
     size_t len = (size_t)ms->capture[l].len;
     if ((size_t)(ms->src_end - s) >= len && std::memcmp(ms->capture[l].init, s, len) == 0)
@@ -723,8 +742,7 @@ static const char* match_capture(MatchState* ms, const char* s, int l)
 }
 
 //------------------ match — main recursive pattern-matching engine
-static const char* match(MatchState* ms, const char* s, const char* p)
-{
+static const char *match(MatchState *ms, const char *s, const char *p) {
     if (ms->matchdepth-- == 0)
         throw_runtime_error("pattern too complex");
 init:
@@ -753,7 +771,7 @@ init:
                 break;
             }
             case 'f': {
-                const char* ep;
+                const char *ep;
                 char previous;
                 p += 2;
                 if (*p != '[')
@@ -790,7 +808,7 @@ init:
             break;
         default:
         dflt: {
-            const char* ep = classend(ms, p);
+            const char *ep = classend(ms, p);
             if (!singlematch(ms, s, p, ep)) {
                 if (*ep == '*' || *ep == '?' || *ep == '-') {
                     p = ep + 1;
@@ -800,7 +818,7 @@ init:
             } else {
                 switch (*ep) {
                 case '?': {
-                    const char* res = match(ms, s + 1, ep + 1);
+                    const char *res = match(ms, s + 1, ep + 1);
                     if (res)
                         s = res;
                     else {
@@ -832,16 +850,15 @@ init:
 }
 
 //------------------ lmemfind — find substring in memory (plain-text search)
-static const char* lmemfind(const char* s1, size_t l1, const char* s2, size_t l2)
-{
+static const char *lmemfind(const char *s1, size_t l1, const char *s2, size_t l2) {
     if (l2 == 0)
         return s1;
     if (l2 > l1)
         return NULL;
-    const char* init;
+    const char *init;
     l2--;
     l1 = l1 - l2;
-    while (l1 > 0 && (init = (const char*)std::memchr(s1, *s2, l1)) != NULL) {
+    while (l1 > 0 && (init = (const char *)std::memchr(s1, *s2, l1)) != NULL) {
         init++;
         if (std::memcmp(init, s2 + 1, l2) == 0)
             return init - 1;
@@ -852,8 +869,7 @@ static const char* lmemfind(const char* s1, size_t l1, const char* s2, size_t l2
 }
 
 //------------------ get_onecapture — retrieve a single capture by index
-static ptrdiff_t get_onecapture(MatchState* ms, int i, const char* s, const char* e, const char** cap)
-{
+static ptrdiff_t get_onecapture(MatchState *ms, int i, const char *s, const char *e, const char **cap) {
     if (i >= ms->level) {
         if (i != 0) {
             char buf[64];
@@ -872,8 +888,7 @@ static ptrdiff_t get_onecapture(MatchState* ms, int i, const char* s, const char
 }
 
 //------------------ prepstate — initialise MatchState with source & pattern
-static void prepstate(MatchState* ms, LState* L, const char* s, size_t ls, const char* p, size_t lp)
-{
+static void prepstate(MatchState *ms, LState *L, const char *s, size_t ls, const char *p, size_t lp) {
     ms->L = L;
     ms->src_init = s;
     ms->src_end = s + ls;
@@ -881,15 +896,13 @@ static void prepstate(MatchState* ms, LState* L, const char* s, size_t ls, const
 }
 
 //------------------ reprepstate — reset match depth and captures for new attempt
-static void reprepstate(MatchState* ms)
-{
+static void reprepstate(MatchState *ms) {
     ms->matchdepth = MAXCCALLS;
     ms->level = 0;
 }
 
 //------------------ nospecials — check if pattern has no magic characters
-static int nospecials(const char* p, size_t l)
-{
+static int nospecials(const char *p, size_t l) {
     size_t upto = 0;
     do {
         size_t seg = clx_strlen(p + upto);
@@ -901,8 +914,7 @@ static int nospecials(const char* p, size_t l)
 }
 
 //------------------ literal_first_byte — check if pattern starts with a literal byte (for optimization)
-static int literal_first_byte(const char* p, size_t lp, char* out_c)
-{
+static int literal_first_byte(const char *p, size_t lp, char *out_c) {
     if (lp == 0)
         return 0;
     unsigned char c0 = (unsigned char)p[0];
@@ -920,12 +932,12 @@ static int literal_first_byte(const char* p, size_t lp, char* out_c)
 }
 
 //------------------ str_find_aux — shared implementation of find/match
-static MultiValue str_find_aux(LState* L, const LValue* args, size_t count, int find)
-{
+static MultiValue str_find_aux(LState *L, const LValue *args, size_t count, int find) {
+    const char *fname = find ? "string.find" : "string.match";
     size_t ls, lp;
-    const char* s = get_string(L, args, count, ls, 1);
-    const char* p = get_string(L, args, count, lp, 2);
-    int64_t init_i = (count >= 3 && args[2].type != Nil) ? get_integer(L, args, count, 3) : 1;
+    const char *s = get_string(L, args, count, ls, 1);
+    const char *p = get_string(L, args, count, lp, 2);
+    int64_t init_i = (count >= 3 && args[2].type != Nil) ? get_integer(L, args, count, 3, fname) : 1;
     size_t init = posrelat(init_i, ls) - 1;
     if (init > ls)
         return MultiValue(LValue());
@@ -938,19 +950,19 @@ static MultiValue str_find_aux(LState* L, const LValue* args, size_t count, int 
             e++;
         if (find)
             return MultiValue(LValue(static_cast<int64_t>(init + 1)), LValue(static_cast<int64_t>(e)),
-                              LValue(static_cast<int64_t>(e + 1)));
+                LValue(static_cast<int64_t>(e + 1)));
         return MultiValue(LValue(static_cast<int64_t>(e + 1)));
     }
 
     if (find && (plain || nospecials(p, lp))) {
-        const char* s2 = lmemfind(s + init, ls - init, p, lp);
+        const char *s2 = lmemfind(s + init, ls - init, p, lp);
         if (s2) {
             return MultiValue(
                 { LValue(static_cast<int64_t>((s2 - s) + 1)), LValue(static_cast<int64_t>((s2 - s) + lp)) });
         }
     } else {
         MatchState ms;
-        const char* s1 = s + init;
+        const char *s1 = s + init;
         int anchor = (*p == '^');
         if (anchor) {
             p++;
@@ -961,7 +973,7 @@ static MultiValue str_find_aux(LState* L, const LValue* args, size_t count, int 
         bool can_skip = !anchor && literal_first_byte(p, lp, &first_c);
         do {
             reprepstate(&ms);
-            const char* res = match(&ms, s1, p);
+            const char *res = match(&ms, s1, p);
             if (res) {
                 if (find) {
                     LValue results[LUA_MAXCAPTURES + 2];
@@ -970,7 +982,7 @@ static MultiValue str_find_aux(LState* L, const LValue* args, size_t count, int 
                     results[rc++] = LValue(static_cast<int64_t>(res - s));
                     int nlevels = ms.level;
                     for (int ci = 0; ci < nlevels; ci++) {
-                        const char* cap;
+                        const char *cap;
                         ptrdiff_t capl = get_onecapture(&ms, ci, s1, res, &cap);
                         results[rc++] = (capl == CAP_POSITION) ? LValue(static_cast<int64_t>((cap - s) + 1))
                                                                : L->intern_lvalue(cap, (size_t)capl);
@@ -981,7 +993,7 @@ static MultiValue str_find_aux(LState* L, const LValue* args, size_t count, int 
                     LValue results[LUA_MAXCAPTURES];
                     size_t rc = 0;
                     for (int ci = 0; ci < nlevels; ci++) {
-                        const char* cap;
+                        const char *cap;
                         ptrdiff_t capl = get_onecapture(&ms, ci, s1, res, &cap);
                         results[rc++] = (capl == CAP_POSITION) ? LValue(static_cast<int64_t>((cap - s) + 1))
                                                                : L->intern_lvalue(cap, (size_t)capl);
@@ -990,7 +1002,7 @@ static MultiValue str_find_aux(LState* L, const LValue* args, size_t count, int 
                 }
             }
             if (can_skip && s1 < ms.src_end) {
-                const char* nx = (const char*)std::memchr(s1 + 1, first_c, (size_t)(ms.src_end - (s1 + 1)));
+                const char *nx = (const char *)std::memchr(s1 + 1, first_c, (size_t)(ms.src_end - (s1 + 1)));
                 if (!nx)
                     break;
                 s1 = nx;
@@ -1003,33 +1015,30 @@ static MultiValue str_find_aux(LState* L, const LValue* args, size_t count, int 
 }
 
 //------------------ str_find — string.find: locate pattern in string
-MultiValue str_find(LState* L, const LValue* args, size_t count)
-{
+MultiValue str_find(LState *L, const LValue *args, size_t count) {
     return str_find_aux(L, args, count, 1);
 }
 
 //------------------ str_match — string.match: capture pattern match
-MultiValue str_match(LState* L, const LValue* args, size_t count)
-{
+MultiValue str_match(LState *L, const LValue *args, size_t count) {
     return str_find_aux(L, args, count, 0);
 }
 
 //------------------ GMatchState — state for gmatch iterator
 struct GMatchState {
-    const char* src;
-    const char* p;
-    const char* lastmatch;
+    const char *src;
+    const char *p;
+    const char *lastmatch;
     MatchState ms;
 };
 
 //------------------ gmatch_aux — gmatch iterator body (called per-iteration)
-static MultiValue gmatch_aux(LState* L, const LValue* args, size_t count, void* ud)
-{
-    GMatchState* gm = (GMatchState*)ud;
-    const char* src;
+static MultiValue gmatch_aux(LState *L, const LValue *args, size_t count, void *ud) {
+    GMatchState *gm = (GMatchState *)ud;
+    const char *src;
     gm->ms.L = L;
     for (src = gm->src; src <= gm->ms.src_end; src++) {
-        const char* e;
+        const char *e;
         reprepstate(&gm->ms);
         if ((e = match(&gm->ms, src, gm->p)) != NULL && e != gm->lastmatch) {
             gm->src = gm->lastmatch = e;
@@ -1037,7 +1046,7 @@ static MultiValue gmatch_aux(LState* L, const LValue* args, size_t count, void* 
             LValue results[LUA_MAXCAPTURES];
             size_t rc = 0;
             for (int ci = 0; ci < nlevels; ci++) {
-                const char* cap;
+                const char *cap;
                 ptrdiff_t capl = get_onecapture(&gm->ms, ci, src, e, &cap);
                 results[rc++] = (capl == CAP_POSITION) ? LValue(static_cast<int64_t>((cap - gm->ms.src_init) + 1))
                                                        : L->intern_lvalue(cap, (size_t)capl);
@@ -1051,14 +1060,13 @@ static MultiValue gmatch_aux(LState* L, const LValue* args, size_t count, void* 
 }
 
 //------------------ str_gmatch — string.gmatch: global match iterator
-MultiValue str_gmatch(LState* L, const LValue* args, size_t count)
-{
+MultiValue str_gmatch(LState *L, const LValue *args, size_t count) {
     size_t ls, lp;
-    const char* s = get_string(L, args, count, ls, 1);
-    const char* p = get_string(L, args, count, lp, 2);
+    const char *s = get_string(L, args, count, ls, 1);
+    const char *p = get_string(L, args, count, lp, 2);
     s = L->intern_string(s, ls);
     p = L->intern_string(p, lp);
-    int64_t init_i = (count >= 3 && args[2].type != Nil) ? get_integer(L, args, count, 3) : 1;
+    int64_t init_i = (count >= 3 && args[2].type != Nil) ? get_integer(L, args, count, 3, "string.gmatch") : 1;
     size_t init = posrelat(init_i, ls) - 1;
     if (init > ls)
         init = ls + 1;
@@ -1069,7 +1077,7 @@ MultiValue str_gmatch(LState* L, const LValue* args, size_t count)
     gm->p = p;
     gm->lastmatch = NULL;
 
-    auto iter = [gm](LState* L2, const LValue* a2, size_t c2) -> MultiValue {
+    auto iter = [gm](LState *L2, const LValue *a2, size_t c2) -> MultiValue {
         (void)a2;
         (void)c2;
         return gmatch_aux(L2, a2, c2, gm.get());
@@ -1079,14 +1087,14 @@ MultiValue str_gmatch(LState* L, const LValue* args, size_t count)
 }
 
 //------------------ str_gsub — string.gsub: global search-and-replace
-MultiValue str_gsub(LState* L, const LValue* args, size_t count)
-{
+MultiValue str_gsub(LState *L, const LValue *args, size_t count) {
     size_t srcl, lp;
-    const char* src = get_string(L, args, count, srcl, 1);
-    const char* p = get_string(L, args, count, lp, 2);
+    const char *src = get_string(L, args, count, srcl, 1);
+    const char *p = get_string(L, args, count, lp, 2);
 
     ValueType tr_type = (count >= 3) ? args[2].type : Nil;
-    int64_t max_s = (count >= 4 && args[3].type != Nil) ? get_integer(L, args, count, 4) : (int64_t)srcl + 1;
+    int64_t max_s
+        = (count >= 4 && args[3].type != Nil) ? get_integer(L, args, count, 4, "string.gsub") : (int64_t)srcl + 1;
     int anchor = (*p == '^');
     if (anchor) {
         p++;
@@ -1096,8 +1104,8 @@ MultiValue str_gsub(LState* L, const LValue* args, size_t count)
     MatchState ms;
     int64_t n = 0;
     bool changed = false;
-    const char* lastmatch = NULL;
-    const char* src_pos = src;
+    const char *lastmatch = NULL;
+    const char *src_pos = src;
 
     prepstate(&ms, L, src, srcl, p, lp);
     char first_c;
@@ -1109,13 +1117,13 @@ MultiValue str_gsub(LState* L, const LValue* args, size_t count)
 
     while (n < max_s) {
         reprepstate(&ms);
-        const char* e;
+        const char *e;
         if ((e = match(&ms, src_pos, p)) != NULL && e != lastmatch) {
             n++;
             changed = true;
 
             if (tr_type == String) {
-                const char* news = args[2].as_string();
+                const char *news = args[2].as_string();
                 size_t l = args[2].string_len();
                 size_t i = 0;
                 while (i < l) {
@@ -1128,7 +1136,7 @@ MultiValue str_gsub(LState* L, const LValue* args, size_t count)
                             result.append(src_pos, static_cast<uint32_t>(ml));
                         } else if (std::isdigit((unsigned char)news[i])) {
                             int ci = news[i] - '1';
-                            const char* cap;
+                            const char *cap;
                             ptrdiff_t capl = get_onecapture(&ms, ci, src_pos, e, &cap);
                             if (capl == CAP_POSITION) {
                                 char tmp[24];
@@ -1151,7 +1159,7 @@ MultiValue str_gsub(LState* L, const LValue* args, size_t count)
                 int nlevels = (ms.level == 0) ? 1 : ms.level;
                 std::vector<LValue> fargs(nlevels);
                 for (int ci = 0; ci < nlevels; ci++) {
-                    const char* cap;
+                    const char *cap;
                     ptrdiff_t capl = get_onecapture(&ms, ci, src_pos, e, &cap);
                     if (capl == CAP_POSITION)
                         fargs[ci] = LValue(static_cast<int64_t>((cap - src) + 1));
@@ -1168,11 +1176,11 @@ MultiValue str_gsub(LState* L, const LValue* args, size_t count)
                 }
 
             } else if (tr_type == Table) {
-                const char* cap;
+                const char *cap;
                 ptrdiff_t capl = get_onecapture(&ms, 0, src_pos, e, &cap);
                 LValue key = (capl == CAP_POSITION) ? LValue(static_cast<int64_t>((cap - src) + 1))
                                                     : LValue(L->intern_string(cap, (size_t)capl));
-                LValue val = static_cast<LTable*>(args[2].as_pointer())->gettable(key);
+                LValue val = static_cast<LTable *>(args[2].as_pointer())->gettable(key);
                 if (val.type == String) {
                     result.append(L, val);
                 } else {
@@ -1184,7 +1192,7 @@ MultiValue str_gsub(LState* L, const LValue* args, size_t count)
             src_pos = lastmatch = e;
         } else if (src_pos < ms.src_end) {
             if (can_skip) {
-                const char* nx = (const char*)std::memchr(src_pos + 1, first_c, (size_t)(ms.src_end - (src_pos + 1)));
+                const char *nx = (const char *)std::memchr(src_pos + 1, first_c, (size_t)(ms.src_end - (src_pos + 1)));
                 size_t span = nx ? (size_t)(nx - src_pos) : (size_t)(ms.src_end - src_pos);
                 result.append(src_pos, static_cast<uint32_t>(span));
                 src_pos += span;
@@ -1223,32 +1231,20 @@ static const union {
 
 //------------------ Header — pack/unpack format state (endian, alignment)
 struct Header {
-    LState* L;
+    LState *L;
     int islittle;
     unsigned maxalign;
 };
 
-enum KOption { Kint,
-    Kuint,
-    Kfloat,
-    Knumber,
-    Kdouble,
-    Kchar,
-    Kstring,
-    Kzstr,
-    Kpadding,
-    Kpaddalign,
-    Knop };
+enum KOption { Kint, Kuint, Kfloat, Knumber, Kdouble, Kchar, Kstring, Kzstr, Kpadding, Kpaddalign, Knop };
 
 //------------------ digit — test if char is a decimal digit
-static int digit(int c)
-{
+static int digit(int c) {
     return '0' <= c && c <= '9';
 }
 
 //------------------ getnum — parse decimal number from format string
-static size_t getnum(const char** fmt, size_t df)
-{
+static size_t getnum(const char **fmt, size_t df) {
     if (!digit(**fmt))
         return df;
     size_t a = 0;
@@ -1259,8 +1255,7 @@ static size_t getnum(const char** fmt, size_t df)
 }
 
 //------------------ getnumlimit — parse number with size-limit validation
-static unsigned getnumlimit(Header* h, const char** fmt, size_t df)
-{
+static unsigned getnumlimit(Header *h, const char **fmt, size_t df) {
     size_t sz = getnum(fmt, df);
     if ((sz - 1u) >= MAXINTSIZE) {
         char buf[64];
@@ -1271,16 +1266,14 @@ static unsigned getnumlimit(Header* h, const char** fmt, size_t df)
 }
 
 //------------------ initheader — initialise pack header (endian, alignment)
-static void initheader(LState* L, Header* h)
-{
+static void initheader(LState *L, Header *h) {
     h->L = L;
     h->islittle = nativeendian.little;
     h->maxalign = 1;
 }
 
 //------------------ getoption — parse a single pack format option char
-static KOption getoption(Header* h, const char** fmt, size_t* size)
-{
+static KOption getoption(Header *h, const char **fmt, size_t *size) {
     struct cD {
         char c;
         double u;
@@ -1373,8 +1366,7 @@ static KOption getoption(Header* h, const char** fmt, size_t* size)
 }
 
 //------------------ getdetails — resolve option + compute padding alignment
-static KOption getdetails(Header* h, size_t totalsize, const char** fmt, size_t* psize, unsigned* ntoalign)
-{
+static KOption getdetails(Header *h, size_t totalsize, const char **fmt, size_t *psize, unsigned *ntoalign) {
     KOption opt = getoption(h, fmt, psize);
     size_t align = *psize;
     if (opt == Kpaddalign) {
@@ -1398,12 +1390,11 @@ static KOption getdetails(Header* h, size_t totalsize, const char** fmt, size_t*
 }
 
 //------------------ packint — write integer to buffer with endianness
-static void packint(std::string& buf, uint64_t n, int islittle, unsigned size, int neg)
-{
+static void packint(std::string &buf, uint64_t n, int islittle, unsigned size, int neg) {
     size_t pos = buf.size();
     buf.resize(pos + size);
     unsigned i;
-    char* buff = &buf[pos];
+    char *buff = &buf[pos];
     buff[islittle ? 0 : size - 1] = (char)(n & MC);
     for (i = 1; i < size; i++) {
         n >>= NB;
@@ -1416,8 +1407,7 @@ static void packint(std::string& buf, uint64_t n, int islittle, unsigned size, i
 }
 
 //------------------ copywithendian — copy bytes with optional endian swap
-static void copywithendian(char* dest, const char* src, unsigned size, int islittle)
-{
+static void copywithendian(char *dest, const char *src, unsigned size, int islittle) {
     if (islittle == nativeendian.little)
         std::memcpy(dest, src, size);
     else {
@@ -1428,8 +1418,7 @@ static void copywithendian(char* dest, const char* src, unsigned size, int islit
 }
 
 //------------------ unpackint — read integer from buffer with endianness
-static int64_t unpackint(const char* str, int islittle, int size, int issigned)
-{
+static int64_t unpackint(const char *str, int islittle, int size, int issigned) {
     uint64_t res = 0;
     int i;
     int limit = (size <= SZINT) ? size : SZINT;
@@ -1456,10 +1445,9 @@ static int64_t unpackint(const char* str, int islittle, int size, int issigned)
 }
 
 //------------------ str_pack — string.pack: pack values into binary string
-MultiValue str_pack(LState* L, const LValue* args, size_t count)
-{
+MultiValue str_pack(LState *L, const LValue *args, size_t count) {
     size_t fmt_len;
-    const char* fmt = get_string(L, args, count, fmt_len, 1);
+    const char *fmt = get_string(L, args, count, fmt_len, 1);
     int arg = 1;
     size_t totalsize = 0;
     Header h;
@@ -1476,7 +1464,7 @@ MultiValue str_pack(LState* L, const LValue* args, size_t count)
         arg++;
         switch (opt) {
         case Kint: {
-            int64_t n = get_integer(L, args, count, arg);
+            int64_t n = get_integer(L, args, count, arg, "string.pack");
             if (size < SZINT) {
                 int64_t lim = (int64_t)1 << ((size * NB) - 1);
                 if (n < -lim || n >= lim)
@@ -1486,7 +1474,7 @@ MultiValue str_pack(LState* L, const LValue* args, size_t count)
             break;
         }
         case Kuint: {
-            int64_t n = get_integer(L, args, count, arg);
+            int64_t n = get_integer(L, args, count, arg, "string.pack");
             if (size < SZINT) {
                 uint64_t lim = (uint64_t)1 << (size * NB);
                 if ((uint64_t)n >= lim)
@@ -1505,7 +1493,7 @@ MultiValue str_pack(LState* L, const LValue* args, size_t count)
             float f = (float)d;
             size_t pos = buf.size();
             buf.resize(pos + sizeof(f));
-            copywithendian(&buf[pos], (const char*)&f, sizeof(f), h.islittle);
+            copywithendian(&buf[pos], (const char *)&f, sizeof(f), h.islittle);
             break;
         }
         case Knumber: {
@@ -1517,7 +1505,7 @@ MultiValue str_pack(LState* L, const LValue* args, size_t count)
             }
             size_t pos = buf.size();
             buf.resize(pos + sizeof(d));
-            copywithendian(&buf[pos], (const char*)&d, sizeof(d), h.islittle);
+            copywithendian(&buf[pos], (const char *)&d, sizeof(d), h.islittle);
             break;
         }
         case Kdouble: {
@@ -1529,12 +1517,12 @@ MultiValue str_pack(LState* L, const LValue* args, size_t count)
             }
             size_t pos = buf.size();
             buf.resize(pos + sizeof(d));
-            copywithendian(&buf[pos], (const char*)&d, sizeof(d), h.islittle);
+            copywithendian(&buf[pos], (const char *)&d, sizeof(d), h.islittle);
             break;
         }
         case Kchar: {
             size_t len;
-            const char* s = get_string(L, args, count, len, arg);
+            const char *s = get_string(L, args, count, len, arg);
             if (len > size) {
                 char ebuf[128];
                 std::snprintf(ebuf, sizeof(ebuf), "bad argument #%d to 'pack' (string longer than given size)", arg);
@@ -1547,7 +1535,7 @@ MultiValue str_pack(LState* L, const LValue* args, size_t count)
         }
         case Kstring: {
             size_t len;
-            const char* s = get_string(L, args, count, len, arg);
+            const char *s = get_string(L, args, count, len, arg);
             if (size < (int)sizeof(uint64_t) && len >= ((uint64_t)1 << (size * NB))) {
                 char ebuf[128];
                 std::snprintf(
@@ -1561,7 +1549,7 @@ MultiValue str_pack(LState* L, const LValue* args, size_t count)
         }
         case Kzstr: {
             size_t len;
-            const char* s = get_string(L, args, count, len, arg);
+            const char *s = get_string(L, args, count, len, arg);
             if (std::strlen(s) != len) {
                 char ebuf[128];
                 std::snprintf(ebuf, sizeof(ebuf), "bad argument #%d to 'pack' (string contains zeros)", arg);
@@ -1584,10 +1572,9 @@ MultiValue str_pack(LState* L, const LValue* args, size_t count)
 }
 
 //------------------ str_packsize — string.packsize: compute packed size
-MultiValue str_packsize(LState* L, const LValue* args, size_t count)
-{
+MultiValue str_packsize(LState *L, const LValue *args, size_t count) {
     size_t fmt_len;
-    const char* fmt = get_string(L, args, count, fmt_len, 1);
+    const char *fmt = get_string(L, args, count, fmt_len, 1);
     size_t totalsize = 0;
     Header h;
     initheader(L, &h);
@@ -1606,13 +1593,12 @@ MultiValue str_packsize(LState* L, const LValue* args, size_t count)
 }
 
 //------------------ str_unpack — string.unpack: unpack values from binary string
-MultiValue str_unpack(LState* L, const LValue* args, size_t count)
-{
+MultiValue str_unpack(LState *L, const LValue *args, size_t count) {
     size_t fmt_len;
-    const char* fmt = get_string(L, args, count, fmt_len, 1);
+    const char *fmt = get_string(L, args, count, fmt_len, 1);
     size_t ld;
-    const char* data = get_string(L, args, count, ld, 2);
-    int64_t pos_i = (count >= 3 && args[2].type != Nil) ? get_integer(L, args, count, 3) : 1;
+    const char *data = get_string(L, args, count, ld, 2);
+    int64_t pos_i = (count >= 3 && args[2].type != Nil) ? get_integer(L, args, count, 3, "string.unpack") : 1;
     size_t pos = posrelat(pos_i, ld) - 1;
     if (pos > ld)
         throw_runtime_error("initial position out of string");
@@ -1635,19 +1621,19 @@ MultiValue str_unpack(LState* L, const LValue* args, size_t count)
         }
         case Kfloat: {
             float f;
-            copywithendian((char*)&f, data + pos, sizeof(f), h.islittle);
+            copywithendian((char *)&f, data + pos, sizeof(f), h.islittle);
             results.push_back(LValue((double)f));
             break;
         }
         case Knumber: {
             double f;
-            copywithendian((char*)&f, data + pos, sizeof(f), h.islittle);
+            copywithendian((char *)&f, data + pos, sizeof(f), h.islittle);
             results.push_back(LValue(f));
             break;
         }
         case Kdouble: {
             double f;
-            copywithendian((char*)&f, data + pos, sizeof(f), h.islittle);
+            copywithendian((char *)&f, data + pos, sizeof(f), h.islittle);
             results.push_back(LValue(f));
             break;
         }
@@ -1683,11 +1669,10 @@ MultiValue str_unpack(LState* L, const LValue* args, size_t count)
 }
 
 //------------------ luastd_string — register string library and metatable
-void luastd_string(LState* L)
-{
+void luastd_string(LState *L) {
     LValue string_table = L->create_table();
     L->root_value(string_table);
-    LTable* t = static_cast<LTable*>(string_table.as_pointer());
+    LTable *t = static_cast<LTable *>(string_table.as_pointer());
 
     static constexpr clx::LazyReg strings_funcs[] = { { "len", str_len }, { "sub", str_sub },
         { "reverse", str_reverse }, { "lower", str_lower }, { "upper", str_upper }, { "rep", str_rep },
@@ -1699,7 +1684,7 @@ void luastd_string(LState* L)
     L->unroot_value(string_table);
 
     LValue mt = L->create_table();
-    L->string_metatable = static_cast<LTable*>(mt.as_pointer());
+    L->string_metatable = static_cast<LTable *>(mt.as_pointer());
     L->root_value(mt);
     L->string_metatable->settable(LValue(L->intern_string("__index")), string_table);
 }

@@ -1,6 +1,7 @@
 build/
 *.o
 *.exe
+deviations.md
 *.a
 *.so
 *.lib

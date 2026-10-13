@@ -209,6 +209,23 @@ void CodeEmitter::emit_native(uint32_t n_idx) {
                 t_name = std::string_view(ctx.nodes[n.as.table_access.table].as.ident.name,
                     ctx.nodes[n.as.table_access.table].as.ident.length);
             }
+            if (!t_name.empty() && ctx.nodes[n.as.table_access.key].type == NodeType::String) {
+                auto _ssit = state.struct_locals.find({ owner_of_node(state, n_idx), std::string(t_name) });
+                if (_ssit != state.struct_locals.end()) {
+                    const StructLocal &_sl = _ssit->second;
+                    std::string_view _fk(ctx.nodes[n.as.table_access.key].as.string.text,
+                        ctx.nodes[n.as.table_access.key].as.string.length);
+                    for (size_t _fi = 0; _fi < _sl.fields.size(); ++_fi) {
+                        if (_sl.fields[_fi] != _fk)
+                            continue;
+                        if (!_sl.late[_fi] || state.struct_proven_reads.count(n_idx)) {
+                            out << "l_" << t_name << "." << _sl.fields[_fi];
+                            return;
+                        }
+                        break;
+                    }
+                }
+            }
             if (ctx.nodes[n.as.table_access.key].type == NodeType::String) {
                 if (!t_name.empty()) {
                     auto it = state.numeric_table_fields.find({ owner_of_node(state, n_idx), t_name });
@@ -916,9 +933,11 @@ void CodeEmitter::emitUnaryOp(const ASTNode &node, uint32_t node_idx) {
                         emit_native(node.as.unary_op.expr);
                         out << "))";
                     } else {
-                        out << "clx::LValue(static_cast<double>(-(";
-                        emit_native(node.as.unary_op.expr);
-                        out << ")))";
+                        out << "([&](){ clx::LValue _qa" << node_idx << " = ";
+                        emit_node(node.as.unary_op.expr);
+                        out << "; if (_qa" << node_idx
+                            << ".type == clx::ValueType::Int64) return clx::LValue(clx::int_neg(_qa" << node_idx
+                            << ".val.payload.i64)); return clx::LValue(-(_qa" << node_idx << ".as_number())); }())";
                     }
                 }
             }
@@ -1022,7 +1041,7 @@ void CodeEmitter::emitBinaryOp(const ASTNode &node, uint32_t node_idx) {
                 || op == static_cast<int>(BinaryOp::Mul)) {
                 std::string lf = int_flag_expr(node.as.bin_op.left, 1);
                 std::string rf = int_flag_expr(node.as.bin_op.right, 1);
-                if (lf != "false" || rf != "false") {
+                if (lf != "false" && rf != "false") {
                     static const char *exact_fn[] = { "", "clx::add_exact", "clx::sub_exact", "clx::mul_exact" };
                     out << exact_fn[op] << "((" << lf << "), ";
                     emit_native(node.as.bin_op.left);
@@ -1030,11 +1049,16 @@ void CodeEmitter::emitBinaryOp(const ASTNode &node, uint32_t node_idx) {
                     emit_native(node.as.bin_op.right);
                     out << ", (" << int_value_expr(node.as.bin_op.right, 1) << "))";
                 } else {
-                    out << "clx::LValue(static_cast<double>(";
-                    emit_native(node.as.bin_op.left);
-                    out << (op == 1 ? " + " : op == 2 ? " - " : " * ");
-                    emit_native(node.as.bin_op.right);
-                    out << "))";
+                    static const char *intfn[] = { "", "clx::int_add_lv", "clx::int_sub_lv", "clx::int_mul_lv" };
+                    static const char *sym[] = { "", " + ", " - ", " * " };
+                    out << "([&](){ clx::LValue _qa" << node_idx << " = ";
+                    emit_node(node.as.bin_op.left);
+                    out << "; clx::LValue _qb" << node_idx << " = ";
+                    emit_node(node.as.bin_op.right);
+                    out << "; if (_qa" << node_idx << ".type == clx::ValueType::Int64 && _qb" << node_idx
+                        << ".type == clx::ValueType::Int64) return " << intfn[op] << "(_qa" << node_idx
+                        << ".val.payload.i64, _qb" << node_idx << ".val.payload.i64); return clx::LValue(_qa"
+                        << node_idx << ".as_number()" << sym[op] << "_qb" << node_idx << ".as_number()); }())";
                 }
             }
             return;
@@ -1064,7 +1088,7 @@ void CodeEmitter::emitBinaryOp(const ASTNode &node, uint32_t node_idx) {
             }
             std::string lf = int_flag_expr(node.as.bin_op.left, 1);
             std::string rf = int_flag_expr(node.as.bin_op.right, 1);
-            if (lf != "false" || rf != "false") {
+            if (lf != "false" && rf != "false") {
                 out << "((" << lf << ") && (" << rf << ")) ? clx::LValue(clx::int_floor_mod("
                     << int_value_expr(node.as.bin_op.left, 1) << ", " << int_value_expr(node.as.bin_op.right, 1)
                     << ")) : clx::LValue(clx::fmod_floor(";
@@ -1073,11 +1097,15 @@ void CodeEmitter::emitBinaryOp(const ASTNode &node, uint32_t node_idx) {
                 emit_native(node.as.bin_op.right);
                 out << "))";
             } else {
-                out << "clx::LValue(clx::fmod_floor(";
-                emit_native(node.as.bin_op.left);
-                out << ", ";
-                emit_native(node.as.bin_op.right);
-                out << "))";
+                out << "([&](){ clx::LValue _qa" << node_idx << " = ";
+                emit_node(node.as.bin_op.left);
+                out << "; clx::LValue _qb" << node_idx << " = ";
+                emit_node(node.as.bin_op.right);
+                out << "; if (_qa" << node_idx << ".type == clx::ValueType::Int64 && _qb" << node_idx
+                    << ".type == clx::ValueType::Int64) return clx::LValue(clx::int_floor_mod(_qa" << node_idx
+                    << ".val.payload.i64, _qb" << node_idx
+                    << ".val.payload.i64)); return clx::LValue(clx::fmod_floor(_qa" << node_idx << ".as_number(), _qb"
+                    << node_idx << ".as_number())); }())";
             }
             return;
         }
@@ -1092,7 +1120,7 @@ void CodeEmitter::emitBinaryOp(const ASTNode &node, uint32_t node_idx) {
             }
             std::string lf = int_flag_expr(node.as.bin_op.left, 1);
             std::string rf = int_flag_expr(node.as.bin_op.right, 1);
-            if (lf != "false" || rf != "false") {
+            if (lf != "false" && rf != "false") {
                 out << "((" << lf << ") && (" << rf << ")) ? clx::LValue(clx::int_floor_div("
                     << int_value_expr(node.as.bin_op.left, 1) << ", " << int_value_expr(node.as.bin_op.right, 1)
                     << ")) : clx::LValue(static_cast<double>(std::floor((";
@@ -1101,11 +1129,15 @@ void CodeEmitter::emitBinaryOp(const ASTNode &node, uint32_t node_idx) {
                 emit_native(node.as.bin_op.right);
                 out << "))))";
             } else {
-                out << "clx::LValue(static_cast<double>(std::floor((";
-                emit_native(node.as.bin_op.left);
-                out << ") / (";
-                emit_native(node.as.bin_op.right);
-                out << "))))";
+                out << "([&](){ clx::LValue _qa" << node_idx << " = ";
+                emit_node(node.as.bin_op.left);
+                out << "; clx::LValue _qb" << node_idx << " = ";
+                emit_node(node.as.bin_op.right);
+                out << "; if (_qa" << node_idx << ".type == clx::ValueType::Int64 && _qb" << node_idx
+                    << ".type == clx::ValueType::Int64) return clx::LValue(clx::int_floor_div(_qa" << node_idx
+                    << ".val.payload.i64, _qb" << node_idx
+                    << ".val.payload.i64)); return clx::LValue(static_cast<double>(std::floor(_qa" << node_idx
+                    << ".as_number() / _qb" << node_idx << ".as_number()))); }())";
             }
             return;
         }
@@ -1520,6 +1552,27 @@ void CodeEmitter::emitTableAccess(const ASTNode &node, uint32_t node_idx) {
             out << ") - 1]))";
         }
         return;
+    }
+    if (!t_name.empty() && node.as.table_access.key < ctx.nodes.size()
+        && ctx.nodes[node.as.table_access.key].type == NodeType::String) {
+        auto _ssit = state.struct_locals.find({ owner_of_node(state, node_idx), std::string(t_name) });
+        if (_ssit != state.struct_locals.end()) {
+            const StructLocal &_sl = _ssit->second;
+            std::string_view _fk(ctx.nodes[node.as.table_access.key].as.string.text,
+                ctx.nodes[node.as.table_access.key].as.string.length);
+            for (size_t _fi = 0; _fi < _sl.fields.size(); ++_fi) {
+                if (_sl.fields[_fi] != _fk)
+                    continue;
+                bool _cond = _sl.late[_fi] && !state.struct_proven_reads.count(node_idx);
+                std::string _mem = "l_" + std::string(t_name) + "." + _sl.fields[_fi];
+                std::string _val = (_sl.kinds[_fi] == FieldKind::Str) ? "(*" + _mem + ")" : "clx::LValue(" + _mem + ")";
+                if (_cond)
+                    out << "(l_" << t_name << ".has_" << _sl.fields[_fi] << " ? " << _val << " : clx::LValue())";
+                else
+                    out << _val;
+                return;
+            }
+        }
     }
     std::string _hp = hoisted_table_ptr(node.as.table_access.table);
     if (state.bce_safe_nodes.count(node_idx)) {

@@ -159,6 +159,9 @@ void pass_int_returns_masks(const ASTContext &ctx, AnalysisState &state, PassScr
 //------------------ pass_local_hygiene: goto-crossed locals, definite-table locals, dead literal tables
 void pass_local_hygiene(const ASTContext &ctx, AnalysisState &state, uint32_t root_node);
 
+//------------------ pass_struct_locals: record locals promoted to native C++ structs (kind fixpoint + read presence)
+void pass_struct_locals(const ASTContext &ctx, AnalysisState &state, PassScratch &sk, uint32_t root_node);
+
 }
 
 #endif
