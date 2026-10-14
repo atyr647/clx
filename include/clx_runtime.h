@@ -20,7 +20,6 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -216,6 +215,9 @@ struct LValue;
 
 //------------------ Binary metamethod dispatcher
 LValue call_bin_metamethod(LState *L, const LValue &a, const LValue &b, const char *event);
+
+//------------------ find_bin_metamethod: returns the binary-op metamethod from either operand's metatable, or Nil
+LValue find_bin_metamethod(LState *L, const LValue &a, const LValue &b, const char *event);
 
 //------------------ Float/int string coercions (defined later in this header)
 bool flt_to_integer(double d, int64_t &out);
@@ -586,7 +588,8 @@ MultiValue call_function_rooted(
     LState *L, const LValue &func, const LValue *args, size_t count, const char *file, int line);
 MultiValue call_direct_rooted(
     LState *L, const LValue &func, const LValue *args, size_t count, const char *file, int line);
-MultiValue call_cfunc_rooted(LState *L, CFunctionType f, const LValue *args, size_t count);
+MultiValue call_cfunc_rooted(
+    LState *L, CFunctionType f, const LValue *args, size_t count, const char *file = "", int line = 0);
 
 //------------------ Userdata block
 struct LUserdata : public LHeader {
@@ -605,7 +608,8 @@ struct LReg {
 //------------------ Raw C function pointer type
 using RawCFunction = MultiValue (*)(LState *, const LValue *, size_t);
 
-MultiValue call_cfunc_rooted(LState *L, RawCFunction f, const LValue *args, size_t count);
+MultiValue call_cfunc_rooted(
+    LState *L, RawCFunction f, const LValue *args, size_t count, const char *file = "", int line = 0);
 
 //------------------ C function registration (lazy init)
 struct LazyReg {
@@ -1171,6 +1175,23 @@ struct LState {
     const char *current_file;
     int current_line;
 
+    //------------------ call-site context for stock luaL_argerror semantics: pending_* is set by generated//------------------ code before dispatch; a C-function wrapper moves it into arg_* for the callee to read.
+    //------------------ pending_* is a stack: codegen pushes the saved frame (call_ctx_push) at the start of every
+    //------------------ call-expression lambda and pops (call_ctx_pop) before restore. Nested evaluation (callee
+    //------------------ lookup / argument subexpressions) may dispatch Lua functions that clobber the *live*
+    //------------------ pending_* fields, but CallCtxGuard reads the flags captured at this call site's frame
+    //------------------ (pending_ctx_bottom), so lazy __index materialization or an argument call no longer
+    //------------------ steals the name/method flags destined for the real callee. Depth is bounded by nesting.
+    static constexpr size_t kMaxCallCtxDepth = 128;
+    bool pending_call_is_method = false;
+    bool pending_call_name_short = false;
+    bool pending_ctx_bottom_is_method = false;
+    bool pending_ctx_bottom_name_short = false;
+    uint32_t pending_ctx_depth = 0;
+    bool call_ctx_frames[kMaxCallCtxDepth][2] = { };
+    bool arg_is_method = false;
+    bool arg_name_short = false;
+
     //---------- luaapi: backing ApiBundle for the Lua 5.5 C API (src/runtime/luaapi.cpp)
     void *luaapi = nullptr;
 
@@ -1446,30 +1467,104 @@ CLX_INLINE_HOT MultiValue call_direct_rooted(
     return call_direct(L, func, args, count, file, line);
 }
 
+//------------------ CallCtxGuard: moves pending call-site flags into arg_* for the callee; restores on exit
+struct CallCtxGuard {
+    LState *L;
+    bool saved_method;
+    bool saved_name_short;
+
+    CLX_INLINE explicit CallCtxGuard(LState *state)
+        : L(state)
+        , saved_method(state->arg_is_method)
+        , saved_name_short(state->arg_name_short) {
+        state->arg_is_method = state->pending_ctx_bottom_is_method;
+        state->arg_name_short = state->pending_ctx_bottom_name_short;
+        state->pending_call_is_method = false;
+        state->pending_call_name_short = false;
+    }
+
+    CLX_INLINE ~CallCtxGuard() {
+        L->arg_is_method = saved_method;
+        L->arg_name_short = saved_name_short;
+    }
+
+    CallCtxGuard(const CallCtxGuard &) = delete;
+    CallCtxGuard &operator=(const CallCtxGuard &) = delete;
+};
+
+//------------------ call_ctx_push: generated code calls this at the start of every call-expression lambda,
+//------------------ right after capturing the flags it will restore. It records this call site's flags into the
+//------------------ depth-indexed frame stack and mirrors the top into pending_ctx_bottom_*, which CallCtxGuard
+//------------------ reads. This decouples the flags destined for the callee from the live pending_* fields that
+//------------------ nested evaluation (callee lookup / argument subexpressions) may clobber.
+CLX_INLINE void call_ctx_push(LState *L, bool is_method, bool name_short) {
+    size_t d = L->pending_ctx_depth;
+    if (d < LState::kMaxCallCtxDepth) {
+        L->call_ctx_frames[d][0] = is_method;
+        L->call_ctx_frames[d][1] = name_short;
+        L->pending_ctx_depth = static_cast<uint32_t>(d + 1);
+    }
+    L->pending_ctx_bottom_is_method = is_method;
+    L->pending_ctx_bottom_name_short = name_short;
+}
+
+//------------------ call_ctx_pop: mirrors the enclosing call site's flags back into pending_ctx_bottom_* before
+//------------------ the generated code restores the live pending_* fields. Pops one frame.
+CLX_INLINE void call_ctx_pop(LState *L) {
+    if (L->pending_ctx_depth > 0)
+        L->pending_ctx_depth--;
+    size_t d = L->pending_ctx_depth;
+    if (d < LState::kMaxCallCtxDepth) {
+        L->pending_ctx_bottom_is_method = L->call_ctx_frames[d][0];
+        L->pending_ctx_bottom_name_short = L->call_ctx_frames[d][1];
+    } else {
+        L->pending_ctx_bottom_is_method = false;
+        L->pending_ctx_bottom_name_short = false;
+    }
+}
+
 //------------------ Rooted call wrapper for direct C function pointers (hoisted builtins, direct impls)
-CLX_INLINE_HOT MultiValue call_cfunc_rooted(LState *L, CFunctionType f, const LValue *args, size_t count) {
+CLX_INLINE_HOT MultiValue call_cfunc_rooted(
+    LState *L, CFunctionType f, const LValue *args, size_t count, const char *file, int line) {
     ScopeGuard sg(L);
+    CallCtxGuard cg(L);
     for (size_t i = 0; i < count; ++i)
         L->shadow_stack[L->shadow_top++]
             = TypedSlot(const_cast<TValue *>(&args[i].val), const_cast<ValueType *>(&args[i].type));
+    if (line > 0) {
+        L->current_file = file;
+        L->current_line = line;
+    }
     return f(L, args, count);
 }
 
 //------------------ Raw pointer overload: skips std::function construction on hot builtin calls
-CLX_INLINE_HOT MultiValue call_cfunc_rooted(LState *L, RawCFunction f, const LValue *args, size_t count) {
+CLX_INLINE_HOT MultiValue call_cfunc_rooted(
+    LState *L, RawCFunction f, const LValue *args, size_t count, const char *file, int line) {
     ScopeGuard sg(L);
+    CallCtxGuard cg(L);
     for (size_t i = 0; i < count; ++i)
         L->shadow_stack[L->shadow_top++]
             = TypedSlot(const_cast<TValue *>(&args[i].val), const_cast<ValueType *>(&args[i].type));
+    if (line > 0) {
+        L->current_file = file;
+        L->current_line = line;
+    }
     return f(L, args, count);
 }
 
 //------------------ Roots args[] across the direct-call fast path; else collections inside the callee miss survivor-aged args.
-CLX_INLINE_HOT MultiValue call_cfunc_direct(LState *L, const CFunctionType &f, const LValue *args, size_t count) {
+CLX_INLINE_HOT MultiValue call_cfunc_direct(
+    LState *L, const CFunctionType &f, const LValue *args, size_t count, const char *file = "", int line = 0) {
     ScopeGuard sg(L);
+    CallCtxGuard cg(L);
     for (size_t i = 0; i < count; ++i)
         L->shadow_stack[L->shadow_top++]
             = TypedSlot(const_cast<TValue *>(&args[i].val), const_cast<ValueType *>(&args[i].type));
+    if (line > 0) {
+        L->current_file = file;
+        L->current_line = line;
+    }
     return f(L, args, count);
 }
 
@@ -1498,9 +1593,40 @@ CLX_INLINE void meta_list_remove(LState *L, LTable *t) {
 }
 
 inline std::string file_line_prefix(LState *L) {
-    if (L->current_file && L->current_file[0] != '\0')
+    if (L->current_file && L->current_file[0] != '\0' && L->current_line > 0)
         return std::string(L->current_file) + ":" + std::to_string(L->current_line) + ": ";
     return "";
+}
+
+//------------------ stock_type_name: luaL_typename mapping (Int64 and Double are both "number")
+inline const char *stock_type_name(const LValue &v) {
+    if (v.type == ValueType::Int64 || v.type == ValueType::Double)
+        return "number";
+    return VALUE_TYPE_NAMES[static_cast<size_t>(v.type)];
+}
+
+//------------------ err_func_name: stock luaL_argerror uses the short name when the call site is
+//------------------ resolvable (direct field call or method); otherwise the pushglobalfuncname fallback.
+inline const char *err_func_name(LState *L, const char *fname) {
+    if (L->arg_is_method || L->arg_name_short) {
+        const char *dot = std::strrchr(fname, '.');
+        if (dot)
+            return dot + 1;
+    }
+    return fname;
+}
+
+//------------------ bad_arg_msg: stock luaL_argerror message shape, incl. method-call index shift and
+//------------------ "calling 'X' on bad self" for the self argument
+inline std::string bad_arg_msg(LState *L, int idx, const char *fname, const std::string &expected_got) {
+    const char *nm = err_func_name(L, fname);
+    int eidx = idx;
+    if (L->arg_is_method) {
+        if (idx == 1)
+            return file_line_prefix(L) + "calling '" + nm + "' on bad self (" + expected_got + ")";
+        eidx = idx - 1;
+    }
+    return file_line_prefix(L) + "bad argument #" + std::to_string(eidx) + " to '" + nm + "' (" + expected_got + ")";
 }
 
 inline void MultiValue::overflow_init(const clx::LValue *arr, size_t c) {
@@ -1801,6 +1927,10 @@ const char *intern_error_message(const char *msg, size_t len);
     throw LRuntimeException(LValue(intern_error_message(msg, clx_strlen(msg))));
 }
 
+[[noreturn]] CLX_INLINE_COLD void throw_runtime_error(const std::string &msg) {
+    throw LRuntimeException(LValue(intern_error_message(msg.data(), msg.size())));
+}
+
 //------------------ Raises "attempt to index a nil value" (or the actual type name) like Lua does
 [[noreturn]] CLX_INLINE_COLD void throw_index_error(LState *L, const LValue &obj) {
     (void)L;
@@ -1992,9 +2122,11 @@ CLX_INLINE_HOT int64_t int_neg(int64_t a) {
     return static_cast<int64_t>(0 - static_cast<uint64_t>(a));
 }
 
-//------------------ Lua floor modulo (%): result takes the sign of the divisor.
-CLX_INLINE_HOT int64_t int_floor_mod(int64_t a, int64_t b) {
-    if (b == 0 || b == -1)
+//------------------ Lua floor modulo (%): result takes the sign of the divisor. b == 0 errors like stock luaV_mod.
+CLX_INLINE_HOT int64_t int_floor_mod(LState *L, int64_t a, int64_t b) {
+    if (b == 0)
+        throw_runtime_error(file_line_prefix(L) + "attempt to perform 'n%0'");
+    if (b == -1)
         return 0;
     int64_t r = a % b;
     if (r && (r < 0) != (b < 0))
@@ -2003,15 +2135,33 @@ CLX_INLINE_HOT int64_t int_floor_mod(int64_t a, int64_t b) {
 }
 
 //------------------ Lua integer floor division (//): truncation toward negative infinity, integer result.
-CLX_INLINE_HOT int64_t int_floor_div(int64_t a, int64_t b) {
+//------------------ b == 0 errors like stock luaV_idiv; b == -1 wraps (mininteger // -1 == mininteger).
+CLX_INLINE_HOT int64_t int_floor_div(LState *L, int64_t a, int64_t b) {
     if (b == 0)
-        return 0;
+        throw_runtime_error(file_line_prefix(L) + "attempt to divide by zero");
     if (b == -1)
         return (a == INT64_MIN) ? INT64_MIN : -a;
     int64_t q = a / b;
     if ((a % b != 0) && ((a < 0) != (b < 0)))
         q -= 1;
     return q;
+}
+
+//------------------ Lua integer shift (stock luaV_shiftl): unsigned shifts, out-of-range counts give 0.
+//------------------ shr computes shiftl_int(x, -y) with a wrapping negation (mininteger count -> 0).
+CLX_INLINE_HOT int64_t shiftl_int(int64_t x, int64_t y) {
+    if (y < 0) {
+        if (y <= -64)
+            return 0;
+        return static_cast<int64_t>(static_cast<uint64_t>(x) >> static_cast<unsigned>(-y));
+    }
+    if (y >= 64)
+        return 0;
+    return static_cast<int64_t>(static_cast<uint64_t>(x) << static_cast<unsigned>(y));
+}
+
+CLX_INLINE_HOT int64_t shr_int(int64_t x, int64_t y) {
+    return shiftl_int(x, static_cast<int64_t>(0 - static_cast<uint64_t>(y)));
 }
 
 //------------------ Lua floor modulo for the floating fast path (%): result takes the sign of the divisor.
@@ -2086,17 +2236,6 @@ CLX_INLINE_HOT int clx_format_num(char *buf, size_t cap, double v, bool is_int) 
         && v == static_cast<double>(static_cast<int64_t>(v)))
         return std::snprintf(buf, cap, "%lld", static_cast<long long>(static_cast<int64_t>(v)));
     return clx_format_double(buf, cap, v);
-}
-
-//------------------ floor_div_num / mod_num: floor division and modulo with runtime int flag
-CLX_INLINE_HOT double floor_div_num(double a, double b, bool is_int) {
-    return is_int ? static_cast<double>(int_floor_div(static_cast<int64_t>(a), static_cast<int64_t>(b)))
-                  : std::floor(a / b);
-}
-
-CLX_INLINE_HOT double mod_num(double a, double b, bool is_int) {
-    return is_int ? static_cast<double>(int_floor_mod(static_cast<int64_t>(a), static_cast<int64_t>(b)))
-                  : fmod_floor(a, b);
 }
 
 //------------------ int_neg_lv: unary minus preserving the runtime integer subtype flag
@@ -2335,10 +2474,23 @@ CLX_INLINE bool to_integer(const LValue &v, int64_t &out) {
     return false;
 }
 
-//------------------ Bitwise AND with metamethod fallback
+//------------------ to_integer_bitwise: stock trygetinteger — Int64 and exact doubles only (F2Ieq).
+//------------------ Strings NEVER coerce for bitwise ops; inexact/out-of-range doubles fail (the
+//------------------ both-numbers miss in call_bin_metamethod reports "number has no integer representation").
+CLX_INLINE bool to_integer_bitwise(const LValue &v, int64_t &out) {
+    if (v.type == ValueType::Int64) {
+        out = v.val.payload.i64;
+        return true;
+    }
+    if (v.type == ValueType::Double)
+        return flt_to_integer(v.val.payload.f64, out);
+    return false;
+}
+
+//------------------ Bitwise AND with metamethod fallback (stock error wording via call_bin_metamethod)
 CLX_INLINE LValue band(LState *L, const LValue &a, const LValue &b) {
     int64_t l, r;
-    if (to_integer(a, l) && to_integer(b, r)) [[likely]]
+    if (to_integer_bitwise(a, l) && to_integer_bitwise(b, r)) [[likely]]
         return LValue(l & r);
     return call_bin_metamethod(L, a, b, "__band");
 }
@@ -2346,7 +2498,7 @@ CLX_INLINE LValue band(LState *L, const LValue &a, const LValue &b) {
 //------------------ Bitwise OR with metamethod fallback
 CLX_INLINE LValue bor(LState *L, const LValue &a, const LValue &b) {
     int64_t l, r;
-    if (to_integer(a, l) && to_integer(b, r)) [[likely]]
+    if (to_integer_bitwise(a, l) && to_integer_bitwise(b, r)) [[likely]]
         return LValue(l | r);
     return call_bin_metamethod(L, a, b, "__bor");
 }
@@ -2354,31 +2506,31 @@ CLX_INLINE LValue bor(LState *L, const LValue &a, const LValue &b) {
 //------------------ Bitwise XOR with metamethod fallback
 CLX_INLINE LValue bxor(LState *L, const LValue &a, const LValue &b) {
     int64_t l, r;
-    if (to_integer(a, l) && to_integer(b, r)) [[likely]]
+    if (to_integer_bitwise(a, l) && to_integer_bitwise(b, r)) [[likely]]
         return LValue(l ^ r);
     return call_bin_metamethod(L, a, b, "__bxor");
 }
 
-//------------------ Bitwise SHL with metamethod fallback
+//------------------ Bitwise SHL with metamethod fallback (stock luaV_shiftl semantics)
 CLX_INLINE LValue shl(LState *L, const LValue &a, const LValue &b) {
     int64_t l, r;
-    if (to_integer(a, l) && to_integer(b, r)) [[likely]]
-        return LValue(l << r);
+    if (to_integer_bitwise(a, l) && to_integer_bitwise(b, r)) [[likely]]
+        return LValue(shiftl_int(l, r));
     return call_bin_metamethod(L, a, b, "__shl");
 }
 
-//------------------ Bitwise SHR with metamethod fallback
+//------------------ Bitwise SHR with metamethod fallback (shiftl_int(x, -y))
 CLX_INLINE LValue shr(LState *L, const LValue &a, const LValue &b) {
     int64_t l, r;
-    if (to_integer(a, l) && to_integer(b, r)) [[likely]]
-        return LValue(l >> r);
+    if (to_integer_bitwise(a, l) && to_integer_bitwise(b, r)) [[likely]]
+        return LValue(shr_int(l, r));
     return call_bin_metamethod(L, a, b, "__shr");
 }
 
 //------------------ Bitwise NOT with metamethod fallback
 CLX_INLINE LValue bnot(LState *L, const LValue &a) {
     int64_t v;
-    if (to_integer(a, v)) [[likely]]
+    if (to_integer_bitwise(a, v)) [[likely]]
         return LValue(~v);
     return call_bin_metamethod(L, a, a, "__bnot");
 }
@@ -2492,10 +2644,10 @@ CLX_INLINE_COLD LValue len(LState *L, const LValue &a) {
     return LValue(lo);
 }
 
-//------------------ Modulo with metamethod fallback
+//------------------ Modulo with metamethod fallback (stock errors for integer b == 0)
 CLX_INLINE LValue mod(LState *L, const LValue &a, const LValue &b) {
     if (a.type == ValueType::Int64 && b.type == ValueType::Int64) [[likely]]
-        return LValue(int_floor_mod(a.val.payload.i64, b.val.payload.i64));
+        return LValue(int_floor_mod(L, a.val.payload.i64, b.val.payload.i64));
     if ((a.type == ValueType::Double || a.type == ValueType::Int64)
         && (b.type == ValueType::Double || b.type == ValueType::Int64)) {
         double l = (a.type == ValueType::Int64) ? static_cast<double>(a.val.payload.i64) : a.val.payload.f64;
@@ -2504,24 +2656,17 @@ CLX_INLINE LValue mod(LState *L, const LValue &a, const LValue &b) {
     }
     int64_t li, ri;
     if (to_integer_coerced(a, li) && to_integer_coerced(b, ri))
-        return LValue(int_floor_mod(li, ri));
+        return LValue(int_floor_mod(L, li, ri));
     double l, r;
     if (a.to_number(l) && b.to_number(r))
         return LValue(l - std::floor(l / r) * r);
     return call_bin_metamethod(L, a, b, "__mod");
 }
 
-//------------------ Floor-division with metamethod fallback
+//------------------ Floor-division with metamethod fallback (stock errors for integer b == 0)
 CLX_INLINE LValue idiv(LState *L, const LValue &a, const LValue &b) {
-    if (a.type == ValueType::Int64 && b.type == ValueType::Int64) [[likely]] {
-        int64_t ai = a.val.payload.i64;
-        int64_t bi = b.val.payload.i64;
-        if (bi == 0)
-            return LValue(static_cast<double>(ai) / 0.0);
-        if (bi == -1)
-            return LValue(static_cast<int64_t>(-static_cast<uint64_t>(ai)));
-        return LValue(ai / bi);
-    }
+    if (a.type == ValueType::Int64 && b.type == ValueType::Int64) [[likely]]
+        return LValue(int_floor_div(L, a.val.payload.i64, b.val.payload.i64));
     if ((a.type == ValueType::Double || a.type == ValueType::Int64)
         && (b.type == ValueType::Double || b.type == ValueType::Int64)) {
         double l = (a.type == ValueType::Int64) ? static_cast<double>(a.val.payload.i64) : a.val.payload.f64;
@@ -2529,13 +2674,8 @@ CLX_INLINE LValue idiv(LState *L, const LValue &a, const LValue &b) {
         return LValue(std::floor(l / r));
     }
     int64_t li, ri;
-    if (to_integer_coerced(a, li) && to_integer_coerced(b, ri)) {
-        if (ri == 0)
-            return LValue(static_cast<double>(li) / 0.0);
-        if (ri == -1)
-            return LValue(static_cast<int64_t>(-static_cast<uint64_t>(li)));
-        return LValue(li / ri);
-    }
+    if (to_integer_coerced(a, li) && to_integer_coerced(b, ri))
+        return LValue(int_floor_div(L, li, ri));
     double l, r;
     if (a.to_number(l) && b.to_number(r))
         return LValue(std::floor(l / r));
