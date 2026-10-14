@@ -156,8 +156,8 @@ LCFunction::LCFunction(CFunctionType f)
     next = nullptr;
 }
 
-//------------------ call_bin_metamethod — call binary op metamethod
-LValue call_bin_metamethod(LState *L, const LValue &a, const LValue &b, const char *event) {
+//------------------ find_bin_metamethod — returns the binary-op metamethod from either operand's metatable, or Nil
+LValue find_bin_metamethod(LState *L, const LValue &a, const LValue &b, const char *event) {
     LTable *mt = nullptr;
     if (a.type == Table)
         mt = tbl_metatable(static_cast<LTable *>(a.as_pointer()));
@@ -170,11 +170,19 @@ LValue call_bin_metamethod(LState *L, const LValue &a, const LValue &b, const ch
 
     if (mt) {
         LValue method = mt->gettable(LValue(L->intern_string(event)));
-        if (method.type != Nil && method.type == Function) {
-            LValue args[2] = { a, b };
-            MultiValue res = call_function_rooted(L, method, args, 2, __FILE__, __LINE__);
-            return res[0];
-        }
+        if (method.type != Nil && method.type == Function)
+            return method;
+    }
+    return LValue();
+}
+
+//------------------ call_bin_metamethod — call binary op metamethod
+LValue call_bin_metamethod(LState *L, const LValue &a, const LValue &b, const char *event) {
+    LValue method = find_bin_metamethod(L, a, b, event);
+    if (method.type == Function) {
+        LValue args[2] = { a, b };
+        MultiValue res = call_function_rooted(L, method, args, 2, __FILE__, __LINE__);
+        return res[0];
     }
 
     std::string_view ev(event);
@@ -194,20 +202,33 @@ LValue call_bin_metamethod(LState *L, const LValue &a, const LValue &b, const ch
             LValue(L->intern_string(prefix + "attempt to compare " + type_name(a) + " with " + type_name(b))));
     }
 
+    auto bad_type_name = [](const LValue &v) {
+        size_t idx
+            = (v.type == ValueType::Int64) ? static_cast<size_t>(ValueType::Double) : static_cast<size_t>(v.type);
+        return VALUE_TYPE_NAMES[idx];
+    };
+
+    if (ev == "__band" || ev == "__bor" || ev == "__bxor" || ev == "__bnot" || ev == "__shl" || ev == "__shr") {
+        bool a_is_number = (a.type == ValueType::Int64 || a.type == ValueType::Double);
+        bool b_is_number = (b.type == ValueType::Int64 || b.type == ValueType::Double);
+        if (a_is_number && b_is_number)
+            throw LRuntimeException(LValue(L->intern_string(prefix + "number has no integer representation")));
+        const LValue &bad = a_is_number ? b : a;
+        throw LRuntimeException(LValue(
+            L->intern_string(prefix + "attempt to perform bitwise operation on a " + bad_type_name(bad) + " value")));
+    }
+
     std::string op_type = "perform arithmetic on";
     if (ev == "__concat")
         op_type = "concatenate";
     else if (ev == "__len")
         op_type = "get length of";
-    else if (ev == "__band" || ev == "__bor" || ev == "__bxor" || ev == "__bnot" || ev == "__shl" || ev == "__shr")
-        op_type = "perform bitwise operation on";
 
     bool a_is_number = (a.type == ValueType::Int64 || a.type == ValueType::Double);
     bool a_is_concatable = (a_is_number || a.type == ValueType::String);
     const LValue &bad = (ev == "__concat") ? (a_is_concatable ? b : a) : (a_is_number ? b : a);
 
-    std::string err_msg
-        = prefix + "attempt to " + op_type + " a " + VALUE_TYPE_NAMES[static_cast<size_t>(bad.type)] + " value";
+    std::string err_msg = prefix + "attempt to " + op_type + " a " + bad_type_name(bad) + " value";
     throw LRuntimeException(LValue(L->intern_string(err_msg)));
 }
 
