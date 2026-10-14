@@ -86,7 +86,13 @@ LValue table_get_slow(LState *L, const LValue &obj, const LValue &key) {
             return table_get(L, index, key);
         if (index.type == ValueType::Function) {
             LValue args[2] = { obj, key };
+            //------------------ Lazy materialization (__index) is not a user-level call: it must not consume the
+            //------------------ pending call-site name/method flags destined for the real callee. Preserve them.
+            bool _pm = L->pending_call_is_method;
+            bool _ps = L->pending_call_name_short;
             MultiValue mv = call_function_rooted(L, index, args, 2, "__index", 0);
+            L->pending_call_is_method = _pm;
+            L->pending_call_name_short = _ps;
             return mv.count > 0 ? mv[0] : LValue();
         }
         return LValue();
@@ -101,7 +107,11 @@ LValue table_get_slow(LState *L, const LValue &obj, const LValue &key) {
         return LValue();
     if (index.type == ValueType::Function) {
         LValue args[2] = { obj, key };
+        bool _pm = L->pending_call_is_method;
+        bool _ps = L->pending_call_name_short;
         MultiValue mv = call_function_rooted(L, index, args, 2, "__index", 0);
+        L->pending_call_is_method = _pm;
+        L->pending_call_name_short = _ps;
         return mv.count > 0 ? mv[0] : LValue();
     }
     if (index.type == ValueType::Table)
