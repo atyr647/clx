@@ -35,11 +35,13 @@ MultiValue call_function(LState *L, const LValue &func, const LValue *args, size
         LCFunction *saved_func = L->current_func;
         L->current_func = f;
         if (f->direct) {
+            CallCtxGuard cg(L);
             MultiValue ret = f->direct(L, args, count);
             L->current_func = saved_func;
             L->shadow_top = prev_shadow;
             return ret;
         }
+        CallCtxGuard cg(L);
         MultiValue ret = f->func(L, args, count);
         L->current_func = saved_func;
         L->shadow_top = prev_shadow;
@@ -87,7 +89,17 @@ MultiValue call_function(LState *L, const LValue &func, const LValue *args, size
 MultiValue pcall_function(LState *L, const LValue &func, const LValue *args, size_t count) {
     size_t shadow_base = L->shadow_top;
     try {
-        MultiValue ret = call_function(L, func, args, count, L->current_file, L->current_line);
+        //------------------ stock luaL_where sees the C pcall frame for its callers: no line, so errors
+        //------------------ raised directly under pcall carry no file:line prefix (keep the source name).
+        //------------------ The callee is passed as a value (not a field/method access at this call site), so
+        //------------------ clear the name/method flags: a forwarded call falls back to the full function name.
+        L->pending_call_is_method = false;
+        L->pending_call_name_short = false;
+        if (L->pending_ctx_depth > 0) {
+            L->pending_ctx_bottom_is_method = false;
+            L->pending_ctx_bottom_name_short = false;
+        }
+        MultiValue ret = call_function(L, func, args, count, L->current_file, 0);
         if (ret.count == 0)
             return MultiValue({ LValue(true) });
         if (ret.count == 1)
@@ -125,6 +137,11 @@ MultiValue call_direct(LState *L, const LValue &func, const LValue *args, size_t
                     = TypedSlot(const_cast<TValue *>(&args[ai].val), const_cast<ValueType *>(&args[ai].type));
             LCFunction *saved = L->current_func;
             L->current_func = f;
+            if (line > 0) {
+                L->current_file = file;
+                L->current_line = line;
+            }
+            CallCtxGuard cg(L);
             MultiValue ret = f->direct(L, args, count);
             L->current_func = saved;
             L->shadow_top = prev_shadow;
