@@ -21,18 +21,12 @@ struct CodesUd {
 static const char utf8_charpattern[] = "[%z\x01-\x7F\xC2-\xF4\x80-\xBF*]";
 
 //------------------ get_string: extracts a string argument from Lua args by index
-static const char *get_string(LState *L, const LValue *args, size_t count, size_t &len, int idx) {
-    if (idx < 1 || idx > (int)count) {
-        char buf[128];
-        std::snprintf(buf, sizeof(buf), "bad argument #%d to a string function (string expected, got no value)", idx);
-        throw_runtime_error(buf);
-    }
-    if (args[idx - 1].type != String) {
-        char buf[128];
-        std::snprintf(buf, sizeof(buf), "bad argument #%d to a string function (string expected, got %s)", idx,
-            args[idx - 1].type == Double ? "number" : "table");
-        throw_runtime_error(buf);
-    }
+static const char *get_string(LState *L, const LValue *args, size_t count, size_t &len, int idx, const char *fname) {
+    if (idx < 1 || idx > (int)count)
+        throw_runtime_error(bad_arg_msg(L, idx, fname, "string expected, got no value"));
+    if (args[idx - 1].type != String)
+        throw_runtime_error(
+            bad_arg_msg(L, idx, fname, std::string("string expected, got ") + stock_type_name(args[idx - 1])));
     len = args[idx - 1].string_len();
     return args[idx - 1].as_string();
 }
@@ -102,7 +96,7 @@ static MultiValue utf8_char(LState *L, const LValue *args, size_t count) {
     for (size_t i = 0; i < count; ++i) {
         uint32_t cp = static_cast<uint32_t>(check_integer(L, args[i]));
         if (cp > 0x10FFFF)
-            throw_runtime_error("bad argument #1 to 'char' (value out of range)");
+            throw_runtime_error(bad_arg_msg(L, (int)(i + 1), "utf8.char", "value out of range"));
         char buf[8];
         int n = utf8_encode(cp, buf);
         sb.append(L, LValue(L->intern_string(buf, static_cast<size_t>(n))));
@@ -121,7 +115,7 @@ static MultiValue codes_iter(LState *L, const LValue *a, size_t c) {
     uint32_t cp;
     int n = utf8_decode(ud->s, ud->len, ud->pos, cp);
     if (n <= 0)
-        throw_runtime_error("bad argument #1 to 'codes' (invalid UTF-8 code)");
+        throw_runtime_error("invalid UTF-8 code");
     size_t cur = ud->pos + 1;
     ud->pos += n;
     return MultiValue({ clx::integer(static_cast<int64_t>(cur)), clx::integer(static_cast<int64_t>(cp)) });
@@ -129,10 +123,8 @@ static MultiValue codes_iter(LState *L, const LValue *a, size_t c) {
 
 //------------------ utf8_codes: returns an iterator over UTF-8 codepoints in a string
 static MultiValue utf8_codes(LState *L, const LValue *args, size_t count) {
-    if (count == 0)
-        throw_runtime_error("bad argument #1 to 'codes' (string expected, got no value)");
     size_t len;
-    const char *raw = get_string(L, args, count, len, 1);
+    const char *raw = get_string(L, args, count, len, 1, "utf8.codes");
     const char *s = L->intern_string(raw, len);
     LValue u_lv = newuserdata(L, sizeof(CodesUd));
     L->shadow_stack[L->shadow_top++] = { &u_lv.val, &u_lv.type };
@@ -148,10 +140,8 @@ static MultiValue utf8_codes(LState *L, const LValue *args, size_t count) {
 
 //------------------ utf8_codepoint: returns codepoints from a range in a UTF-8 string
 static MultiValue utf8_codepoint(LState *L, const LValue *args, size_t count) {
-    if (count == 0)
-        throw_runtime_error("bad argument #1 to 'codepoint' (string expected, got no value)");
     size_t len;
-    const char *s = get_string(L, args, count, len, 1);
+    const char *s = get_string(L, args, count, len, 1, "utf8.codepoint");
     size_t i = 1;
     if (count >= 2 && args[1].type != Nil)
         i = static_cast<size_t>(check_integer(L, args[1]));
@@ -168,7 +158,7 @@ static MultiValue utf8_codepoint(LState *L, const LValue *args, size_t count) {
         uint32_t cp;
         int n = utf8_decode(s, len, i - 1, cp);
         if (n <= 0)
-            throw_runtime_error("bad argument #1 to 'codepoint' (invalid UTF-8 code)");
+            throw_runtime_error("invalid UTF-8 code");
         return MultiValue(clx::integer(static_cast<int64_t>(cp)));
     }
     size_t nv = j - i + 1;
@@ -180,7 +170,7 @@ static MultiValue utf8_codepoint(LState *L, const LValue *args, size_t count) {
         int nbytes = utf8_decode(s, len, pos, cp);
         if (nbytes <= 0) {
             delete[] vals;
-            throw_runtime_error("bad argument #1 to 'codepoint' (invalid UTF-8 code)");
+            throw_runtime_error("invalid UTF-8 code");
         }
         vals[out++] = clx::integer(static_cast<int64_t>(cp));
         pos += nbytes;
@@ -192,10 +182,8 @@ static MultiValue utf8_codepoint(LState *L, const LValue *args, size_t count) {
 
 //------------------ utf8_len: returns the number of UTF-8 codepoints in a range
 static MultiValue utf8_len(LState *L, const LValue *args, size_t count) {
-    if (count == 0)
-        throw_runtime_error("bad argument #1 to 'len' (string expected, got no value)");
     size_t len;
-    const char *s = get_string(L, args, count, len, 1);
+    const char *s = get_string(L, args, count, len, 1, "utf8.len");
     size_t i = 1;
     if (count >= 2 && args[1].type != Nil)
         i = static_cast<size_t>(check_integer(L, args[1]));
@@ -214,8 +202,8 @@ static MultiValue utf8_len(LState *L, const LValue *args, size_t count) {
         uint32_t cp;
         int n = utf8_decode(s, len, pos, cp);
         if (n <= 0) {
-            char buf[128];
-            std::snprintf(buf, sizeof(buf), "bad argument #1 to 'len' (invalid UTF-8 code at position %zu)", pos + 1);
+            char buf[160];
+            std::snprintf(buf, sizeof(buf), "invalid UTF-8 code at position %zu", pos + 1);
             throw_runtime_error(buf);
         }
         pos += n;
@@ -226,16 +214,14 @@ static MultiValue utf8_len(LState *L, const LValue *args, size_t count) {
 
 //------------------ utf8_offset: returns byte offset of a codepoint position in a UTF-8 string
 static MultiValue utf8_offset(LState *L, const LValue *args, size_t count) {
-    if (count == 0)
-        throw_runtime_error("bad argument #1 to 'offset' (string expected, got no value)");
     size_t len;
-    const char *s = get_string(L, args, count, len, 1);
+    const char *s = get_string(L, args, count, len, 1, "utf8.offset");
     int64_t n = check_integer(L, count >= 2 ? args[1] : LValue());
     size_t i = 1;
     if (count >= 3 && args[2].type != Nil)
         i = static_cast<size_t>(check_integer(L, args[2]));
     if (i < 1 || i > len)
-        throw_runtime_error("bad argument #3 to 'offset' (position out of range)");
+        throw_runtime_error(bad_arg_msg(L, 3, "utf8.offset", "position out of bounds"));
     size_t byte_pos;
     if (n >= 0) {
         byte_pos = i - 1;
@@ -245,7 +231,7 @@ static MultiValue utf8_offset(LState *L, const LValue *args, size_t count) {
             uint32_t cp;
             int nb = utf8_decode(s, len, byte_pos, cp);
             if (nb <= 0)
-                throw_runtime_error("bad argument #1 to 'offset' (invalid UTF-8 code)");
+                throw_runtime_error("invalid UTF-8 code");
             byte_pos += nb;
             count_pos++;
         }
