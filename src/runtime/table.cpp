@@ -63,7 +63,7 @@ static void set_elem(LTable *t, size_t idx, const LValue &val) {
 //------------------ table_concat: concatenates array elements into a string
 MultiValue table_concat(LState *L, const LValue *args, size_t count) {
     if (count == 0)
-        throw_runtime_error("bad argument #1 to 'concat' (table expected, got no value)");
+        throw_runtime_error(bad_arg_msg(L, 1, "table.concat", "table expected, got no value"));
     LTable *list = check_table(L, args[0]);
     const char *sep = "";
     size_t sep_len = 0;
@@ -82,8 +82,17 @@ MultiValue table_concat(LState *L, const LValue *args, size_t count) {
         return MultiValue(LValue(L->intern_string("", 0)));
 
     {
-        if (!clx_validate_types_range(reinterpret_cast<const uint8_t *>(list->array_types), i - 1, j - i + 1, 2, 4))
-            throw_runtime_error("bad argument #1 to 'concat' (table contains non-string/number value)");
+        if (!clx_validate_types_range(reinterpret_cast<const uint8_t *>(list->array_types), i - 1, j - i + 1, 2, 4)) {
+            for (size_t k = i; k <= j; ++k) {
+                LValue v = get_elem(list, k);
+                if (v.type != String && v.type != Int64 && v.type != Double) {
+                    char cbuf[160];
+                    std::snprintf(cbuf, sizeof(cbuf), "invalid value (%s) at index %zu in table for 'concat'",
+                        stock_type_name(v), k);
+                    throw_runtime_error(file_line_prefix(L) + cbuf);
+                }
+            }
+        }
     }
 
     StringBuilder sb;
@@ -99,7 +108,7 @@ MultiValue table_concat(LState *L, const LValue *args, size_t count) {
 //------------------ table_insert: inserts element at a position in the array
 MultiValue table_insert(LState *L, const LValue *args, size_t count) {
     if (count < 2)
-        throw_runtime_error("bad argument #1 to 'insert' (table expected, got no value)");
+        throw_runtime_error(file_line_prefix(L) + "wrong number of arguments to 'insert'");
     LTable *list = check_table(L, args[0]);
     size_t len = get_array_len(L, list);
     size_t pos;
@@ -110,12 +119,12 @@ MultiValue table_insert(LState *L, const LValue *args, size_t count) {
     } else {
         int64_t p = check_integer(L, args[1]);
         if (p < 1)
-            throw_runtime_error("bad argument #2 to 'insert' (position out of bounds)");
+            throw_runtime_error(bad_arg_msg(L, 2, "table.insert", "position out of bounds"));
         pos = static_cast<size_t>(p);
         val = args[2];
     }
     if (pos < 1 || pos > len + 1)
-        throw_runtime_error("bad argument #2 to 'insert' (position out of bounds)");
+        throw_runtime_error(bad_arg_msg(L, 2, "table.insert", "position out of bounds"));
     if (pos <= len) {
         if (pos <= list->array_size && len <= list->array_size) {
             if (list->array_cap <= len)
@@ -145,7 +154,7 @@ MultiValue table_insert(LState *L, const LValue *args, size_t count) {
 //------------------ table_remove: removes element from array, shifts subsequent elements
 MultiValue table_remove(LState *L, const LValue *args, size_t count) {
     if (count == 0)
-        throw_runtime_error("bad argument #1 to 'remove' (table expected, got no value)");
+        throw_runtime_error(bad_arg_msg(L, 1, "table.remove", "table expected, got no value"));
     LTable *list = check_table(L, args[0]);
     size_t len = get_array_len(L, list);
     size_t pos = len;
@@ -173,7 +182,7 @@ MultiValue table_remove(LState *L, const LValue *args, size_t count) {
 //------------------ table_sort: sorts array elements in-place
 MultiValue table_sort(LState *L, const LValue *args, size_t count) {
     if (count == 0)
-        throw_runtime_error("bad argument #1 to 'sort' (table expected, got no value)");
+        throw_runtime_error(bad_arg_msg(L, 1, "table.sort", "table expected, got no value"));
     LTable *list = check_table(L, args[0]);
     size_t len = get_array_len(L, list);
     if (len == 0)
@@ -244,7 +253,7 @@ MultiValue table_pack(LState *L, const LValue *args, size_t count) {
 //------------------ table_unpack: unpacks array elements into multiple return values
 MultiValue table_unpack(LState *L, const LValue *args, size_t count) {
     if (count == 0)
-        throw_runtime_error("bad argument #1 to 'unpack' (table expected, got no value)");
+        throw_runtime_error(bad_arg_msg(L, 1, "table.unpack", "table expected, got no value"));
     LTable *list = check_table(L, args[0]);
     size_t len = get_array_len(L, list);
     size_t i = 1;
@@ -279,7 +288,7 @@ MultiValue table_unpack(LState *L, const LValue *args, size_t count) {
 //------------------ table_move: moves elements from one range to another (within or between tables)
 MultiValue table_move(LState *L, const LValue *args, size_t count) {
     if (count < 3)
-        throw_runtime_error("bad argument #1 to 'move' (table expected, got no value)");
+        throw_runtime_error(bad_arg_msg(L, 1, "table.move", "table expected, got no value"));
     LTable *src = check_table(L, args[0]);
     int64_t f = check_integer(L, args[1]);
     int64_t e = check_integer(L, args[2]);
@@ -317,8 +326,8 @@ MultiValue table_move(LState *L, const LValue *args, size_t count) {
 static MultiValue table_create(LState *L, const LValue *args, size_t count) {
     int64_t narray = count >= 1 ? check_integer(L, args[0]) : 0;
     int64_t nhash = count >= 2 ? check_integer(L, args[1]) : 0;
-    if (narray < 0 || nhash < 0)
-        throw_runtime_error("bad argument to 'create' (elements cannot be negative)");
+    if (narray < 0 || nhash < 0 || narray > INT_MAX || nhash > INT_MAX)
+        throw_runtime_error(bad_arg_msg(L, 1, "table.create", "out of range"));
     LValue t = L->create_table(static_cast<size_t>(narray), static_cast<size_t>(nhash));
     return MultiValue(t);
 }
