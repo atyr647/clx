@@ -248,7 +248,8 @@ std::string CodeEmitter::int_value_expr(uint32_t expr_idx, int depth) {
                                                                 : nullptr;
         if (!fn)
             return "0";
-        return std::string(fn) + "(" + int_value_expr(n.as.bin_op.left, depth + 1) + ", "
+        bool takes_l = bop == static_cast<int>(BinaryOp::FloorDiv) || bop == static_cast<int>(BinaryOp::Mod);
+        return std::string(fn) + (takes_l ? "(L, " : "(") + int_value_expr(n.as.bin_op.left, depth + 1) + ", "
             + int_value_expr(n.as.bin_op.right, depth + 1) + ")";
     }
     if (n.type == NodeType::UnaryOp && n.as.unary_op.op == static_cast<int>(UnaryOp::Minus))
@@ -510,6 +511,8 @@ void CodeEmitter::emit(uint32_t root_node, std::string_view module_name) {
 
     out << "CLX_API clx::LValue luaopen_" << module_name << "(clx::LState* L) {\n";
     out << "    clx::LValue _ENV(clx::ValueType::Table, L->_G);\n";
+    out << "    L->current_file = \"" << ctx.filename << "\";\n";
+    out << "    L->current_line = 0;\n";
 
     for (const auto &sb_name : state.global_string_builders) {
         out << "    clx::StringBuilder sb_" << sb_name << ";\n";
