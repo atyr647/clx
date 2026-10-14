@@ -215,9 +215,11 @@ struct LValue;
 
 //------------------ Binary metamethod dispatcher
 LValue call_bin_metamethod(LState *L, const LValue &a, const LValue &b, const char *event);
+LValue call_bin_metamethod(LState *L, const LValue &a, const LValue &b, const LValue &key, const char *event);
 
 //------------------ find_bin_metamethod: returns the binary-op metamethod from either operand's metatable, or Nil
 LValue find_bin_metamethod(LState *L, const LValue &a, const LValue &b, const char *event);
+LValue find_bin_metamethod(LState *L, const LValue &a, const LValue &b, const LValue &key);
 
 //------------------ Float/int string coercions (defined later in this header)
 bool flt_to_integer(double d, int64_t &out);
@@ -1223,6 +1225,28 @@ struct LState {
     LValue str_close;
     LValue str_pairs;
     LValue str_tostring;
+    LValue str_len;
+    LValue str_eq;
+    LValue str_lt;
+    LValue str_le;
+    LValue str_concat;
+    LValue str_add;
+    LValue str_sub;
+    LValue str_mul;
+    LValue str_div;
+    LValue str_mod;
+    LValue str_idiv;
+    LValue str_pow;
+    LValue str_unm;
+    LValue str_band;
+    LValue str_bor;
+    LValue str_bxor;
+    LValue str_shl;
+    LValue str_shr;
+    LValue str_bnot;
+    LValue str_metatable;
+    LValue str_name;
+    LValue str_ipairs;
     LTable *string_metatable;
 
     StringPool string_pool;
@@ -2310,7 +2334,7 @@ CLX_INLINE_HOT LValue add(LState *L, const LValue &a, const LValue &b) {
     double l, r;
     if (a.to_number(l) && b.to_number(r))
         return LValue(l + r);
-    return call_bin_metamethod(L, a, b, "__add");
+    return call_bin_metamethod(L, a, b, L->str_add, "__add");
 }
 
 CLX_INLINE_HOT LValue sub(LState *L, const LValue &a, const LValue &b) {
@@ -2328,7 +2352,7 @@ CLX_INLINE_HOT LValue sub(LState *L, const LValue &a, const LValue &b) {
     double l, r;
     if (a.to_number(l) && b.to_number(r))
         return LValue(l - r);
-    return call_bin_metamethod(L, a, b, "__sub");
+    return call_bin_metamethod(L, a, b, L->str_sub, "__sub");
 }
 
 CLX_INLINE_HOT LValue mul(LState *L, const LValue &a, const LValue &b) {
@@ -2346,7 +2370,7 @@ CLX_INLINE_HOT LValue mul(LState *L, const LValue &a, const LValue &b) {
     double l, r;
     if (a.to_number(l) && b.to_number(r))
         return LValue(l * r);
-    return call_bin_metamethod(L, a, b, "__mul");
+    return call_bin_metamethod(L, a, b, L->str_mul, "__mul");
 }
 
 CLX_INLINE_HOT LValue div(LState *L, const LValue &a, const LValue &b) {
@@ -2359,7 +2383,7 @@ CLX_INLINE_HOT LValue div(LState *L, const LValue &a, const LValue &b) {
     double l, r;
     if (a.to_number(l) && b.to_number(r))
         return LValue(l / r);
-    return call_bin_metamethod(L, a, b, "__div");
+    return call_bin_metamethod(L, a, b, L->str_div, "__div");
 }
 
 //------------------ Equality with metamethod fallback
@@ -2389,9 +2413,9 @@ CLX_INLINE_HOT LValue eq(LState *L, const LValue &a, const LValue &b) {
             LTable *mt_b = (b.type == ValueType::Table) ? tbl_metatable(static_cast<LTable *>(b.as_pointer()))
                                                         : static_cast<LUserdata *>(b.as_pointer())->metatable;
             if (mt && mt == mt_b) {
-                LValue mm = mt->gettable(LValue(L->intern_string("__eq")));
+                LValue mm = mt->gettable(L->str_eq);
                 if (mm.type != ValueType::Nil)
-                    return LValue(call_bin_metamethod(L, a, b, "__eq").as_bool());
+                    return LValue(call_bin_metamethod(L, a, b, L->str_eq, "__eq").as_bool());
             }
         }
         return LValue(a.val.payload.ptr == b.val.payload.ptr);
@@ -2492,7 +2516,7 @@ CLX_INLINE LValue band(LState *L, const LValue &a, const LValue &b) {
     int64_t l, r;
     if (to_integer_bitwise(a, l) && to_integer_bitwise(b, r)) [[likely]]
         return LValue(l & r);
-    return call_bin_metamethod(L, a, b, "__band");
+    return call_bin_metamethod(L, a, b, L->str_band, "__band");
 }
 
 //------------------ Bitwise OR with metamethod fallback
@@ -2500,7 +2524,7 @@ CLX_INLINE LValue bor(LState *L, const LValue &a, const LValue &b) {
     int64_t l, r;
     if (to_integer_bitwise(a, l) && to_integer_bitwise(b, r)) [[likely]]
         return LValue(l | r);
-    return call_bin_metamethod(L, a, b, "__bor");
+    return call_bin_metamethod(L, a, b, L->str_bor, "__bor");
 }
 
 //------------------ Bitwise XOR with metamethod fallback
@@ -2508,7 +2532,7 @@ CLX_INLINE LValue bxor(LState *L, const LValue &a, const LValue &b) {
     int64_t l, r;
     if (to_integer_bitwise(a, l) && to_integer_bitwise(b, r)) [[likely]]
         return LValue(l ^ r);
-    return call_bin_metamethod(L, a, b, "__bxor");
+    return call_bin_metamethod(L, a, b, L->str_bxor, "__bxor");
 }
 
 //------------------ Bitwise SHL with metamethod fallback (stock luaV_shiftl semantics)
@@ -2516,7 +2540,7 @@ CLX_INLINE LValue shl(LState *L, const LValue &a, const LValue &b) {
     int64_t l, r;
     if (to_integer_bitwise(a, l) && to_integer_bitwise(b, r)) [[likely]]
         return LValue(shiftl_int(l, r));
-    return call_bin_metamethod(L, a, b, "__shl");
+    return call_bin_metamethod(L, a, b, L->str_shl, "__shl");
 }
 
 //------------------ Bitwise SHR with metamethod fallback (shiftl_int(x, -y))
@@ -2524,7 +2548,7 @@ CLX_INLINE LValue shr(LState *L, const LValue &a, const LValue &b) {
     int64_t l, r;
     if (to_integer_bitwise(a, l) && to_integer_bitwise(b, r)) [[likely]]
         return LValue(shr_int(l, r));
-    return call_bin_metamethod(L, a, b, "__shr");
+    return call_bin_metamethod(L, a, b, L->str_shr, "__shr");
 }
 
 //------------------ Bitwise NOT with metamethod fallback
@@ -2532,7 +2556,7 @@ CLX_INLINE LValue bnot(LState *L, const LValue &a) {
     int64_t v;
     if (to_integer_bitwise(a, v)) [[likely]]
         return LValue(~v);
-    return call_bin_metamethod(L, a, a, "__bnot");
+    return call_bin_metamethod(L, a, a, L->str_bnot, "__bnot");
 }
 
 CLX_INLINE LValue lt(LState *L, const LValue &a, const LValue &b) {
@@ -2546,7 +2570,7 @@ CLX_INLINE LValue lt(LState *L, const LValue &a, const LValue &b) {
     }
     if (a.type == ValueType::String && b.type == ValueType::String)
         return a < b;
-    return LValue(call_bin_metamethod(L, a, b, "__lt").as_bool());
+    return LValue(call_bin_metamethod(L, a, b, L->str_lt, "__lt").as_bool());
 }
 
 CLX_INLINE LValue le(LState *L, const LValue &a, const LValue &b) {
@@ -2560,7 +2584,7 @@ CLX_INLINE LValue le(LState *L, const LValue &a, const LValue &b) {
     }
     if (a.type == ValueType::String && b.type == ValueType::String)
         return a <= b;
-    return LValue(call_bin_metamethod(L, a, b, "__le").as_bool());
+    return LValue(call_bin_metamethod(L, a, b, L->str_le, "__le").as_bool());
 }
 
 //------------------ Integer fast ordering: compares without boxing a constant operand
@@ -2603,13 +2627,13 @@ CLX_INLINE_COLD LValue len(LState *L, const LValue &a) {
     }
 
     if (a.type != ValueType::Table)
-        return call_bin_metamethod(L, a, a, "__len");
+        return call_bin_metamethod(L, a, a, L->str_len, "__len");
     LTable *t = static_cast<LTable *>(a.as_pointer());
 
     if (LTable *mt = tbl_metatable(t)) {
-        LValue mm = mt->gettable(LValue(L->intern_string("__len", 5)));
+        LValue mm = mt->gettable(L->str_len);
         if (mm.type != ValueType::Nil)
-            return call_bin_metamethod(L, a, a, "__len");
+            return call_bin_metamethod(L, a, a, L->str_len, "__len");
     }
 
     if (t->array_size > 0) {
@@ -2660,7 +2684,7 @@ CLX_INLINE LValue mod(LState *L, const LValue &a, const LValue &b) {
     double l, r;
     if (a.to_number(l) && b.to_number(r))
         return LValue(l - std::floor(l / r) * r);
-    return call_bin_metamethod(L, a, b, "__mod");
+    return call_bin_metamethod(L, a, b, L->str_mod, "__mod");
 }
 
 //------------------ Floor-division with metamethod fallback (stock errors for integer b == 0)
@@ -2679,7 +2703,7 @@ CLX_INLINE LValue idiv(LState *L, const LValue &a, const LValue &b) {
     double l, r;
     if (a.to_number(l) && b.to_number(r))
         return LValue(std::floor(l / r));
-    return call_bin_metamethod(L, a, b, "__idiv");
+    return call_bin_metamethod(L, a, b, L->str_idiv, "__idiv");
 }
 
 //------------------ Power with metamethod fallback
@@ -2693,7 +2717,7 @@ CLX_INLINE LValue pow(LState *L, const LValue &a, const LValue &b) {
     double l, r;
     if (a.to_number(l) && b.to_number(r))
         return LValue(std::pow(l, r));
-    return call_bin_metamethod(L, a, b, "__pow");
+    return call_bin_metamethod(L, a, b, L->str_pow, "__pow");
 }
 
 //------------------ Unary minus with metamethod fallback
@@ -2715,7 +2739,7 @@ CLX_INLINE LValue unm(LState *L, const LValue &a) {
     double d;
     if (a.to_number(d))
         return LValue(-d);
-    return call_bin_metamethod(L, a, a, "__unm");
+    return call_bin_metamethod(L, a, a, L->str_unm, "__unm");
 }
 
 //------------------ Logical NOT
@@ -2732,7 +2756,7 @@ CLX_INLINE_COLD LValue concat_multi(LState *L, const LValue *args, size_t count)
         for (size_t i = 0; i < count; ++i) {
             if (args[i].type != ValueType::String && args[i].type != ValueType::Int64
                 && args[i].type != ValueType::Double) {
-                return call_bin_metamethod(L, args[i], args[i == count - 1 ? i - 1 : i + 1], "__concat");
+                return call_bin_metamethod(L, args[i], args[i == count - 1 ? i - 1 : i + 1], L->str_concat, "__concat");
             }
             if (args[i].type == ValueType::String) {
                 ptrs[i] = args[i].as_string();
@@ -2953,7 +2977,7 @@ CLX_INLINE void table_set(LState *L, const LValue &obj, const LValue &key, const
         mt = ud->metatable;
         if (!mt)
             return;
-        LValue newindex = mt->gettable(LValue(L->intern_string("__newindex")));
+        LValue newindex = mt->gettable(L->str_newindex);
         if (newindex.type == ValueType::Nil)
             return;
         if (newindex.type == ValueType::Function) {
@@ -2990,7 +3014,7 @@ CLX_INLINE LValue table_get_int(LState *L, const LValue &obj, size_t idx) {
 
     if (!mt)
         return LValue();
-    LValue index = mt->gettable(LValue(L->intern_string("__index")));
+    LValue index = mt->gettable(L->str_index);
     if (index.type == ValueType::Nil)
         return LValue();
     if (index.type == ValueType::Function) {
@@ -3028,7 +3052,7 @@ CLX_INLINE void table_set_int(LState *L, const LValue &obj, size_t idx, const LV
         LUserdata *ud = static_cast<LUserdata *>(obj.as_pointer());
         if (!ud->metatable)
             return;
-        LValue newindex = ud->metatable->gettable(LValue(L->intern_string("__newindex")));
+        LValue newindex = ud->metatable->gettable(L->str_newindex);
         if (newindex.type == ValueType::Nil)
             return;
         if (newindex.type == ValueType::Function) {

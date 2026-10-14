@@ -79,7 +79,7 @@ LValue table_get_slow(LState *L, const LValue &obj, const LValue &key) {
         mt = L->string_metatable;
         if (!mt)
             return LValue();
-        LValue index = mt->gettable(LValue(L->intern_string("__index")));
+        LValue index = mt->gettable(L->str_index);
         if (index.type == ValueType::Nil)
             return LValue();
         if (index.type == ValueType::Table)
@@ -102,7 +102,7 @@ LValue table_get_slow(LState *L, const LValue &obj, const LValue &key) {
 
     if (!mt)
         return LValue();
-    LValue index = mt->gettable(LValue(L->intern_string("__index")));
+    LValue index = mt->gettable(L->str_index);
     if (index.type == ValueType::Nil)
         return LValue();
     if (index.type == ValueType::Function) {

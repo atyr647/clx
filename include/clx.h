@@ -444,7 +444,7 @@ CLX_INLINE LValue getmetatable(LState* L, const LValue& obj)
         mt = static_cast<LUserdata*>(obj.as_pointer())->metatable;
     }
     if (mt) {
-        LValue protected_mt = mt->gettable(LValue(L->intern_string("__metatable")));
+        LValue protected_mt = mt->gettable(L->str_metatable);
         if (protected_mt.type != ValueType::Nil) {
             return protected_mt;
         }
@@ -467,7 +467,7 @@ CLX_INLINE void setmetatable(LState* L, const LValue& obj, const LValue& mt)
         LTable* t = static_cast<LTable*>(obj.as_pointer());
         LTable* cur_mt = tbl_metatable(t);
         if (cur_mt) {
-            LValue protected_mt = cur_mt->gettable(LValue(L->intern_string("__metatable")));
+            LValue protected_mt = cur_mt->gettable(L->str_metatable);
             if (protected_mt.type != ValueType::Nil) {
                 throw_runtime_error("cannot change a protected metatable");
             }

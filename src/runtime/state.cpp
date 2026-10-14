@@ -46,6 +46,28 @@ LState::LState()
     str_close = LValue(intern_string("__close"));
     str_pairs = LValue(intern_string("__pairs"));
     str_tostring = LValue(intern_string("__tostring"));
+    str_len = LValue(intern_string("__len"));
+    str_eq = LValue(intern_string("__eq"));
+    str_lt = LValue(intern_string("__lt"));
+    str_le = LValue(intern_string("__le"));
+    str_concat = LValue(intern_string("__concat"));
+    str_add = LValue(intern_string("__add"));
+    str_sub = LValue(intern_string("__sub"));
+    str_mul = LValue(intern_string("__mul"));
+    str_div = LValue(intern_string("__div"));
+    str_mod = LValue(intern_string("__mod"));
+    str_idiv = LValue(intern_string("__idiv"));
+    str_pow = LValue(intern_string("__pow"));
+    str_unm = LValue(intern_string("__unm"));
+    str_band = LValue(intern_string("__band"));
+    str_bor = LValue(intern_string("__bor"));
+    str_bxor = LValue(intern_string("__bxor"));
+    str_shl = LValue(intern_string("__shl"));
+    str_shr = LValue(intern_string("__shr"));
+    str_bnot = LValue(intern_string("__bnot"));
+    str_metatable = LValue(intern_string("__metatable"));
+    str_name = LValue(intern_string("__name"));
+    str_ipairs = LValue(intern_string("__ipairs"));
 
     //------------------ GC work-vector pre-sizing (callgrind: vector growth is
 

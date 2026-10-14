@@ -16,7 +16,7 @@ namespace clx {
 //------------------ get_array_len: returns the length (#) of the array part of a table
 static size_t get_array_len(LState *L, LTable *t) {
     if (LTable *mt = tbl_metatable(t)) {
-        LValue mm = mt->gettable(LValue(L->intern_string("__len", 5)));
+        LValue mm = mt->gettable(L->str_len);
         if (mm.type != Nil) {
             LValue res = len(L, LValue(t));
             if (res.type == Int64)

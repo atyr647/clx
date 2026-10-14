@@ -485,7 +485,7 @@ static MultiValue ipairs(LState *L, const LValue *args, size_t count) {
     if (clx::is_table(t)) {
         LTable *tbl = static_cast<LTable *>(t.as_pointer());
         if (LTable *mt = tbl_metatable(tbl)) {
-            LValue mt_ipairs = mt->gettable(LValue(L->intern_string("__ipairs")));
+            LValue mt_ipairs = mt->gettable(L->str_ipairs);
             if (mt_ipairs.type == Function) {
                 MultiValue ret = call_function_rooted(L, mt_ipairs, &t, 1, __FILE__, __LINE__);
                 return ret;

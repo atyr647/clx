@@ -84,7 +84,7 @@ std::string LValue::to_string(LState *L) const {
         if (L) {
             LTable *mt = tbl_metatable(static_cast<LTable *>(as_pointer()));
             if (mt) {
-                LValue n = mt->gettable(LValue(L->intern_string("__name")));
+                LValue n = mt->gettable(L->str_name);
                 if (n.type != Nil && n.type == String)
                     prefix = n.as_string();
             }
@@ -157,7 +157,7 @@ LCFunction::LCFunction(CFunctionType f)
 }
 
 //------------------ find_bin_metamethod — returns the binary-op metamethod from either operand's metatable, or Nil
-LValue find_bin_metamethod(LState *L, const LValue &a, const LValue &b, const char *event) {
+LValue find_bin_metamethod(LState *L, const LValue &a, const LValue &b, const LValue &key) {
     LTable *mt = nullptr;
     if (a.type == Table)
         mt = tbl_metatable(static_cast<LTable *>(a.as_pointer()));
@@ -169,16 +169,21 @@ LValue find_bin_metamethod(LState *L, const LValue &a, const LValue &b, const ch
         mt = static_cast<LUserdata *>(b.as_pointer())->metatable;
 
     if (mt) {
-        LValue method = mt->gettable(LValue(L->intern_string(event)));
+        LValue method = mt->gettable(key);
         if (method.type != Nil && method.type == Function)
             return method;
     }
     return LValue();
 }
 
+//------------------ find_bin_metamethod (event-name overload: interns and forwards)
+LValue find_bin_metamethod(LState *L, const LValue &a, const LValue &b, const char *event) {
+    return find_bin_metamethod(L, a, b, LValue(L->intern_string(event)));
+}
+
 //------------------ call_bin_metamethod — call binary op metamethod
-LValue call_bin_metamethod(LState *L, const LValue &a, const LValue &b, const char *event) {
-    LValue method = find_bin_metamethod(L, a, b, event);
+LValue call_bin_metamethod(LState *L, const LValue &a, const LValue &b, const LValue &key, const char *event) {
+    LValue method = find_bin_metamethod(L, a, b, key);
     if (method.type == Function) {
         LValue args[2] = { a, b };
         MultiValue res = call_function_rooted(L, method, args, 2, __FILE__, __LINE__);
@@ -230,6 +235,11 @@ LValue call_bin_metamethod(LState *L, const LValue &a, const LValue &b, const ch
 
     std::string err_msg = prefix + "attempt to " + op_type + " a " + bad_type_name(bad) + " value";
     throw LRuntimeException(LValue(L->intern_string(err_msg)));
+}
+
+//------------------ call_bin_metamethod (event-name overload: interns and forwards)
+LValue call_bin_metamethod(LState *L, const LValue &a, const LValue &b, const char *event) {
+    return call_bin_metamethod(L, a, b, LValue(L->intern_string(event)), event);
 }
 
 }
