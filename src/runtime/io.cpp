@@ -42,12 +42,12 @@ struct LinesFileUd {
     bool first;
 };
 
-static FileUd *as_file(LState *L, const LValue &v) {
+static FileUd *as_file(LState *L, const LValue &v, const char *fname = "io.read") {
     if (v.type != UserData)
-        throw_runtime_error("bad argument (FILE* expected, got userdata)");
+        throw_runtime_error(bad_arg_msg(L, 1, fname, std::string("FILE* expected, got ") + stock_type_name(v)));
     LUserdata *ud = static_cast<LUserdata *>(v.as_pointer());
     if (ud->size < sizeof(FileUd))
-        throw_runtime_error("bad argument (not a valid file handle)");
+        throw_runtime_error(bad_arg_msg(L, 1, fname, "FILE* expected"));
     FileUd *f = static_cast<FileUd *>(ud->data());
     if (!f->fp && !f->is_pipe)
         throw_runtime_error("attempt to use a closed file");
@@ -241,8 +241,7 @@ static MultiValue file_read_args(LState *L, FileUd *f, const LValue *a, size_t c
             default:
                 if (!lenient) {
                     char buf[128];
-                    std::snprintf(buf, sizeof(buf), "bad argument #%zu to 'read' (invalid format)", i + 1);
-                    throw_runtime_error(buf);
+                    throw_runtime_error(bad_arg_msg(L, (int)(i + 1), "io.read", "invalid format"));
                 }
                 break;
             }
@@ -266,8 +265,7 @@ static void file_write_args(LState *L, FileUd *f, const LValue *a, size_t c, boo
                 std::fwrite(buf, 1, static_cast<size_t>(n), f->fp);
         } else if (!lenient) {
             char buf[128];
-            std::snprintf(buf, sizeof(buf), "bad argument #%zu to 'write' (string/number expected)", i + 1);
-            throw_runtime_error(buf);
+            throw_runtime_error(bad_arg_msg(L, (int)(i + 1), "io.write", "string expected"));
         }
     }
 }
@@ -360,7 +358,7 @@ static LValue make_file(LState *L, FILE *fp, bool close_on_gc, bool is_pipe = fa
     auto meth_setvbuf = [](LState *L, const LValue *a, size_t c) -> MultiValue {
         FileUd *f = as_file(L, a[0]);
         if (c < 2)
-            throw_runtime_error("bad argument #2 to 'setvbuf' (string expected, got no value)");
+            throw_runtime_error(bad_arg_msg(L, 2, "io.setvbuf", "string expected, got no value"));
         const char *mode = check_string(L, a[1]);
         int smode;
         if (std::strcmp(mode, "full") == 0)
@@ -371,8 +369,7 @@ static LValue make_file(LState *L, FILE *fp, bool close_on_gc, bool is_pipe = fa
             smode = _IONBF;
         else {
             char buf[128];
-            std::snprintf(buf, sizeof(buf), "bad argument #2 to 'setvbuf' (invalid mode '%s')", mode);
-            throw_runtime_error(buf);
+            throw_runtime_error(bad_arg_msg(L, 2, "io.setvbuf", std::string("invalid option '") + mode + "'"));
         }
         size_t size = BUFSIZ;
         if (c >= 3 && a[2].type != Nil)
@@ -496,7 +493,7 @@ static void set_default(LState *L, LValue &slot, const LValue &v) {
 
 static MultiValue io_open(LState *L, const LValue *args, size_t count) {
     if (count == 0)
-        throw_runtime_error("bad argument #1 to 'open' (string expected, got no value)");
+        throw_runtime_error(bad_arg_msg(L, 1, "io.open", "string expected, got no value"));
     const char *filename = check_string(L, args[0]);
     const char *mode = "r";
     if (count >= 2 && args[1].type != Nil)
@@ -720,13 +717,13 @@ static MultiValue io_write(LState *L, const LValue *args, size_t count) {
 //------------------ io_popen — open a process pipe for read or write
 static MultiValue io_popen(LState *L, const LValue *args, size_t count) {
     if (count == 0 || args[0].type != String)
-        throw_runtime_error("bad argument #1 to 'popen' (string expected)");
+        throw_runtime_error(bad_arg_msg(L, 1, "io.popen", "string expected"));
     const char *command = args[0].as_string();
     const char *mode = "r";
     if (count >= 2 && args[1].type != Nil)
         mode = check_string(L, args[1]);
     if (std::strcmp(mode, "r") != 0 && std::strcmp(mode, "w") != 0) {
-        throw_runtime_error("bad argument #2 to 'popen' (mode must be 'r' or 'w')");
+        throw_runtime_error(bad_arg_msg(L, 2, "io.popen", "mode must be 'r' or 'w'"));
     }
     FILE *fp = popen(command, mode);
     if (!fp) {

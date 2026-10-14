@@ -99,7 +99,7 @@ static MultiValue os_date(LState *L, const LValue *args, size_t count) {
 //------------------ os_difftime: returns difference in seconds between two times
 static MultiValue os_difftime(LState *L, const LValue *args, size_t count) {
     if (count < 2)
-        throw_runtime_error("bad argument #1 to 'difftime' (number expected, got no value)");
+        throw_runtime_error(bad_arg_msg(L, 1, "os.difftime", "number expected, got no value"));
     double t2 = check_number(L, args[0]);
     double t1 = check_number(L, args[1]);
     return MultiValue(clx::number(t2 - t1));
@@ -129,7 +129,7 @@ static MultiValue os_exit(LState *L, const LValue *args, size_t count) {
 //------------------ os_getenv: gets an environment variable
 static MultiValue os_getenv(LState *L, const LValue *args, size_t count) {
     if (count == 0)
-        throw_runtime_error("bad argument #1 to 'getenv' (string expected, got no value)");
+        throw_runtime_error(bad_arg_msg(L, 1, "os.getenv", "string expected, got no value"));
     const char *name = check_string(L, args[0]);
     const char *val = std::getenv(name);
     if (!val)
@@ -140,7 +140,7 @@ static MultiValue os_getenv(LState *L, const LValue *args, size_t count) {
 //------------------ os_remove: deletes a file
 static MultiValue os_remove(LState *L, const LValue *args, size_t count) {
     if (count == 0)
-        throw_runtime_error("bad argument #1 to 'remove' (string expected, got no value)");
+        throw_runtime_error(bad_arg_msg(L, 1, "os.remove", "string expected, got no value"));
     const char *path = check_string(L, args[0]);
     std::error_code ec;
     if (!std::filesystem::remove(path, ec) && ec) {
@@ -157,7 +157,7 @@ static MultiValue os_remove(LState *L, const LValue *args, size_t count) {
 //------------------ os_rename: renames a file or directory
 static MultiValue os_rename(LState *L, const LValue *args, size_t count) {
     if (count < 2)
-        throw_runtime_error("bad argument #1 to 'rename' (string expected, got no value)");
+        throw_runtime_error(bad_arg_msg(L, 1, "os.rename", "string expected, got no value"));
     const char *oldname = check_string(L, args[0]);
     const char *newname = check_string(L, args[1]);
     std::error_code ec;
@@ -194,8 +194,7 @@ static MultiValue os_setlocale(LState *L, const LValue *args, size_t count) {
             category = LC_TIME;
         else {
             char buf[128];
-            std::snprintf(buf, sizeof(buf), "bad argument #2 to 'setlocale' (invalid category '%s')", cat);
-            throw_runtime_error(buf);
+            throw_runtime_error(bad_arg_msg(L, 2, "os.setlocale", std::string("invalid option '") + cat + "'"));
         }
     }
     const char *result = std::setlocale(category, locale);
