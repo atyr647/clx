@@ -97,9 +97,8 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
     if (is_local && t_count == 1 && v_count == 1) {
         uint32_t _dt = ctx.block_statements[first_t];
         uint32_t _dv = ctx.block_statements[first_v];
-        if (_dt < ctx.nodes.size() && ctx.nodes[_dt].type == NodeType::Identifier
-            && !ctx.nodes[_dt].as.ident.is_global && _dv < ctx.nodes.size()
-            && ctx.nodes[_dv].type == NodeType::TableConstructor) {
+        if (_dt < ctx.nodes.size() && ctx.nodes[_dt].type == NodeType::Identifier && !ctx.nodes[_dt].as.ident.is_global
+            && _dv < ctx.nodes.size() && ctx.nodes[_dv].type == NodeType::TableConstructor) {
             std::string_view _dn(ctx.nodes[_dt].as.ident.name, ctx.nodes[_dt].as.ident.length);
             auto _dsit = state.struct_locals.find({ owner_of_node(state, node_idx), std::string(_dn) });
             if (_dsit != state.struct_locals.end()) {
@@ -116,8 +115,8 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                         _firsti = false;
                         if (_sl.kinds[_k] == FieldKind::Str) {
                             out << "&cstr_["
-                                << state.string_pool_index.at(std::string_view(ctx.nodes[_vv].as.string.text,
-                                       ctx.nodes[_vv].as.string.length))
+                                << state.string_pool_index.at(
+                                       std::string_view(ctx.nodes[_vv].as.string.text, ctx.nodes[_vv].as.string.length))
                                 << "]";
                         } else if (_sl.kinds[_k] == FieldKind::Int) {
                             out << "static_cast<int64_t>(";
@@ -216,8 +215,8 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                 emit_native(ctx.block_statements[first_v]);
                 out << ";\n";
                 out << "bool _rhsf_" << node_idx << " = (" << rhs_flag_text << ");\n";
-                out << "int64_t _rhsi_" << node_idx << " = (" << int_value_expr(ctx.block_statements[first_v], 1)
-                    << ");\n";
+                out << "int64_t _rhsi_" << node_idx << " = _rhsf_" << node_idx << " ? (int64_t)("
+                    << int_value_expr(ctx.block_statements[first_v], 1) << ") : 0;\n";
             }
             if (!state.hoisted_locals.count(single_name)) {
                 if (is_int_single) {
@@ -245,11 +244,12 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                 if (v_count > 0) {
                     if (use_rhs_tmp) {
                         out << "_intf_l_" << single_name << " = _rhsf_" << node_idx << ";\n";
-                        out << "_ii_l_" << single_name << " = _rhsi_" << node_idx << ";\n";
+                        out << "_ii_l_" << single_name << " = _intf_l_" << single_name << " ? (int64_t)("
+                            << int_value_expr(ctx.block_statements[first_v], 1) << ") : 0;\n";
                     } else {
                         out << "_intf_l_" << single_name << " = (" << rhs_flag_text << ");\n";
-                        out << "_ii_l_" << single_name << " = (" << int_value_expr(ctx.block_statements[first_v], 1)
-                            << ");\n";
+                        out << "_ii_l_" << single_name << " = _intf_l_" << single_name << " ? (int64_t)("
+                            << int_value_expr(ctx.block_statements[first_v], 1) << ") : 0;\n";
                     }
                 } else {
                     out << "_intf_l_" << single_name << " = false;\n";
@@ -637,8 +637,8 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                 if (hv_native) {
                                     out << "_intf_l_" << name << " = ("
                                         << int_flag_expr(ctx.block_statements[first_v], 1) << ");\n";
-                                    out << "_ii_l_" << name << " = ("
-                                        << int_value_expr(ctx.block_statements[first_v], 1) << ");\n";
+                                    out << "_ii_l_" << name << " = _intf_l_" << name << " ? (int64_t)("
+                                        << int_value_expr(ctx.block_statements[first_v], 1) << ") : 0;\n";
                                 }
                             }
                         } else {
@@ -946,8 +946,8 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                         out << "_intf_l_" << name << " = ("
                                             << int_flag_expr(ctx.block_statements[first_v], 1) << ");\n";
                                         if (it->has_ii)
-                                            out << "_ii_l_" << name << " = ("
-                                                << int_value_expr(ctx.block_statements[first_v], 1) << ");\n";
+                                            out << "_ii_l_" << name << " = _intf_l_" << name << " ? (int64_t)("
+                                                << int_value_expr(ctx.block_statements[first_v], 1) << ") : 0;\n";
                                     } else {
                                         out << "_intf_l_" << name << " = false;\n";
                                         if (it->has_ii)
@@ -993,8 +993,8 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                         out << "l_" << t_name << "." << _sl.fields[_fi] << " = ";
                         if (_sl.kinds[_fi] == FieldKind::Str) {
                             out << "&cstr_["
-                                << state.string_pool_index.at(std::string_view(ctx.nodes[_wv].as.string.text,
-                                       ctx.nodes[_wv].as.string.length))
+                                << state.string_pool_index.at(
+                                       std::string_view(ctx.nodes[_wv].as.string.text, ctx.nodes[_wv].as.string.length))
                                 << "]";
                         } else if (_sl.kinds[_fi] == FieldKind::Int) {
                             out << "static_cast<int64_t>(";
@@ -1683,8 +1683,8 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                     << ".count && _mret_" << node_idx << "[" << mi
                                     << "].type == clx::ValueType::Int64);\n";
                                 if (sit->has_ii)
-                                    out << "_ii_l_" << name << " = _intf_l_" << name << " ? _mret_" << node_idx
-                                        << "[" << mi << "].val.payload.i64 : 0;\n";
+                                    out << "_ii_l_" << name << " = _intf_l_" << name << " ? _mret_" << node_idx << "["
+                                        << mi << "].val.payload.i64 : 0;\n";
                             } else if (i >= v_count) {
                                 out << "_intf_l_" << name << " = false;\n";
                                 if (sit->has_ii)
@@ -1693,7 +1693,8 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                 uint32_t fv = ctx.block_statements[first_v + i];
                                 out << "_intf_l_" << name << " = (" << int_flag_expr(fv, 1) << ");\n";
                                 if (sit->has_ii)
-                                    out << "_ii_l_" << name << " = (" << int_value_expr(fv, 1) << ");\n";
+                                    out << "_ii_l_" << name << " = _intf_l_" << name << " ? (int64_t)("
+                                        << int_value_expr(fv, 1) << ") : 0;\n";
                             }
                         }
                         break;
@@ -1737,8 +1738,8 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                         out << "l_" << t_name << "." << _sl.fields[_fi] << " = ";
                         if (_str_lit) {
                             out << "&cstr_["
-                                << state.string_pool_index.at(std::string_view(ctx.nodes[_wv].as.string.text,
-                                       ctx.nodes[_wv].as.string.length))
+                                << state.string_pool_index.at(
+                                       std::string_view(ctx.nodes[_wv].as.string.text, ctx.nodes[_wv].as.string.length))
                                 << "]";
                         } else if (_sl.kinds[_fi] == FieldKind::Int) {
                             out << "(" << val_str << ").as_integer()";
