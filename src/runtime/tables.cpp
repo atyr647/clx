@@ -136,34 +136,25 @@ LTable::~LTable() {
     if (ext) {
         if (ext->ic)
             delete[] ext->ic;
-        if (!(flags & LFLAG_ARENA)) {
-            if (ext->entries)
-                free(ext->entries);
-            if (ext->hash_bitmap)
-                free(ext->hash_bitmap);
-        }
+        if (!(flags & LFLAG_ARENA))
+            table_free_hash(ext->entries, ext->hash_bitmap);
         delete ext;
         ext = nullptr;
     }
-    if (!(flags & LFLAG_ARENA)) {
-        if (array && array != small_array)
-            delete[] array;
-        if (array_types && array_types != small_array_types)
-            delete[] array_types;
-    }
-}
+    if (!(flags & LFLAG_ARENA))
+        table_free_array(array, array_types, small_array);}
 
 //------------------ LTable::resize_hash — allocate/rehash to new_size (power of 2)
 void LTable::resize_hash(size_t new_size) {
+    g_alloc_census.hash_resize++;
     new_size = next_pow2(new_size);
 
     const size_t hb_before = table_heap_bytes(this);
     LTableExt *ex = tbl_ensure_ext(this);
 
-    HashEntry *new_entries = static_cast<HashEntry *>(std::calloc(new_size, sizeof(HashEntry)));
-
-    size_t bm_words = (new_size + 63) / 64;
-    uint64_t *new_bitmap = static_cast<uint64_t *>(std::calloc(bm_words, sizeof(uint64_t)));
+    HashEntry *new_entries = nullptr;
+    uint64_t *new_bitmap = nullptr;
+    table_alloc_hash(new_entries, new_bitmap, new_size);
 
     uint32_t mask = static_cast<uint32_t>(new_size - 1);
     if (ex->entries) {
@@ -183,15 +174,13 @@ void LTable::resize_hash(size_t new_size) {
             new_bitmap[h / 64] |= (1ULL << (h % 64));
         }
         if (!(flags & LFLAG_ARENA))
-            free(ex->entries);
+            table_free_hash(ex->entries, ex->hash_bitmap);
     }
 
     flags &= ~LFLAG_ARENA;
     ex->entries = new_entries;
     ex->hash_size = new_size;
     ex->hash_tombs = 0;
-    if (ex->hash_bitmap)
-        free(ex->hash_bitmap);
     ex->hash_bitmap = new_bitmap;
     ex->hash_version++;
     if (clx_current_L)
@@ -277,18 +266,16 @@ void LTable::settable(const LValue &key, const LValue &val) {
         if (idx == static_cast<int64_t>(array_size + 1)) {
             size_t new_cap = (array_cap == 0) ? 8 : array_cap * 2;
             const size_t hb_grow = table_heap_bytes(this);
-            TValue *new_arr = new TValue[new_cap];
-            ValueType *new_types = new ValueType[new_cap]();
+            TValue *new_arr = nullptr;
+            ValueType *new_types = nullptr;
+            g_alloc_census.array_grow++;
+            table_alloc_array(new_arr, new_types, new_cap);
             if (array_cap) {
                 std::memcpy(new_arr, array, array_cap * sizeof(TValue));
                 std::memcpy(new_types, array_types, array_cap * sizeof(ValueType));
             }
-            if (!(flags & LFLAG_ARENA)) {
-                if (array != small_array)
-                    delete[] array;
-                if (array_types != small_array_types)
-                    delete[] array_types;
-            }
+            if (!(flags & LFLAG_ARENA))
+                table_free_array(array, array_types, small_array);
             flags &= ~LFLAG_ARENA;
             array = new_arr;
             array_types = new_types;
@@ -353,18 +340,15 @@ void LTable::settable(const LValue &key, const LValue &val) {
             if (idx == static_cast<int64_t>(array_size + 1)) {
                 size_t new_cap = (array_cap == 0) ? 8 : array_cap * 2;
                 const size_t hb_grow = table_heap_bytes(this);
-                TValue *new_arr = new TValue[new_cap];
-                ValueType *new_types = new ValueType[new_cap]();
+                TValue *new_arr = nullptr;
+                ValueType *new_types = nullptr;
+                table_alloc_array(new_arr, new_types, new_cap);
                 if (array_cap) {
                     std::memcpy(new_arr, array, array_cap * sizeof(TValue));
                     std::memcpy(new_types, array_types, array_cap * sizeof(ValueType));
                 }
-                if (!(flags & LFLAG_ARENA)) {
-                    if (array != small_array)
-                        delete[] array;
-                    if (array_types != small_array_types)
-                        delete[] array_types;
-                }
+                if (!(flags & LFLAG_ARENA))
+                    table_free_array(array, array_types, small_array);
                 flags &= ~LFLAG_ARENA;
                 array = new_arr;
                 array_types = new_types;
