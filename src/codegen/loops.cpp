@@ -105,7 +105,7 @@ void CodeEmitter::emitForStatement(const ASTNode &node, uint32_t node_idx) {
 
     out << "{\n";
     if (!native_for)
-        out << "clx::ScopeGuard _sg_for_" << node_idx << "(L);\n";
+        out << "clx::FrameGuard _fg_for_" << node_idx << "(_fr);\n";
 
     if (native_for) {
         if (counter_is_int) {
@@ -162,8 +162,7 @@ void CodeEmitter::emitForStatement(const ASTNode &node, uint32_t node_idx) {
             out << "clx::LValue limit_" << node_idx << " = ";
             emit_node(node.as.for_stmt.limit_expr);
             out << ";\n";
-            out << "L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&limit_" << node_idx << ".val, &limit_"
-                << node_idx << ".type);\n";
+            out << "_fr.push(limit_" << node_idx << ");\n";
             if (node.as.for_stmt.step_expr != 0xFFFFFFFF) {
                 out << "double st_" << node_idx << " = ";
                 if (ctx.nodes[node.as.for_stmt.step_expr].type == NodeType::Integer)
@@ -183,13 +182,11 @@ void CodeEmitter::emitForStatement(const ASTNode &node, uint32_t node_idx) {
             out << "clx::LValue start_" << node_idx << " = ";
             emit_node(node.as.for_stmt.start_expr);
             out << ";\n";
-            out << "L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&start_" << node_idx << ".val, &start_"
-                << node_idx << ".type);\n";
+            out << "_fr.push(start_" << node_idx << ");\n";
             out << "clx::LValue limit_" << node_idx << " = ";
             emit_node(node.as.for_stmt.limit_expr);
             out << ";\n";
-            out << "L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&limit_" << node_idx << ".val, &limit_"
-                << node_idx << ".type);\n";
+            out << "_fr.push(limit_" << node_idx << ");\n";
 
             if (node.as.for_stmt.step_expr != 0xFFFFFFFF) {
                 out << "clx::LValue step_" << node_idx << " = ";
@@ -198,8 +195,7 @@ void CodeEmitter::emitForStatement(const ASTNode &node, uint32_t node_idx) {
             } else {
                 out << "clx::LValue step_" << node_idx << " = clx::LValue(static_cast<double>(1.0));\n";
             }
-            out << "L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&step_" << node_idx << ".val, &step_" << node_idx
-                << ".type);\n";
+            out << "_fr.push(step_" << node_idx << ");\n";
 
             out << "double s_" << node_idx << ", l_" << node_idx << ", st_" << node_idx << ";\n";
             out << "if (!start_" << node_idx << ".to_number(s_" << node_idx << ") || !limit_" << node_idx
@@ -291,7 +287,7 @@ void CodeEmitter::emitForStatement(const ASTNode &node, uint32_t node_idx) {
         out << ", ";
         emit_node(ctx.nodes[_h_node].as.table_access.key);
         out << ");\n";
-        out << "L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&" << _h_name << ".val, &" << _h_name << ".type);\n";
+        out << "_fr.push(" << _h_name << ");\n";
         state.hoisted_lookups[_h_node] = _h_name;
         uint32_t _ht = ctx.nodes[_h_node].as.table_access.table;
         uint32_t _hk = ctx.nodes[_h_node].as.table_access.key;
@@ -310,7 +306,7 @@ void CodeEmitter::emitForStatement(const ASTNode &node, uint32_t node_idx) {
 
     auto emit_for_body = [&]() {
         if (is_cap || !is_n) {
-            out << "clx::ScopeGuard _sg_iter(L);\n";
+            out << "clx::FrameGuard _fg_iter(_fr);\n";
         }
 
         if (is_cap) {
@@ -318,8 +314,7 @@ void CodeEmitter::emitForStatement(const ASTNode &node, uint32_t node_idx) {
             out << "l_" << var_name
                 << " = clx::make_upvalue((i_val == static_cast<int64_t>(i_val)) ? "
                    "clx::LValue(static_cast<int64_t>(i_val)) : clx::LValue(i_val));\n";
-            out << "L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&l_" << var_name << "->val, &l_" << var_name
-                << "->type);\n";
+            out << "_fr.push(*l_" << var_name << ");\n";
         } else if (is_n) {
             if (counter_is_int) {
                 out << "const int64_t l_" << var_name << " = i_val;\n";
@@ -425,7 +420,7 @@ void CodeEmitter::emitForStatement(const ASTNode &node, uint32_t node_idx) {
     }
 
     for (size_t _hi = 0; _hi < state.hoisted_lookups.size(); ++_hi)
-        out << "L->shadow_top--;\n";
+        out << "_fr.pop();\n";
     state.hoisted_lookups = std::move(_saved_hoisted);
     state.hoisted_cfuncs = std::move(_saved_hoisted_cf);
     restore_loop_table_hoists(_added_ht);
@@ -479,8 +474,7 @@ void CodeEmitter::emitGenericForStatement(const ASTNode &node, uint32_t node_idx
             if (is_cap) {
                 out << "        clx::LUpValue l_" << v_name << ";\n";
                 out << "        l_" << v_name << " = clx::make_upvalue(" << _vexpr << ");\n";
-                out << "        L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&l_" << v_name << "->val, &l_"
-                    << v_name << "->type);\n";
+                out << "        _fr.push(*l_" << v_name << ");\n";
             } else {
                 out << "        clx::LValue l_" << v_name << " = " << _vexpr << ";\n";
                 out << "        ";
@@ -496,7 +490,7 @@ void CodeEmitter::emitGenericForStatement(const ASTNode &node, uint32_t node_idx
         emit_loop_table_hoists(loop.body_block, _added_ht);
         out << "    for (size_t _vi_" << node_idx << " = 1; _vi_" << node_idx << " <= l_" << vec_name
             << ".size(); ++_vi_" << node_idx << ") {\n";
-        out << "        clx::ScopeGuard _sg_gf_iter_" << node_idx << "(L);\n";
+        out << "        clx::FrameGuard _fg_gf_iter_" << node_idx << "(_fr);\n";
         if (loop.var_count >= 1)
             out << "        clx::LValue _kk_" << node_idx << " = clx::integer(static_cast<int64_t>(_vi_" << node_idx
                 << "));\n";
@@ -523,7 +517,7 @@ void CodeEmitter::emitGenericForStatement(const ASTNode &node, uint32_t node_idx
         return;
     }
 
-    out << "{\n    clx::ScopeGuard _sg_gen_for_" << node_idx << "(L);\n";
+    out << "{\n    clx::FrameGuard _fg_gen_for_" << node_idx << "(_fr);\n";
 
     out << "    clx::MultiValue _triplet_" << node_idx << ";\n";
     if (loop.iter_count > 0 && ctx.nodes[ctx.block_statements[loop.first_iter]].type == NodeType::CallExpression) {
@@ -538,13 +532,12 @@ void CodeEmitter::emitGenericForStatement(const ASTNode &node, uint32_t node_idx
                 is_direct = true;
         }
 
-        out << "    {\n        size_t _ssave_iter = L->shadow_top;\n";
+        out << "    {\n        size_t _ssave_iter = _fr.mark();\n";
         if (call_node.as.call_expr.arg_count > 0) {
             out << "        clx::LValue args_" << iter_node << "[" << call_node.as.call_expr.arg_count << "];\n";
             for (uint32_t a = 0; a < call_node.as.call_expr.arg_count; ++a) {
                 if (a > 0)
-                    out << "        L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&args_" << iter_node << "["
-                        << (a - 1) << "].val, &args_" << iter_node << "[" << (a - 1) << "].type);\n";
+                    out << "        _fr.push(args_" << iter_node << "[" << (a - 1) << "]);\n";
                 out << "        args_" << iter_node << "[" << a << "] = ";
                 emit_node(ctx.block_statements[call_node.as.call_expr.first_arg + a]);
                 out << ";\n";
@@ -569,7 +562,7 @@ void CodeEmitter::emitGenericForStatement(const ASTNode &node, uint32_t node_idx
                 << ", " << call_node.as.call_expr.arg_count << ", \"" << ctx.filename << "\", " << call_node.line
                 << ");\n";
         }
-        out << "        L->shadow_top = _ssave_iter;\n    }\n";
+        out << "        _fr.restore(_ssave_iter);\n    }\n";
     } else if (loop.iter_count > 0) {
         uint32_t iter_node = ctx.block_statements[loop.first_iter];
         out << "    _triplet_" << node_idx << " = clx::MultiValue(";
@@ -588,23 +581,18 @@ void CodeEmitter::emitGenericForStatement(const ASTNode &node, uint32_t node_idx
 
     //------------------ Root the iterator triplet for the whole loop: _f/_s/_var live in plain locals
 
-    out << "    L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&_f_" << node_idx << ".val, &_f_" << node_idx
-        << ".type);\n";
-    out << "    L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&_s_" << node_idx << ".val, &_s_" << node_idx
-        << ".type);\n";
-    out << "    L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&_var_" << node_idx << ".val, &_var_" << node_idx
-        << ".type);\n";
+    out << "    _fr.push(_f_" << node_idx << ");\n";
+    out << "    _fr.push(_s_" << node_idx << ");\n";
+    out << "    _fr.push(_var_" << node_idx << ");\n";
 
     std::vector<std::string_view> _added_ht;
     emit_loop_table_hoists(loop.body_block, _added_ht);
 
     out << "    while (true) {\n";
-    out << "        clx::ScopeGuard _sg_gf_iter_" << node_idx << "(L);\n";
+    out << "        clx::FrameGuard _fg_gf_iter_" << node_idx << "(_fr);\n";
     out << "        clx::LValue _args_" << node_idx << "[] = { _s_" << node_idx << ", _var_" << node_idx << " };\n";
-    out << "        L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&_args_" << node_idx << "[0].val, &_args_"
-        << node_idx << "[0].type);\n";
-    out << "        L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&_args_" << node_idx << "[1].val, &_args_"
-        << node_idx << "[1].type);\n";
+    out << "        _fr.push(_args_" << node_idx << "[0]);\n";
+    out << "        _fr.push(_args_" << node_idx << "[1]);\n";
     out << "        clx::MultiValue _res_" << node_idx << ";\n";
     out << "        if (_f_" << node_idx << ".type == clx::ValueType::Function) {\n";
     out << "            clx::LCFunction* _lcf_" << node_idx << " = static_cast<clx::LCFunction*>(_f_" << node_idx
@@ -616,10 +604,9 @@ void CodeEmitter::emitGenericForStatement(const ASTNode &node, uint32_t node_idx
     out << "            _res_" << node_idx << " = clx::call_function(L, _f_" << node_idx << ", _args_" << node_idx
         << ", 2, \"" << ctx.filename << "\", " << node.line << ");\n";
     out << "        }\n";
-    out << "        L->shadow_top -= 2;\n";
+    out << "        _fr.pop_n(2);\n";
     out << "        for (size_t m = 0; m < _res_" << node_idx << ".count; ++m)\n";
-    out << "            L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&_res_" << node_idx << "[m].val, &_res_"
-        << node_idx << "[m].type);\n";
+    out << "            _fr.push(_res_" << node_idx << "[m]);\n";
 
     out << "        _var_" << node_idx << " = (_res_" << node_idx << ".count > 0) ? _res_" << node_idx
         << "[0] : clx::LValue();\n";
