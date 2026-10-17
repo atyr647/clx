@@ -2169,10 +2169,11 @@ const char *intern_error_message(const char *msg, size_t len);
     throw LRuntimeException(LValue(intern_error_message(msg.data(), msg.size())));
 }
 
-//------------------ Raises "attempt to index a nil value" (or the actual type name) like Lua does
+//------------------ Raises "attempt to index a nil value" (or the actual type name) like Lua does.
+//------------------ Carries file:line like stock (missing-module indexing under --minimal hits this).
 [[noreturn]] CLX_INLINE_COLD void throw_index_error(LState *L, const LValue &obj) {
-    (void)L;
-    std::string msg = std::string("attempt to index a ") + VALUE_TYPE_NAMES[static_cast<size_t>(obj.type)] + " value";
+    std::string msg = file_line_prefix(L) + std::string("attempt to index a ")
+        + VALUE_TYPE_NAMES[static_cast<size_t>(obj.type)] + " value";
     throw LRuntimeException(LValue(intern_error_message(msg.data(), msg.size())));
 }
 
