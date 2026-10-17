@@ -698,4 +698,146 @@ void pass_callables(const ASTContext &ctx, AnalysisState &state, PassScratch &sk
     }
 }
 
+//------------------ tuple_value_ok: a multi-return value position that the tuple impl can emit.
+//------------------ Arithmetic (and unary minus) coerce their operands at runtime exactly like the
+//------------------ native_direct bodies do, so they need no proof; bare reads/calls keep their value
+//------------------ uncoerced on the generic path and therefore require a yields_number proof.
+static bool tuple_value_ok(const ASTContext &ctx, const AnalysisState &state, uint32_t node_idx,
+    const std::set<std::string_view> *known_numbers, std::string_view self_name,
+    const std::set<std::string_view> *param_numbers) {
+    uint32_t nidx = node_idx;
+    while (nidx < ctx.nodes.size() && ctx.nodes[nidx].type == NodeType::ParenExpression)
+        nidx = ctx.nodes[nidx].as.paren_expr.expr;
+    if (nidx == 0xFFFFFFFF || nidx >= ctx.nodes.size())
+        return false;
+    const auto &n = ctx.nodes[nidx];
+    if (n.type == NodeType::Number || n.type == NodeType::Integer)
+        return true;
+    if (n.type == NodeType::BinaryOp) {
+        int op = n.as.bin_op.op;
+        return op == static_cast<int>(BinaryOp::Add) || op == static_cast<int>(BinaryOp::Sub)
+            || op == static_cast<int>(BinaryOp::Mul) || op == static_cast<int>(BinaryOp::Div)
+            || op == static_cast<int>(BinaryOp::Mod) || op == static_cast<int>(BinaryOp::Pow)
+            || op == static_cast<int>(BinaryOp::FloorDiv);
+    }
+    if (n.type == NodeType::UnaryOp && n.as.unary_op.op == static_cast<int>(UnaryOp::Minus))
+        return true;
+    return yields_number(ctx, state, nidx, known_numbers, self_name, param_numbers);
+}
+
+//------------------ pass_multi_native: functions returning 2-4 native doubles via a tuple struct.
+//------------------ A function qualifies when every return holds the same N in [2,4] tuple-emittable
+//------------------ values (or forwards a single call to an already-qualified tuple callee of the
+//------------------ same N), with no globals, no varargs, no nested closures and no self-recursion.
+void pass_multi_native(const ASTContext &ctx, AnalysisState &state, PassScratch &sk, uint32_t root_node) {
+    (void)root_node;
+    auto &func_defs = sk.func_defs;
+    auto &known_numbers = sk.known_numbers;
+    for (const auto &fdef : func_defs) {
+        uint32_t f_idx = fdef.second;
+        if (state.reassigned_vars.count(fdef.first))
+            continue;
+        if (state.multi_native_return_counts.count(std::string(fdef.first)))
+            continue;
+        if (f_idx >= ctx.nodes.size() || ctx.nodes[f_idx].type != NodeType::FunctionDef)
+            continue;
+        const auto &fn = ctx.nodes[f_idx];
+        if (fn.as.func_def.is_vararg)
+            continue;
+        uint32_t nparams = fn.as.func_def.param_count;
+        std::set<std::string_view> pnums;
+        auto pnit = state.func_param_native.find(fdef.first);
+        if (pnit != state.func_param_native.end()) {
+            for (size_t p = 0; p < nparams && p < pnit->second.size(); ++p) {
+                if (!pnit->second[p])
+                    continue;
+                uint32_t pi = ctx.block_statements[fn.as.func_def.first_param + p];
+                if (pi < ctx.nodes.size() && ctx.nodes[pi].type == NodeType::Identifier)
+                    pnums.insert(std::string_view(ctx.nodes[pi].as.ident.name, ctx.nodes[pi].as.ident.length));
+            }
+        }
+        bool ok = true;
+        for (uint32_t i = 0; i < ctx.nodes.size() && ok; ++i) {
+            auto oit = state.node_func_owner.find(i);
+            if (oit == state.node_func_owner.end() || oit->second != f_idx)
+                continue;
+            const auto &nd = ctx.nodes[i];
+            if (nd.type == NodeType::FunctionDef && i != f_idx)
+                ok = false;
+            else if (nd.type == NodeType::Vararg)
+                ok = false;
+            else if (nd.type == NodeType::Identifier && nd.as.ident.is_global)
+                ok = false;
+            else if (nd.type == NodeType::CallExpression) {
+                uint32_t tg = nd.as.call_expr.target;
+                if (tg < ctx.nodes.size() && ctx.nodes[tg].type == NodeType::Identifier
+                    && !ctx.nodes[tg].as.ident.is_global
+                    && std::string_view(ctx.nodes[tg].as.ident.name, ctx.nodes[tg].as.ident.length) == fdef.first)
+                    ok = false;
+            }
+        }
+        if (!ok)
+            continue;
+        uint32_t ret_count = 0;
+        uint32_t tuple_n = 0;
+        for (uint32_t i = 0; i < ctx.nodes.size() && ok; ++i) {
+            auto oit = state.node_func_owner.find(i);
+            if (oit == state.node_func_owner.end() || oit->second != f_idx)
+                continue;
+            if (ctx.nodes[i].type != NodeType::ReturnStatement)
+                continue;
+            const auto &rs = ctx.nodes[i].as.return_stmt;
+            ++ret_count;
+            if (rs.value_count == 1) {
+                uint32_t rv = ctx.block_statements[rs.first_value];
+                bool passthrough = false;
+                if (rv < ctx.nodes.size() && ctx.nodes[rv].type == NodeType::CallExpression) {
+                    const auto &ce = ctx.nodes[rv].as.call_expr;
+                    if (ce.target < ctx.nodes.size() && ctx.nodes[ce.target].type == NodeType::Identifier
+                        && !ctx.nodes[ce.target].as.ident.is_global) {
+                        std::string callee(
+                            ctx.nodes[ce.target].as.ident.name, ctx.nodes[ce.target].as.ident.length);
+                        auto cit = state.multi_native_return_counts.find(callee);
+                        if (cit != state.multi_native_return_counts.end()) {
+                            auto pcit = state.func_param_counts.find(std::string_view(callee));
+                            uint32_t need = (pcit != state.func_param_counts.end()) ? pcit->second : 0xFFFFFFFF;
+                            if (ce.arg_count == need) {
+                                bool expands = false;
+                                if (ce.arg_count > 0) {
+                                    uint32_t la = ctx.block_statements[ce.first_arg + ce.arg_count - 1];
+                                    if (la < ctx.nodes.size()
+                                        && (ctx.nodes[la].type == NodeType::CallExpression
+                                            || ctx.nodes[la].type == NodeType::Vararg))
+                                        expands = true;
+                                }
+                                if (!expands && (tuple_n == 0 || tuple_n == cit->second)) {
+                                    tuple_n = cit->second;
+                                    passthrough = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!passthrough)
+                    ok = false;
+            } else if (rs.value_count >= 2 && rs.value_count <= 4) {
+                if (tuple_n == 0)
+                    tuple_n = rs.value_count;
+                else if (tuple_n != rs.value_count)
+                    ok = false;
+                for (uint32_t v = 0; v < rs.value_count && ok; ++v) {
+                    uint32_t vi = ctx.block_statements[rs.first_value + v];
+                    if (!tuple_value_ok(ctx, state, vi, &known_numbers, fdef.first, &pnums))
+                        ok = false;
+                }
+            } else {
+                ok = false;
+            }
+        }
+        if (!ok || ret_count == 0 || tuple_n < 2 || tuple_n > 4)
+            continue;
+        state.multi_native_return_counts.emplace(std::string(fdef.first), tuple_n);
+    }
+}
+
 }
