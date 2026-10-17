@@ -25,8 +25,9 @@ namespace clx {
 LState::LState()
     : allocated_objects(nullptr)
     , free_tables(nullptr)
+    , free_tables_big(nullptr)
     , free_functions(nullptr)
-    , shadow_top(0)
+    , metatabled_ud(nullptr)
     , current_file("")
     , current_line(0)
     , object_count(0)
@@ -98,23 +99,9 @@ LState::LState()
 }
 
 static void dtor_free_table(LTable *t) {
-    if (t->array && t->array != t->small_array) {
-        delete[] t->array;
-        t->array = nullptr;
-    }
-    if (t->array_types && t->array_types != t->small_array_types) {
-        delete[] t->array_types;
-        t->array_types = nullptr;
-    }
+    table_free_array(t->array, t->array_types, t->small_array);
     if (t->ext) {
-        if (t->ext->entries) {
-            free(t->ext->entries);
-            t->ext->entries = nullptr;
-        }
-        if (t->ext->hash_bitmap) {
-            free(t->ext->hash_bitmap);
-            t->ext->hash_bitmap = nullptr;
-        }
+        table_free_hash(t->ext->entries, t->ext->hash_bitmap);
         if (t->ext->ic) {
             delete[] t->ext->ic;
             t->ext->ic = nullptr;
@@ -175,8 +162,7 @@ void LState::invoke_gc_finalizer(LUserdata *ud, const char *tag) {
     if (gc_func.type != Function)
         return;
     LValue args[1] = { LValue(UserData, ud) };
-    size_t prev_shadow = this->shadow_top;
-    this->shadow_stack[this->shadow_top++] = TypedSlot(&args[0].val, &args[0].type);
+    RootRange rr(this, args, 1);
     try {
         call_function(this, gc_func, args, 1, tag, 0);
     } catch (const LRuntimeException &e) {
@@ -186,43 +172,51 @@ void LState::invoke_gc_finalizer(LUserdata *ud, const char *tag) {
     } catch (...) {
         std::cerr << "error in __gc metamethod\n";
     }
-    this->shadow_top = prev_shadow;
 }
+
+void (*clx_io_flush_all_ptr)() = nullptr;
+void (*clx_io_write_ptr)(FILE *fp, const char *p, size_t n) = nullptr;
 
 //------------------ LState::~LState — state destructor
 LState::~LState() {
+    if (clx_io_flush_all_ptr)
+        clx_io_flush_all_ptr();
     if (luaapi_cleanup)
         luaapi_cleanup(this);
-    shadow_stack.reset();
     if (gc_phase == GCPhase::Sweeping) {
         while (gc_phase == GCPhase::Sweeping)
             gc_step();
     }
 
-    for (LHeader *h = allocated_objects; h; h = h->next) {
-        if (h->type == static_cast<uint8_t>(UserData)) {
-            LUserdata *ud = static_cast<LUserdata *>(h);
-            invoke_gc_finalizer(ud, "StateClose_Finalizer");
+    for (int pass = 0; pass < 2; ++pass) {
+        for (LHeader *h = (pass == 0) ? allocated_objects : old_objects; h; h = h->next) {
+            if (h->type == static_cast<uint8_t>(UserData)) {
+                LUserdata *ud = static_cast<LUserdata *>(h);
+                invoke_gc_finalizer(ud, "StateClose_Finalizer");
+            }
         }
     }
 
-    LHeader *curr = allocated_objects;
-    while (curr) {
-        LHeader *next = curr->next;
-        if (curr->flags & LFLAG_VM_PROXY) {
-            if (clx_free_vm_proxy_ptr)
-                clx_free_vm_proxy_ptr(this, curr);
-        } else if (curr->type == static_cast<uint8_t>(Table))
-            dtor_free_table(static_cast<LTable *>(curr));
-        else if (curr->type == static_cast<uint8_t>(Function))
-            delete static_cast<LCFunction *>(curr);
-        else if (curr->type == static_cast<uint8_t>(UserData))
-            delete[] reinterpret_cast<char *>(curr);
-        else if (curr->type == static_cast<uint8_t>(Thread))
-            delete static_cast<LThread *>(curr);
-        curr = next;
+    for (int pass = 0; pass < 2; ++pass) {
+        LHeader *curr = (pass == 0) ? allocated_objects : old_objects;
+        while (curr) {
+            LHeader *next = curr->next;
+            if (curr->flags & LFLAG_VM_PROXY) {
+                if (clx_free_vm_proxy_ptr)
+                    clx_free_vm_proxy_ptr(this, curr);
+            } else if (curr->type == static_cast<uint8_t>(Table))
+                dtor_free_table(static_cast<LTable *>(curr));
+            else if (curr->type == static_cast<uint8_t>(Function))
+                delete static_cast<LCFunction *>(curr);
+            else if (curr->type == static_cast<uint8_t>(UserData))
+                delete[] reinterpret_cast<char *>(curr);
+            else if (curr->type == static_cast<uint8_t>(Thread))
+                delete static_cast<LThread *>(curr);
+            curr = next;
+        }
     }
     allocated_objects = nullptr;
+    old_objects = nullptr;
 
     {
         LTable *t = static_cast<LTable *>(gc_finalizable);
@@ -252,6 +246,13 @@ LState::~LState() {
         ft = next;
     }
     free_tables = nullptr;
+    ft = free_tables_big;
+    while (ft) {
+        LTable *next = static_cast<LTable *>(ft->next);
+        dtor_free_table(ft);
+        ft = next;
+    }
+    free_tables_big = nullptr;
 
     slab_release();
 
@@ -321,11 +322,29 @@ LValue LState::create_table(size_t asize, size_t hsize) {
     gc_maybe_collect();
 
     LTable *t;
-    bool recycled_tbl = (free_tables != nullptr);
-    uint8_t prev_age_tbl = recycled_tbl ? free_tables->age : AGE_YOUNG;
-    if (free_tables) {
-        t = free_tables;
-        free_tables = static_cast<LTable *>(free_tables->next);
+    //------------------ Size-segregated pool pop: a sized creation reuses a big-buffer table (same-shape
+    //------------------ waves land head-first), while a size-unknown creation ({}) takes a small one — a
+    //------------------ 90KB array must never park, counted, on a table that will never use it while its
+    //------------------ rightful user allocates another (linear pool growth wave-over-wave).
+    bool want_big = (asize > 0);
+    LTable **pool = want_big ? &free_tables_big : &free_tables;
+    if (!*pool)
+        pool = want_big ? &free_tables : &free_tables_big;
+    bool recycled_tbl = (*pool != nullptr);
+    if (recycled_tbl)
+        g_alloc_census.table_recycled++;
+    else
+        g_alloc_census.table_new++;
+    uint8_t prev_age_tbl = recycled_tbl ? (*pool)->age : AGE_YOUNG;
+    if (*pool) {
+        t = *pool;
+        *pool = static_cast<LTable *>((*pool)->next);
+        if (!want_big && t->array && t->array != t->small_array) {
+            //------------------ small creation drew big (small list drained): free the array it will never
+            //------------------ use instead of parking it. No accounting: dispose already subtracted it.
+            table_free_array(t->array, t->array_types, t->small_array);
+            t->array_cap = 0;
+        }
         if (t->ext) {
             if (!t->ext->entries)
                 t->ext->hash_size = 0;
@@ -351,14 +370,7 @@ LValue LState::create_table(size_t asize, size_t hsize) {
     if (asize > 0) {
         if (asize <= 2) {
 
-            if (t->array && t->array != t->small_array) {
-                delete[] t->array;
-                t->array = nullptr;
-            }
-            if (t->array_types && t->array_types != t->small_array_types) {
-                delete[] t->array_types;
-                t->array_types = nullptr;
-            }
+            table_free_array(t->array, t->array_types, t->small_array);
             t->array = t->small_array;
             t->array_types = t->small_array_types;
             t->array_size = asize;
@@ -370,12 +382,8 @@ LValue LState::create_table(size_t asize, size_t hsize) {
             std::fill(t->array_types, t->array_types + asize, ValueType::Nil);
             t->array_cap = asize;
         } else {
-            if (t->array && t->array != t->small_array)
-                delete[] t->array;
-            if (t->array_types && t->array_types != t->small_array_types)
-                delete[] t->array_types;
-            t->array = new TValue[asize];
-            t->array_types = new ValueType[asize]();
+            table_free_array(t->array, t->array_types, t->small_array);
+            table_alloc_array(t->array, t->array_types, asize);
             t->array_size = asize;
             t->array_cap = asize;
         }
@@ -411,6 +419,10 @@ clx::LValue clx::LState::create_closure(CFunctionType func, LTable *env, std::ve
 
     LCFunction *f;
     bool recycled_fn = (free_functions != nullptr);
+    if (recycled_fn)
+        g_alloc_census.closure_recycled++;
+    else
+        g_alloc_census.closure_new++;
     uint8_t prev_age_fn = recycled_fn ? free_functions->age : AGE_YOUNG;
     if (free_functions) {
         f = free_functions;
@@ -455,6 +467,7 @@ LValue newuserdata(LState *L, size_t size) {
     ud->flags = 0;
     ud->age = AGE_YOUNG;
     ud->metatable = nullptr;
+    ud->meta_next = nullptr;
     ud->size = size;
 
     ud->next = L->allocated_objects;
@@ -515,6 +528,8 @@ LState *open(int argc, char *argv[]) {
 
 //------------------ close — close Lua state
 void close(LState *L) {
+    if (std::getenv("CLX_ALLOC_STATS"))
+        dump_alloc_census();
     if (clx_current_L == L)
         clx_current_L = nullptr;
 #if defined(_WIN32)
