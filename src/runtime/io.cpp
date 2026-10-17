@@ -10,17 +10,22 @@
 #endif
 
 #include "clx.h"
+#include "internal.h"
 #include <cerrno>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <cstdio>
+#include <io.h>
 #define popen _popen
 #define pclose _pclose
+#else
+#include <unistd.h>
 #endif
 
 namespace clx {
@@ -30,6 +35,149 @@ struct FileUd {
     bool close_on_gc;
     bool is_pipe;
 };
+
+//------------------ Shared per-FILE* output batching. One fwrite() takes two mutexes
+//------------------ (flockfile/funlockfile, ~30ns each), so 2.5M single-char io.writes burn ~70ms in
+//------------------ locking alone (measured microbenchmark: 70ms per-char vs 1ms batched). Batching in
+//------------------ userspace cuts fasta's 2.5M lock pairs to a few hundred flushes.
+//------------------ Keyed by FILE* (not FileUd): io.write's default-output handle and io.stdout are
+//------------------ distinct FileUds over the same FILE*, and stock libc preserves their order through
+//------------------ its shared buffer — per-FileUd buffers would reorder them. Single-threaded
+//------------------ assumption matches the existing process-global default_input/default_output slots.
+struct OutBufEnt {
+    FILE *fp = nullptr;
+    char *buf = nullptr;
+    size_t len = 0;
+    size_t cap = 0;
+    int mode = 0;
+    bool mode_init = false;
+};
+static constexpr size_t kOutBufSlots = 16;
+static constexpr size_t kOutBufCap = 8192;
+static OutBufEnt out_bufs[kOutBufSlots];
+
+static OutBufEnt *outbuf_find(FILE *fp) {
+    for (size_t i = 0; i < kOutBufSlots; ++i)
+        if (out_bufs[i].fp == fp)
+            return &out_bufs[i];
+    return nullptr;
+}
+
+static OutBufEnt *outbuf_get(FILE *fp) {
+    if (OutBufEnt *e = outbuf_find(fp))
+        return e;
+    for (size_t i = 0; i < kOutBufSlots; ++i) {
+        if (out_bufs[i].fp == nullptr) {
+            out_bufs[i].fp = fp;
+            return &out_bufs[i];
+        }
+    }
+    return nullptr;
+}
+
+static void outbuf_flush_ent(OutBufEnt *e) {
+    if (e->len > 0 && e->fp) {
+        std::fwrite(e->buf, 1, e->len, e->fp);
+        e->len = 0;
+    }
+}
+
+//------------------ outbuf_default_mode — stock-matching buffering: stderr unbuffered,
+//------------------ tty output line-buffered (interactive prompts appear), else fully batched.
+static int outbuf_default_mode(FILE *fp) {
+    if (fp == stderr)
+        return 2;
+#if defined(_WIN32) || defined(_WIN64)
+    return (_isatty(_fileno(fp)) ? 1 : 0);
+#else
+    return (isatty(fileno(fp)) ? 1 : 0);
+#endif
+}
+
+static void outbuf_write(FILE *fp, const char *p, size_t n) {
+    if (n == 0 || !fp)
+        return;
+    //------------------ CLX_IO_NOBUF escape hatch (A/B + exotic FILE*): cached, getenv is O(environ).
+    static int nobuf = -1;
+    if (nobuf < 0)
+        nobuf = std::getenv("CLX_IO_NOBUF") ? 1 : 0;
+    if (nobuf) {
+        std::fwrite(p, 1, n, fp);
+        return;
+    }
+    OutBufEnt *e = outbuf_get(fp);
+    if (!e) {
+        std::fwrite(p, 1, n, fp);
+        return;
+    }
+    if (!e->mode_init) {
+        e->mode = outbuf_default_mode(fp);
+        e->mode_init = true;
+    }
+    if (e->mode == 2) {
+        std::fwrite(p, 1, n, fp);
+        return;
+    }
+    if (!e->buf) {
+        e->buf = static_cast<char *>(std::malloc(kOutBufCap));
+        if (!e->buf) {
+            std::fwrite(p, 1, n, fp);
+            return;
+        }
+        e->cap = kOutBufCap;
+    }
+    if (n >= e->cap) {
+        outbuf_flush_ent(e);
+        std::fwrite(p, 1, n, fp);
+        return;
+    }
+    if (e->len + n > e->cap)
+        outbuf_flush_ent(e);
+    std::memcpy(e->buf + e->len, p, n);
+    e->len += n;
+    if (e->mode == 1 && std::memchr(p, '\n', n))
+        outbuf_flush_ent(e);
+}
+
+//------------------ outbuf_flush_fp — push one FILE*'s batch to libc (read/seek/flush/close paths).
+static void outbuf_flush_fp(FILE *fp) {
+    if (fp)
+        if (OutBufEnt *e = outbuf_find(fp))
+            outbuf_flush_ent(e);
+}
+
+//------------------ outbuf_set_mode — record a setvbuf mode (0 full, 1 line, 2 no) for a FILE*.
+static void outbuf_set_mode(FILE *fp, int mode) {
+    if (!fp)
+        return;
+    OutBufEnt *e = outbuf_get(fp);
+    if (!e)
+        return;
+    outbuf_flush_fp(fp);
+    e->mode = mode;
+    e->mode_init = true;
+}
+
+static void outbuf_drop_fp(FILE *fp) {
+    if (!fp)
+        return;
+    if (OutBufEnt *e = outbuf_find(fp)) {
+        outbuf_flush_ent(e);
+        std::free(e->buf);
+        e->buf = nullptr;
+        e->len = e->cap = 0;
+        e->mode = 0;
+        e->mode_init = false;
+        e->fp = nullptr;
+    }
+}
+
+//------------------ outbuf_flush_all — flush every batched FILE* (state close; std files are never
+//------------------ closed so their buffers would otherwise be lost). Published via clx_io_flush_all_ptr.
+static void outbuf_flush_all() {
+    for (size_t i = 0; i < kOutBufSlots; ++i)
+        outbuf_flush_ent(&out_bufs[i]);
+}
 
 struct LinesIterUd {
     FileUd *f;
@@ -171,6 +319,7 @@ static MultiValue make_lines_iter(LState *L, FileUd *f) {
         LinesIterUd *ud = static_cast<LinesIterUd *>(u->data());
         if (!ud->f->fp)
             return MultiValue();
+        outbuf_flush_fp(ud->f->fp);
         LValue line = read_line(L, ud->f->fp);
         if (line.type == Nil)
             return MultiValue();
@@ -184,6 +333,7 @@ static MultiValue make_lines_iter(LState *L, FileUd *f) {
 }
 
 static MultiValue file_read_args(LState *L, FileUd *f, const LValue *a, size_t c, bool lenient = false) {
+    outbuf_flush_fp(f->fp);
     if (c == 1)
         return MultiValue(read_line(L, f->fp));
 
@@ -253,7 +403,7 @@ static MultiValue file_read_args(LState *L, FileUd *f, const LValue *a, size_t c
 static void file_write_args(LState *L, FileUd *f, const LValue *a, size_t c, bool lenient = false) {
     for (size_t i = 1; i < c; ++i) {
         if (a[i].type == String) {
-            std::fwrite(a[i].as_string(), 1, a[i].string_len(), f->fp);
+            outbuf_write(f->fp, a[i].as_string(), a[i].string_len());
         } else if (a[i].type == Double || a[i].type == Int64) {
             char buf[64];
             int n;
@@ -262,7 +412,7 @@ static void file_write_args(LState *L, FileUd *f, const LValue *a, size_t c, boo
             else
                 n = std::snprintf(buf, sizeof(buf), "%.14g", a[i].as_number());
             if (n > 0)
-                std::fwrite(buf, 1, static_cast<size_t>(n), f->fp);
+                outbuf_write(f->fp, buf, static_cast<size_t>(n));
         } else if (!lenient) {
             char buf[128];
             throw_runtime_error(bad_arg_msg(L, (int)(i + 1), "io.write", "string expected"));
@@ -293,6 +443,7 @@ static LValue make_file(LState *L, FILE *fp, bool close_on_gc, bool is_pipe = fa
         FileUd *f = as_file(L, a[0]);
         if (!f->fp)
             return MultiValue(clx::boolean(true));
+        outbuf_drop_fp(f->fp);
         int r;
         if (f->is_pipe)
             r = pclose(f->fp);
@@ -315,6 +466,7 @@ static LValue make_file(LState *L, FILE *fp, bool close_on_gc, bool is_pipe = fa
 
     auto meth_flush = [](LState *L, const LValue *a, size_t c) -> MultiValue {
         FileUd *f = as_file(L, a[0]);
+        outbuf_flush_fp(f->fp);
         if (fflush(f->fp) != 0) {
             char buf[128];
             std::snprintf(buf, sizeof(buf), "cannot flush file: %s", std::strerror(errno));
@@ -333,6 +485,7 @@ static LValue make_file(LState *L, FILE *fp, bool close_on_gc, bool is_pipe = fa
 
     auto meth_seek = [](LState *L, const LValue *a, size_t c) -> MultiValue {
         FileUd *f = as_file(L, a[0]);
+        outbuf_flush_fp(f->fp);
         const char *whence = "cur";
         if (c >= 2 && a[1].type != Nil)
             whence = check_string(L, a[1]);
@@ -374,11 +527,13 @@ static LValue make_file(LState *L, FILE *fp, bool close_on_gc, bool is_pipe = fa
         size_t size = BUFSIZ;
         if (c >= 3 && a[2].type != Nil)
             size = static_cast<size_t>(check_integer(L, a[2]));
+        outbuf_flush_fp(f->fp);
         if (setvbuf(f->fp, nullptr, smode, size) != 0) {
             char buf[128];
             std::snprintf(buf, sizeof(buf), "cannot setvbuf: %s", std::strerror(errno));
             throw_runtime_error(buf);
         }
+        outbuf_set_mode(f->fp, (smode == _IONBF) ? 2 : (smode == _IOLBF) ? 1 : 0);
         return MultiValue(boolean(true));
     };
 
@@ -395,6 +550,7 @@ static LValue make_file(LState *L, FILE *fp, bool close_on_gc, bool is_pipe = fa
             return MultiValue();
         FileUd *f = static_cast<FileUd *>(ud->data());
         if (f->fp && f->close_on_gc) {
+            outbuf_drop_fp(f->fp);
             if (f->is_pipe)
                 pclose(f->fp);
             else
@@ -409,6 +565,7 @@ static LValue make_file(LState *L, FILE *fp, bool close_on_gc, bool is_pipe = fa
             { "seek", meth_seek }, { "setvbuf", meth_setvbuf }, { "write", meth_write }, { "__gc", meth_gc } });
     mt->settable(LValue(L->intern_string("__index")), LValue(Table, mt));
     ud->metatable = mt;
+    meta_ud_list_add(L, ud);
     L->unroot_value(LValue(UserData, ud));
     L->unroot_value(file_mt);
     return LValue(UserData, ud);
@@ -431,6 +588,7 @@ static LValue get_std_file(LState *L, FILE *fp) {
     auto meth_flush = [](LState *L, const LValue *a, size_t c) -> MultiValue {
         LUserdata *u = static_cast<LUserdata *>(a[0].as_pointer());
         FileUd *f = static_cast<FileUd *>(u->data());
+        outbuf_flush_fp(f->fp);
         fflush(f->fp);
         return MultiValue(boolean(true));
     };
@@ -460,6 +618,7 @@ static LValue get_std_file(LState *L, FILE *fp) {
         int64_t offset = 0;
         if (c >= 3 && a[2].type != Nil)
             offset = check_integer(L, a[2]);
+        outbuf_flush_fp(f->fp);
         std::fseek(f->fp, offset, origin);
         return MultiValue(integer(static_cast<int64_t>(std::ftell(f->fp))));
     };
@@ -475,6 +634,7 @@ static LValue get_std_file(LState *L, FILE *fp) {
             { "seek", meth_seek }, { "write", meth_write } });
     mt->settable(LValue(L->intern_string("__index")), LValue(Table, mt));
     ud->metatable = mt;
+    meta_ud_list_add(L, ud);
     L->unroot_value(LValue(UserData, ud));
     L->unroot_value(file_mt);
     return LValue(UserData, ud);
@@ -510,6 +670,7 @@ static MultiValue io_close(LState *L, const LValue *args, size_t count) {
             LValue a = default_output;
             FileUd *f = as_file(L, a);
             if (f->fp) {
+                outbuf_drop_fp(f->fp);
                 fclose(f->fp);
                 f->fp = nullptr;
             }
@@ -518,6 +679,7 @@ static MultiValue io_close(LState *L, const LValue *args, size_t count) {
     }
     FileUd *f = as_file(L, args[0]);
     if (f->fp) {
+        outbuf_drop_fp(f->fp);
         fclose(f->fp);
         f->fp = nullptr;
     }
@@ -528,8 +690,10 @@ static MultiValue io_flush(LState *L, const LValue *args, size_t count) {
     if (default_output.type == UserData) {
         LUserdata *u = static_cast<LUserdata *>(default_output.as_pointer());
         FileUd *f = static_cast<FileUd *>(u->data());
+        outbuf_flush_fp(f->fp);
         fflush(f->fp);
     } else {
+        outbuf_flush_fp(stdout);
         fflush(stdout);
     }
     return MultiValue(boolean(true));
@@ -622,6 +786,7 @@ static MultiValue io_read(LState *L, const LValue *args, size_t count) {
 
     LValue file = default_input;
     FileUd *f = as_file(L, file);
+    outbuf_flush_fp(f->fp);
 
     if (count == 0) {
         return MultiValue(read_line(L, f->fp));
@@ -699,7 +864,7 @@ static MultiValue io_write(LState *L, const LValue *args, size_t count) {
     FileUd *f = static_cast<FileUd *>(u->data());
     for (size_t i = 0; i < count; ++i) {
         if (args[i].type == String) {
-            std::fwrite(args[i].as_string(), 1, args[i].string_len(), f->fp);
+            outbuf_write(f->fp, args[i].as_string(), args[i].string_len());
         } else if (args[i].type == Double || args[i].type == Int64) {
             char buf[64];
             int n;
@@ -708,7 +873,7 @@ static MultiValue io_write(LState *L, const LValue *args, size_t count) {
             else
                 n = std::snprintf(buf, sizeof(buf), "%.14g", args[i].as_number());
             if (n > 0)
-                std::fwrite(buf, 1, static_cast<size_t>(n), f->fp);
+                outbuf_write(f->fp, buf, static_cast<size_t>(n));
         }
     }
     return MultiValue(boolean(true));
@@ -756,6 +921,8 @@ static MultiValue io_tmpfile(LState *L, const LValue *args, size_t count) {
 }
 
 void luastd_io(LState *L) {
+    clx_io_flush_all_ptr = outbuf_flush_all;
+    clx_io_write_ptr = outbuf_write;
     LValue t = L->create_table();
     LTable *tbl = static_cast<LTable *>(t.as_pointer());
     tbl->bind_all(L,
