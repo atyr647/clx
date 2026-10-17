@@ -28,21 +28,10 @@ static void register_loaded_builtins(LState *L) {
     lt->settable(LValue(L->intern_string("_G")), LValue(ValueType::Table, L->_G));
 }
 
-//------------------ openlibs: opens all standard Lua libraries
-void openlibs(LState *L) {
-    luastd_string(L);
-    luastd_table(L);
-    luastd_math(L);
-    luastd_io(L);
-    luastd_os(L);
-    luastd_utf8(L);
-    luastd_coroutine(L);
-    register_loaded_builtins(L);
-}
-
-//------------------ openlibs_minimal: opens only the string library (--minimal keeps base + package + string)
+//------------------ openlibs_minimal: registers whatever is open (--minimal links base + package;
+//------------------ every other std module arrives via --modules <name>, whose luastd_* call the driver
+//------------------ emits into main before this. base + package come from LState::open unconditionally.)
 void openlibs_minimal(LState *L) {
-    luastd_string(L);
     register_loaded_builtins(L);
 }
 }
