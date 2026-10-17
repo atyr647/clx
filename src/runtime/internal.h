@@ -8,8 +8,18 @@
 #pragma once
 
 #include "clx_runtime.h"
+#include <cstdio>
 
 namespace clx {
+
+//------------------ Optional-io hooks: assigned by luastd_io when the io module is linked in, null
+//------------------ under --minimal (base + package + string only). Same pattern as
+//------------------ clx_free_vm_proxy_ptr: the pointers live in always-linked state.cpp so referencing
+//------------------ them never pulls io.o back in (which --gc-sections would otherwise drop).
+//------------------ clx_io_write_ptr shares print/io.write ordering on stdout; every read/seek/flush/
+//------------------ close path inside io.cpp flushes first, so ordering matches stock.
+extern void (*clx_io_flush_all_ptr)();
+extern void (*clx_io_write_ptr)(FILE *fp, const char *p, size_t n);
 
 //------------------ register_static_preload: registers a static preload loader for a module
 void register_static_preload(LState *L, const char *name, LValue(open_func)(LState *));
