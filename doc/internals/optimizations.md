@@ -178,9 +178,9 @@ struct LTableExt {
     LTable *meta_next = nullptr;        // GC metatable-list link
 };
 
-struct LTable : public LHeader {
-    TValue *array;
-    ValueType *array_types;
+struct LTable : public LHeader {       // hot array fields sit in cache line 1 after LHeader
+    TValue *array;                      // co-allocated block base (or small_array)
+    ValueType *array_types;             // points inside the block, never freed separately
     size_t array_size, array_cap;
     TValue small_array[2];              // inline buffer for tiny arrays
     ValueType small_array_types[2];
@@ -203,6 +203,32 @@ Arrays of size ≤ 2 use `small_array`/`small_array_types` storage inside `LTabl
 heap allocation and no accounting overhead for the common small-table case. Buffers retained
 on the table free list are reused (avoids `new[]`/`delete[]` churn) and deallocated only when
 too small for a growth.
+
+### Co-allocated array block
+
+Larger array parts use one malloc holding `TValue[cap]` immediately followed by
+`ValueType[cap]` (`table_alloc_array`/`table_free_array` in `include/clx_runtime.h`), instead
+of two separate `new[]` allocations. Zeroed memory is already initialized (`TValue` u64=0,
+`Nil`=0), so `calloc` replaces `new[]`+value-init. The split SoA layout is preserved — the
+dense `ValueType` array keeps its SIMD type scans — but the two tag/payload lines are now
+adjacent and every array alloc/grow pays one malloc/free instead of two. `table_heap_bytes`
+is unchanged (`cap * (sizeof(TValue) + sizeof(ValueType))`), so GC pacing is unaffected.
+Measured neutral on `binarytrees`/`fasta`/`hashtable` (within run-to-run noise); the win is
+structural — half the allocator traffic on array growth, better locality under pressure.
+
+### Fused hash block
+
+Hash storage uses one `calloc` holding `entries[cap]` immediately followed by the occupancy
+bitmap words (`table_alloc_hash`/`table_free_hash` in `include/clx_runtime.h`), instead of two
+separate `calloc`s. `entries` sits at offset 0, so freeing it frees the whole block and
+`hash_bitmap` is never freed separately (`cap * 24` is always 8-byte aligned, so no padding).
+`table_heap_bytes` is unchanged (same summed bytes), so GC pacing is unaffected. Arena tables
+keep their existing behavior (arena-owned entries + null bitmap until first resize, then a
+heap fused block takes over and clears the flag). As a side effect, the GC finalizable drain
+now releases the bitmap together with entries (previously leaked) and nulls the pointer, so a
+later resize of a recycled table cannot double-free a stale bitmap. Measured neutral on
+`canada` (0.132 vs 0.130–0.137, within noise) — tiny `calloc` pairs are nearly free from the
+thread cache; the win is structural, like the array block above.
 
 ## 3. Inline caching
 
@@ -336,6 +362,16 @@ literal at every access.
 `intern_preallocated()` adopts a pre-formatted buffer directly into the StringPool, cutting
 string concat from 3 heap allocations to 1 (or 0 on pool hit).
 
+### Pooled keys for global reads/writes
+
+Every `Identifier` (including global names) is entered in the compile-time string pool, so
+generated code reads/writes mutable globals via `get_env_var_key`/`set_env_var_key` with a
+pooled `cstr_` key instead of `get_env_var`/`set_env_var` with a raw name. The pooled-key
+forms do the same raw `gettable`/`settable` on `_ENV` but skip the per-execution
+`strlen` + hash + pool probe of `intern_string`. Skynet (1.1 M recursive calls, each reading
+the global `skynet` inside its fan-out loop) went from 1,111,172 pool hits to ~60 and
+~1.09x faster, with byte-identical output.
+
 ## 6. Code generation optimizations
 
 ### Loop transformations
@@ -386,14 +422,15 @@ risk is introduced. Only definitely-table locals are considered; a table declare
 (codegen forward-declares such locals but they are uninitialized) uses the checked path.
 The failure mode is a missed optimization, never incorrect code.
 
-### Snapshot shadow-stack roots for locals, parameters and loop variables
+### Snapshot frame roots for locals, parameters and loop variables
 
-Every non-native local is rooted on the shadow stack so the GC can find the heap objects
-it holds. The root slot stores a *pointer to the local's storage*, which forces the local
-into memory and defeats register allocation for the whole block -- measured at ~2.4x on an
-access-dense inner loop such as `bubble.lua`'s swap.
+Every non-native local is rooted in its function's **root frame** (`clx::Frame<N>`, see
+`clx_runtime.h`) so the GC can find the heap objects it holds. Root slots are *indirect* --
+each aliases an `LValue` with a stable address -- so a slot stores a pointer to the local's
+storage, which forces the local into memory and defeats register allocation for the whole
+block -- measured at ~2.4x on an access-dense inner loop such as `bubble.lua`'s swap.
 
-For a local whose uses never force it into memory, `emit_local_root` /`emit_param_root`
+For a local whose uses never force it into memory, `emit_local_root` / `emit_param_root`
 root a private snapshot slot instead, so the local's own address is never taken and the
 local stays in a register. This covers block locals that are never reassigned (not in
 `reassigned_vars`), and parameters and generic-for variables that are never an assignment
@@ -409,13 +446,13 @@ end
 -- Generated C++
 clx::LValue l_temp = ...;
 clx::LValue _rs_temp = l_temp;
-L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&_rs_temp.val, &_rs_temp.type);
+_fr.push(_rs_temp);
 ```
 
-The GC only ever *reads* shadow slots (`mark`/`push_if_needed`); nothing writes back
-through them, so a snapshot is equivalent as long as the variable is never assigned
-again -- which is exactly the eligibility condition, and any other shape keeps the direct
-root. The block guard is unchanged, so the push/pop stays balanced.
+The GC only ever *reads* root slots; nothing writes back through them, so a snapshot is
+equivalent as long as the variable is never assigned again -- which is exactly the
+eligibility condition, and any other shape keeps the direct root. The block watermark is
+unchanged, so the push/restore stays balanced.
 
 A snapshot only pays off when the local can actually stay in registers. `scan_own` walks
 the enclosing function body tracking whether each use is *by reference* -- that is,
@@ -433,6 +470,63 @@ missed optimization, never incorrect code.
 went stale or lost its only reference: a local, a parameter and a loop variable each held
 as the GC's only reference across a full collection, plus reassignment, closure capture,
 shadowing, `goto`-crossed locals and `<close>`.
+
+### Unrooted locals (`pass_nogc_locals`)
+
+A further cut: locals the optimizer proves can never hold a GC-managed value skip their
+frame slot entirely — no `_fr.push`, not even a snapshot. Only `Table`/`Thread`/`Function`/
+`UserData` are ever traced (`gc_push_for_trace`), and strings are never collected, so a
+local holding only numbers, booleans, nil or strings is invisible to the collector and
+needs no root, with no liveness analysis required.
+
+`pass_nogc_locals` (`src/optimizer/numbers.cpp`, runs last) computes a per-scope fixed
+point: a block local survives only if every reaching assignment — declaration values and
+later stores, with Lua multi-value adjustment (only calls/varargs expand; missing values
+are nil) — is nogc-clean. Literals, comparisons, `#`, `not`, arithmetic/bitwise/concat of
+clean operands, numeric table reads, and calls to proven numeric builtins qualify;
+constructors, closures, unknown calls, globals, parameters, and captured locals (any
+cross-function reference marks the declaration `is_captured`, which disqualifies it)
+do not. A declaration's own names are hidden from its RHS check, so `local x = x` reads
+the outer `x` correctly. Codegen consults the set in `emit_local_root` (and the main-chunk
+declaration path) and emits nothing for exempt locals. Measured effect on current
+benchmarks is within noise (±1%) — per-entry pushes were already cheap next to boxing
+and dispatch — but frames are smaller and minor collections walk fewer dead slots, and
+the analysis is a foundation for cutting per-call rooting next.
+
+### Tuple returns instead of `MultiValue` (`ClxTup`)
+
+A `MultiValue` is a heap-free but *dynamic* container: it carries a value array plus a count,
+and every multi-return function has to build one and every caller has to index it. For
+functions the optimizer can prove return 2–4 **numeric** values, the codegen emits a
+fixed-arity tuple struct instead:
+
+```cpp
+struct ClxTup2 { double v0; double v1; };
+struct ClxTup3 { double v0; double v1; double v2; };
+struct ClxTup4 { double v0; double v1; double v2; double v3; };
+```
+
+The optimizer pass `pass_multi_native` (`src/optimizer/functions.cpp`) qualifies a function
+when every `return` statement holds the same `N` in `[2, 4]` tuple-emittable values, or
+forwards a single call to an already-qualified tuple callee of the same `N`. It refuses
+functions with globals, varargs, nested closures, or self-recursion, and records the result
+in `multi_native_return_counts`. Value positions are checked by `tuple_value_ok`: arithmetic
+and unary minus coerce at runtime, so they need no proof; bare reads and calls require a
+`yields_number` proof.
+
+The codegen then emits a `native_<name>` lambda returning `ClxTup<N>`
+(`emit_multi_impl_def`) alongside the generic closure, so non-tuple call shapes keep working.
+An exact-arity destructure (`local x, y, z = f(...)`) bypasses the closure entirely and
+binds the tuple fields directly. The win over `MultiValue` (which already inlines up to 4
+values) is that the tuple holds raw `double`s: no per-element `LValue` boxing on the return
+path, no count dispatch at the call site, and downstream native arithmetic consumes the
+fields without unboxing.
+
+Tuple element reads that cannot be proven numeric are wrapped in `clx::coerce_number(L, v)`,
+which converts numbers exactly, parses numeric strings like arithmetic coercion, and throws
+the same arithmetic error the generic path would raise rather than silently mapping a
+non-number to `0.0` the way `as_number()` does. Non-tuple call sites keep the ordinary
+`MultiValue` path unchanged.
 
 ### Branch prediction hints
 
@@ -556,6 +650,25 @@ for `Double`, `Int64`, and `Nil` cases, falling back to full `clx::table_get`/`c
 for metamethod or non-numeric values. The codegen emits `table_increment`, `table_decrement`,
 `table_multiply`, or `table_divide` via `emitTableOp`, avoiding duplicated emit logic for
 each compound assignment operator.
+
+### Shared per-FILE* output batching
+
+One `fwrite()` takes two mutexes (`flockfile`/`funlockfile`, ~30ns each), so fasta's 2.5M
+single-char `io.write` calls burned ~70ms in locking alone (measured: 70ms per-char vs 1ms
+batched). `io.cpp` batches output in userspace: 16 slots keyed by `FILE*` (not `FileUd`, so
+`io.write`'s default-output handle and `io.stdout` — distinct `FileUd`s over the same `FILE*`
+— keep stock ordering through one shared buffer), 8KB each, flushed to libc when full.
+`print`/`warn` route through the same buffer, so `print` and `io.write` share one ordering
+domain on stdout. Every read/seek/flush/close/`setvbuf` path flushes first, and `__gc` close
+flushes too, so write→read, `file:close()`, and unclosed-at-GC files all match stock.
+Buffering mode mirrors stock: stderr unbuffered, tty output line-buffered, else fully batched;
+`setvbuf("no"/"line"/"full")` updates the slot mode. `CLX_IO_NOBUF=1` bypasses batching
+(escape hatch + A/B). Measured fasta N=1M same-binary A/B: 1.29×.
+
+The batch is optional-module-safe: `~LState` and `print`/`warn` call it only through nullable
+hooks (`clx_io_flush_all_ptr`, `clx_io_write_ptr`, assigned by `luastd_io` — same pattern as
+`clx_free_vm_proxy_ptr`), so `--minimal` (base + package + string) still drops `io.o` entirely
+via `--gc-sections`.
 
 ## Optimization levels
 
