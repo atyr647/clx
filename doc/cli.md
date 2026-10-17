@@ -35,9 +35,9 @@ compiler underneath (see [Pass-through options](#pass-through-options)).
 | `--size` | Optimize for a small binary (default) |
 | `--fast` | Optimize for speed instead of size |
 | `--cpp` | Write out the generated C++ files without compiling (for debugging) |
-| `--minimal` | Leave out the non-essential libraries (table, io, os, math, utf8, coroutine); keeps base + package + string |
+| `--minimal` | Link base + package only; add std modules with `--modules string,io,...` (drops string, table, math, io, os, utf8, coroutine) |
 | `--dynamic` | Enable `load`, `loadfile`, and `dofile` so code can run at runtime |
-| `--modules <list>` | Link prebuilt native modules (comma-separated) |
+| `--modules <list>` | Link std modules (string, table, math, io, os, utf8, coroutine) or prebuilt native modules (comma-separated) |
 
 ### Help
 
@@ -124,7 +124,7 @@ computations, and `--size` when binary size matters more.
 | Variable | What it means |
 |----------|---------------|
 | `CLX_CXX` | C++ compiler used to build your programs (falls back to the compiler that built clx). The executable name picks the flag style: `cl` and `clang-cl` get MSVC-style flags, anything else gets GCC-style flags. |
-| `CLX_ARCH` | Target CPU for clx's own build (`sse2`, `avx`, `avx2`, `avx512`, `native` on x64). Opting into AVX2 or newer enables faster SIMD paths in the runtime. |
+| `CLX_ARCH` | Target CPU for clx's own build (`sse2`, `avx`, `avx2`, `native` on x64). Opting into AVX2 or newer enables faster SIMD paths in the runtime. |
 | `CLX_GC_MODE` | Collector for compiled programs: `generational` (default) or `incremental` (the legacy collector). |
 | `CLX_GC_MINOR_KB` | Kilobytes allocated between minor collections (default 8192). Lower values collect young garbage sooner. |
 | `CLX_GC_MAJOR_KB` | Old-generation budget in kilobytes that triggers a full collection (default 32768). |
