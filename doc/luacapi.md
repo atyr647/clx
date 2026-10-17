@@ -339,7 +339,7 @@ while the value stays on the stack" guarantee holds.
 | `lua_newuserdatauv(L, sz, nuvalue)` | `nuvalue` is ignored — you can store any number of user values, and out-of-range `lua_getiuservalue`/`lua_setiuservalue` indices return `LUA_TNONE` / `0` instead of failing |
 | `lua_pushexternalstring(L, s, len, falloc, ud)` | clx copies the bytes into its own arena and calls `falloc(ud, s, len+1, 0)` **immediately**, so your buffer must be freeable right away and must not be reused |
 | `luaL_testudata(L, idx, "FILE*")` | returns a pointer to a **single shared scratch slot** in the state, overwritten by the next such call. Copy the `FILE*` out before calling it again |
-| `luaL_openlibs` | no-op; libraries are opened by the runtime. With `--minimal` all but the string library are absent and the C API cannot bring them back |
+| `luaL_openlibs` | no-op; libraries are opened by the runtime. With `--minimal` they are absent and the C API cannot bring them back |
 | Warnings | `lua_setwarnf`/`lua_warning` work for C-to-C calls, but clx's own runtime warnings do not route through them |
 | Module initialisation | openers run at program startup, before the entry chunk, and all of them run regardless of whether anything calls `require` |
 | `lua_getextraspace` | backed by real reserved bytes in front of every `lua_State`, so the macro behaves as in stock |
