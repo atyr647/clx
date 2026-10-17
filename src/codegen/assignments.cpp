@@ -46,27 +46,31 @@ bool CodeEmitter::local_root_snapshot_ok(std::string_view lua_name) {
     return ok;
 }
 
+//------------------ CodeEmitter::frame_root_exempt (see codegen.h)
+bool CodeEmitter::frame_root_exempt(std::string_view name) {
+    return state.nogc_locals.count({ owner_of_node(state, state.current_func_body), name }) > 0;
+}
+
 //------------------ CodeEmitter::emit_local_root (see codegen.h)
 void CodeEmitter::emit_local_root(std::string_view name) {
+    if (frame_root_exempt(name))
+        return;
     if (state.reassigned_vars.count(name) == 0 && local_root_snapshot_ok(name)) {
         out << "clx::LValue _rs_" << name << " = l_" << name << ";\n";
-        out << "L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&_rs_" << name << ".val, &_rs_" << name
-            << ".type);\n";
+        out << "_fr.push(_rs_" << name << ");\n";
         return;
     }
-    out << "L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&l_" << name << ".val, &l_" << name << ".type);\n";
+    out << "_fr.push(l_" << name << ");\n";
 }
 
 //------------------ CodeEmitter::emit_param_root (see codegen.h)
 void CodeEmitter::emit_param_root(std::string_view lua_name, std::string_view cpp_name) {
     if (state.assigned_targets.count(lua_name) == 0 && local_root_snapshot_ok(lua_name)) {
         out << "clx::LValue _rs_" << cpp_name << " = l_" << cpp_name << ";\n";
-        out << "L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&_rs_" << cpp_name << ".val, &_rs_" << cpp_name
-            << ".type);\n";
+        out << "_fr.push(_rs_" << cpp_name << ");\n";
         return;
     }
-    out << "L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&l_" << cpp_name << ".val, &l_" << cpp_name
-        << ".type);\n";
+    out << "_fr.push(l_" << cpp_name << ");\n";
 }
 
 //------------------ emitAssignmentLike: dispatches GlobalDeclStatement, LocalDecl, and Assignment.
@@ -92,6 +96,19 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
         uint32_t last_v_idx = ctx.block_statements[first_v + v_count - 1];
         if (ctx.nodes[last_v_idx].type == NodeType::CallExpression || ctx.nodes[last_v_idx].type == NodeType::Vararg)
             last_is_call = true;
+    }
+
+    uint32_t tuple_fill_n = 0;
+    if (last_is_call && !state.in_fast_function) {
+        uint32_t last_v_idx = ctx.block_statements[first_v + v_count - 1];
+        if (last_v_idx < ctx.nodes.size() && ctx.nodes[last_v_idx].type == NodeType::CallExpression) {
+            const auto &ce = ctx.nodes[last_v_idx].as.call_expr;
+            uint32_t tn = 0;
+            if (multi_call_eligible(ce.target, ce.first_arg, ce.arg_count, tn) && t_count + 1 >= v_count
+                && t_count - (v_count - 1) == tn) {
+                tuple_fill_n = tn;
+            }
+        }
     }
 
     if (is_local && t_count == 1 && v_count == 1) {
@@ -369,6 +386,10 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                             if (!is_fast && state.native_direct_funcs.count(name)) {
                                 emit_native_impl_def(name, v_idx);
                             }
+                            auto _mmit_def = state.multi_native_return_counts.find(name);
+                            if (_mmit_def != state.multi_native_return_counts.end()) {
+                                emit_multi_impl_def(name, v_idx, _mmit_def->second);
+                            }
 
                             if (is_fast) {
                                 out << "auto _fast_" << name << "_impl = ";
@@ -381,11 +402,11 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                 state.current_fast_func = "";
                                 out << ";\n";
                                 out << "#line " << ctx.nodes[v_idx].line << " \"" << ctx.filename << "\"\n";
-                                out << "auto _fast_" << name << " = [=]( ";
+                                out << "auto _fast_" << name << " = [=](clx::FrameBase& _fr";
                                 for (uint32_t a = 0; a < state.func_param_counts[name]; ++a) {
-                                    out << "double p" << a << (a < state.func_param_counts[name] - 1 ? ", " : "");
+                                    out << ", double p" << a;
                                 }
-                                out << ") -> double { return _fast_" << name << "_impl(_fast_" << name << "_impl";
+                                out << ") -> double { return _fast_" << name << "_impl(_fast_" << name << "_impl, _fr";
                                 for (uint32_t a = 0; a < state.func_param_counts[name]; ++a) {
                                     out << ", p" << a;
                                 }
@@ -393,10 +414,10 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
 
                                 out << "auto _impl_" << name
                                     << " = [=](clx::LState* L, const clx::LValue* args, size_t arg_count) -> "
-                                       "clx::MultiValue {\n";
+                                       "clx::MultiValue {\n    clx::Frame<16> _fr(L);\n";
                                 if (state.int_returning_funcs.count(name)) {
                                     out << "    return clx::MultiValue(clx::LValue(static_cast<int64_t>(_fast_" << name
-                                        << "(";
+                                        << "(_fr";
                                 } else if (state.int_preserving_masks.count(name)) {
                                     out << "    bool _bflag = ";
                                     uint32_t _m = state.int_preserving_masks.at(name);
@@ -411,15 +432,13 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                     if (!_any_f)
                                         out << "false";
                                     out << ";\n";
-                                    out << "    return clx::MultiValue(clx::num_box(_fast_" << name << "(";
+                                    out << "    return clx::MultiValue(clx::num_box(_fast_" << name << "(_fr";
                                 } else {
                                     out << "    return clx::MultiValue(clx::LValue(static_cast<double>(_fast_" << name
-                                        << "(";
+                                        << "(_fr";
                                 }
                                 for (uint32_t a = 0; a < state.func_param_counts[name]; ++a) {
-                                    out << "(" << a << " < arg_count ? args[" << a << "].as_number() : 0.0)";
-                                    if (a < state.func_param_counts[name] - 1)
-                                        out << ", ";
+                                    out << ", (" << a << " < arg_count ? args[" << a << "].as_number() : 0.0)";
                                 }
                                 if (state.int_returning_funcs.count(name))
                                     out << "))));\n";
@@ -433,8 +452,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                 out << "clx::LValue l_" << name << " = L->create_closure(_impl_" << name
                                     << ", static_cast<clx::LTable*>(_ENV.as_pointer())"
                                     << (cells_b.empty() ? "" : ", " + cells_b) << ");\n";
-                                out << "L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&l_" << name << ".val, &l_"
-                                    << name << ".type);\n";
+                                out << "_fr.push(l_" << name << ");\n";
                                 {
                                     size_t _sfi = state.string_pool_index.at(name);
                                     out << "L->_G->settable(cstr_[" << _sfi << "], l_" << name << ");\n";
@@ -468,8 +486,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                     << ", static_cast<clx::LTable*>(_ENV.as_pointer())"
                                     << (cells_c.empty() ? "" : ", " + cells_c) << ");\n";
                                 out << "clx::upval_store(l_" << name << "_cell, l_" << name << ");\n";
-                                out << "L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&l_" << name << ".val, &l_"
-                                    << name << ".type);\n";
+                                out << "_fr.push(l_" << name << ");\n";
                                 {
                                     size_t _sfi = state.string_pool_index.at(name);
                                     out << "L->_G->settable(cstr_[" << _sfi << "], l_" << name << ");\n";
@@ -539,8 +556,9 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                     emit_node(ctx.block_statements[first_v]);
                                 else
                                     out << "clx::LValue()";
-                                out << ";\nL->shadow_stack[L->shadow_top++] = clx::TypedSlot(&l_" << name << ".val, &l_"
-                                    << name << ".type);\n";
+                                out << ";\n";
+                                if (!frame_root_exempt(name))
+                                    out << "_fr.push(l_" << name << ");\n";
                             }
                             bool created_csnap = false;
                             if (!state.pure_numeric_arrays.count(name)) {
@@ -588,8 +606,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                     out << "clx::LValue()";
                                 out << ");\n";
                             }
-                            out << "L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&l_" << name << "->val, &l_"
-                                << name << "->type);\n";
+                            out << "_fr.push(*l_" << name << ");\n";
                             if (is_func) {
                                 state.ref_capture.clear();
                                 size_t _sfi = state.string_pool_index.at(name);
@@ -711,7 +728,8 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
 
                     if (is_sb_concat) {
 
-                        out << "{ clx::LValue _gval = clx::get_env_var(L, _ENV, \"" << name << "\");\n";
+                        out << "{ clx::LValue _gval = clx::get_env_var_key(L, _ENV, cstr_[" << state.string_pool_index.at(name)
+                            << "]);\n";
                         out << "  if (sb_" << name << ".empty()) sb_" << name << ".append(L, _gval);\n";
                         for (size_t i = 1; i < ops.size(); ++i) {
                             uint32_t op_idx = ops[i];
@@ -733,14 +751,14 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                 out << ");\n";
                             }
                         }
-                        out << "  clx::set_env_var(L, _ENV, \"" << name << "\", clx::LValue(sb_" << name
-                            << ".to_string(L)));\n";
+                        out << "  clx::set_env_var_key(L, _ENV, cstr_[" << state.string_pool_index.at(name)
+                            << "], clx::LValue(sb_" << name << ".to_string(L)));\n";
                         out << "}\n";
                     } else {
                         if (state.global_string_builders.count(name) || state.module_string_builders.count(name)) {
                             out << "    sb_" << name << ".clear();\n";
                         }
-                        out << "clx::set_env_var(L, _ENV, \"" << name << "\", ";
+                        out << "clx::set_env_var_key(L, _ENV, cstr_[" << state.string_pool_index.at(name) << "], ";
                         if (v_count > 0)
                             emit_node(ctx.block_statements[first_v]);
                         else
@@ -764,6 +782,10 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                             if (!is_fast && state.native_direct_funcs.count(name)) {
                                 emit_native_impl_def(name, v_idx);
                             }
+                            auto _mmit_def = state.multi_native_return_counts.find(name);
+                            if (_mmit_def != state.multi_native_return_counts.end()) {
+                                emit_multi_impl_def(name, v_idx, _mmit_def->second);
+                            }
 
                             if (is_fast) {
                                 out << "auto _fast_" << name << "_impl = ";
@@ -776,11 +798,11 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                 state.current_fast_func = "";
                                 out << ";\n";
                                 out << "#line " << ctx.nodes[v_idx].line << " \"" << ctx.filename << "\"\n";
-                                out << "auto _fast_" << name << " = [=]( ";
+                                out << "auto _fast_" << name << " = [=](clx::FrameBase& _fr";
                                 for (uint32_t a = 0; a < state.func_param_counts[name]; ++a) {
-                                    out << "double p" << a << (a < state.func_param_counts[name] - 1 ? ", " : "");
+                                    out << ", double p" << a;
                                 }
-                                out << ") -> double { return _fast_" << name << "_impl(_fast_" << name << "_impl";
+                                out << ") -> double { return _fast_" << name << "_impl(_fast_" << name << "_impl, _fr";
                                 for (uint32_t a = 0; a < state.func_param_counts[name]; ++a) {
                                     out << ", p" << a;
                                 }
@@ -788,10 +810,10 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
 
                                 out << "auto _impl_" << name
                                     << " = [=](clx::LState* L, const clx::LValue* args, size_t arg_count) -> "
-                                       "clx::MultiValue {\n";
+                                       "clx::MultiValue {\n    clx::Frame<16> _fr(L);\n";
                                 if (state.int_returning_funcs.count(name)) {
                                     out << "    return clx::MultiValue(clx::LValue(static_cast<int64_t>(_fast_" << name
-                                        << "(";
+                                        << "(_fr";
                                 } else if (state.int_preserving_masks.count(name)) {
                                     out << "    bool _bflag = ";
                                     uint32_t _m = state.int_preserving_masks.at(name);
@@ -806,15 +828,13 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                     if (!_any_f)
                                         out << "false";
                                     out << ";\n";
-                                    out << "    return clx::MultiValue(clx::num_box(_fast_" << name << "(";
+                                    out << "    return clx::MultiValue(clx::num_box(_fast_" << name << "(_fr";
                                 } else {
                                     out << "    return clx::MultiValue(clx::LValue(static_cast<double>(_fast_" << name
-                                        << "(";
+                                        << "(_fr";
                                 }
                                 for (uint32_t a = 0; a < state.func_param_counts[name]; ++a) {
-                                    out << "(" << a << " < arg_count ? args[" << a << "].as_number() : 0.0)";
-                                    if (a < state.func_param_counts[name] - 1)
-                                        out << ", ";
+                                    out << ", (" << a << " < arg_count ? args[" << a << "].as_number() : 0.0)";
                                 }
                                 if (state.int_returning_funcs.count(name))
                                     out << "))));\n";
@@ -1116,8 +1136,8 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                     << "->array_size) [[likely]] { clx::TValue _tv" << t_idx << " = _ts" << t_idx
                                     << "->array[_ks" << t_idx << " - 1]; clx::ValueType _tt" << t_idx << " = _ts"
                                     << t_idx << "->array_types[_ks" << t_idx << " - 1]; clx::gc_barrier_table(L, _td"
-                                    << t_idx << ", clx::LValue(_tv" << t_idx << ", _tt" << t_idx
-                                    << ")); if (static_cast<size_t>(_kd" << t_idx << ") - 1 > _td" << t_idx
+                                    << t_idx << ", _tv" << t_idx << ", _tt" << t_idx
+                                    << "); if (static_cast<size_t>(_kd" << t_idx << ") - 1 > _td" << t_idx
                                     << "->array_size) clx::table_fill_gap(_td" << t_idx << ", _td" << t_idx
                                     << "->array_size, static_cast<size_t>(_kd" << t_idx << ") - 1); _td" << t_idx
                                     << "->array[_kd" << t_idx << " - 1] = _tv" << t_idx << "; _td" << t_idx
@@ -1304,7 +1324,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
         return;
     }
 
-    if (last_is_call) {
+    if (last_is_call && tuple_fill_n == 0) {
         bool _mret_hoisted = false;
         for (uint32_t _j = 0; _j < t_count; ++_j) {
             uint32_t _t_idx = ctx.block_statements[first_t + _j];
@@ -1321,7 +1341,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
     std::vector<bool> tmp_is_native(v_count, false);
     std::vector<bool> tmp_is_integer(v_count, false);
     if (v_count > 0) {
-        out << "size_t _eg_base_" << node_idx << " = L->shadow_top;\n";
+        out << "size_t _rg_base_" << node_idx << " = _fr.mark();\n";
         for (size_t i = 0; i < v_count; ++i) {
             uint32_t v_idx = ctx.block_statements[first_v + i];
 
@@ -1338,10 +1358,13 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                             for (bool p : state.func_param_native[fname])
                                 if (!p)
                                     is_fast = false;
-                        }
-                        if (!is_fast && state.native_direct_funcs.count(fname)) {
-                            emit_native_impl_def(fname, v_idx);
-                        }
+                        }                            if (!is_fast && state.native_direct_funcs.count(fname)) {
+                                emit_native_impl_def(fname, v_idx);
+                            }
+                            auto _mmit = state.multi_native_return_counts.find(fname);
+                            if (_mmit != state.multi_native_return_counts.end()) {
+                                emit_multi_impl_def(fname, v_idx, _mmit->second);
+                            }
 
                         if (is_fast) {
                             out << "auto _fast_" << fname << "_impl = ";
@@ -1354,11 +1377,11 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                             state.current_fast_func = "";
                             out << ";\n";
 
-                            out << "auto _fast_" << fname << " = [=]( ";
+                            out << "auto _fast_" << fname << " = [=](clx::FrameBase& _fr";
                             for (uint32_t a = 0; a < state.func_param_counts[fname]; ++a) {
-                                out << "double p" << a << (a < state.func_param_counts[fname] - 1 ? ", " : "");
+                                out << ", double p" << a;
                             }
-                            out << ") -> double { return _fast_" << fname << "_impl(_fast_" << fname << "_impl";
+                            out << ") -> double { return _fast_" << fname << "_impl(_fast_" << fname << "_impl, _fr";
                             for (uint32_t a = 0; a < state.func_param_counts[fname]; ++a) {
                                 out << ", p" << a;
                             }
@@ -1366,11 +1389,11 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
 
                             out << "auto _impl_" << fname
                                 << " = [=](clx::LState* L, const clx::LValue* args, size_t arg_count) -> "
-                                   "clx::MultiValue {\n";
+                                   "clx::MultiValue {\n    clx::Frame<16> _fr(L);\n";
                             bool _site3_masked = false;
                             if (state.int_returning_funcs.count(fname)) {
                                 out << "    return clx::MultiValue(clx::LValue(static_cast<int64_t>(_fast_" << fname
-                                    << "(";
+                                    << "(_fr";
                             } else if (state.int_preserving_masks.count(fname)) {
                                 out << "    bool _bflag = ";
                                 uint32_t _m = state.int_preserving_masks.at(fname);
@@ -1385,16 +1408,14 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                 if (!_any_f)
                                     out << "false";
                                 out << ";\n";
-                                out << "    return clx::MultiValue(clx::num_box(_fast_" << fname << "(";
+                                out << "    return clx::MultiValue(clx::num_box(_fast_" << fname << "(_fr";
                                 _site3_masked = true;
                             } else {
                                 out << "    return clx::MultiValue(clx::LValue(static_cast<double>(_fast_" << fname
-                                    << "(";
+                                    << "(_fr";
                             }
                             for (uint32_t a = 0; a < state.func_param_counts[fname]; ++a) {
-                                out << "(" << a << " < arg_count ? args[" << a << "].as_number() : 0.0)";
-                                if (a < state.func_param_counts[fname] - 1)
-                                    out << ", ";
+                                out << ", (" << a << " < arg_count ? args[" << a << "].as_number() : 0.0)";
                             }
                             if (state.int_returning_funcs.count(fname))
                                 out << "))));\n";
@@ -1416,8 +1437,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                         out << "clx::LValue _tmp_" << node_idx << "_" << i << " = L->create_closure(_impl_" << fname
                             << ", static_cast<clx::LTable*>(_ENV.as_pointer())"
                             << (cells_e.empty() ? "" : ", " + cells_e) << ");\n";
-                        out << "L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&_tmp_" << node_idx << "_" << i
-                            << ".val, &_tmp_" << node_idx << "_" << i << ".type);\n";
+                        out << "_fr.push(_tmp_" << node_idx << "_" << i << ");\n";
                         state.direct_callables.insert(fname);
                         intercepted = true;
                     }
@@ -1428,10 +1448,30 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                 continue;
 
             if (i == v_count - 1 && last_is_call) {
+                if (tuple_fill_n > 0) {
+                    const auto &ce = ctx.nodes[v_idx].as.call_expr;
+                    std::string_view _tfn(
+                        ctx.nodes[ce.target].as.ident.name, ctx.nodes[ce.target].as.ident.length);
+                    out << "ClxTup" << tuple_fill_n << " _tup_" << node_idx << " = ";
+                    emit_multi_call(_tfn, ce.first_arg, ce.arg_count);
+                    out << ";\n";
+                    continue;
+                }
 
                 const auto &lcnode = ctx.nodes[v_idx];
                 bool lc_native = false;
-                if (lcnode.type == NodeType::CallExpression
+                //------------------ unboxed trailing call: triple overload with double-ready args
+                //------------------ bypasses boxing before the generic/native paths below are tried.
+                if (lcnode.type == NodeType::CallExpression && !dbl_self_ref(lcnode.as.call_expr.target)
+                    && dbl_call_eligible(
+                        lcnode.as.call_expr.target, lcnode.as.call_expr.first_arg, lcnode.as.call_expr.arg_count)) {
+                    out << "_mret_" << node_idx << " = clx::MultiValue(";
+                    try_emit_dbl_call(
+                        lcnode.as.call_expr.target, lcnode.as.call_expr.first_arg, lcnode.as.call_expr.arg_count);
+                    out << ");\n";
+                    lc_native = true;
+                }
+                if (!lc_native && lcnode.type == NodeType::CallExpression
                     && native_call_eligible(
                         lcnode.as.call_expr.target, lcnode.as.call_expr.first_arg, lcnode.as.call_expr.arg_count)) {
                     out << "_mret_" << node_idx << " = ";
@@ -1446,9 +1486,8 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                     out << ";\n";
                     state.expect_multivalue = false;
                 }
-                out << "for (size_t _eg_mri = 0; _eg_mri < _mret_" << node_idx << ".count; ++_eg_mri) {\n";
-                out << "L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&_mret_" << node_idx
-                    << "[_eg_mri].val, &_mret_" << node_idx << "[_eg_mri].type);\n";
+                out << "for (size_t _rg_mri = 0; _rg_mri < _mret_" << node_idx << ".count; ++_rg_mri) {\n";
+                out << "_fr.push(_mret_" << node_idx << "[_rg_mri]);\n";
                 out << "}\n";
             } else {
                 bool t_is_n = false;
@@ -1491,12 +1530,11 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                     out << "clx::LValue _tmp_" << node_idx << "_" << i << " = ";
                     emit_node(v_idx);
                     out << ";\n";
-                    out << "L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&_tmp_" << node_idx << "_" << i
-                        << ".val, &_tmp_" << node_idx << "_" << i << ".type);\n";
+                    out << "_fr.push(_tmp_" << node_idx << "_" << i << ");\n";
                 }
             }
         }
-        out << "size_t _eg_mid_" << node_idx << " = L->shadow_top;\n";
+        out << "size_t _rg_mid_" << node_idx << " = _fr.mark();\n";
     }
 
     if (is_local) {
@@ -1509,7 +1547,8 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
             bool in_native = std::find(state.native_numbers.begin(), state.native_numbers.end(), name)
                 != state.native_numbers.end();
             bool val_is_native = (i < v_count && tmp_is_native[i]);
-            bool is_n = in_native || val_is_native;
+            bool is_n = in_native || val_is_native
+                || (tuple_fill_n > 0 && i + 1 >= v_count && i + 1 < v_count + tuple_fill_n);
             bool is_cap = ctx.nodes[t_idx].as.ident.is_captured;
             bool site_b_created_csnap = false;
 
@@ -1517,8 +1556,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                 if (state.constant_upvalues.count(name)) {
                     if (!state.hoisted_locals.count(name)) {
                         out << "clx::LValue l_" << name << ";\n";
-                        out << "L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&l_" << name << ".val, &l_" << name
-                            << ".type);\n";
+                        out << "_fr.push(l_" << name << ");\n";
                         if (!state.pure_numeric_arrays.count(name)) {
                             out << "auto l_" << name << "_csnap = clx::make_upvalue(clx::LValue());\n";
                             state.const_snapshot_cells.push_back(std::string(name));
@@ -1531,8 +1569,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                     if (!state.hoisted_locals.count(name)) {
                         out << "clx::LUpValue l_" << name << ";\n";
                         out << "l_" << name << " = clx::make_upvalue(clx::LValue());\n";
-                        out << "L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&l_" << name << "->val, &l_" << name
-                            << "->type);\n";
+                        out << "_fr.push(*l_" << name << ");\n";
                     }
                     locals.push_back({ name, true });
                 }
@@ -1573,8 +1610,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
             } else {
                 if (!state.hoisted_locals.count(name)) {
                     out << "clx::LValue l_" << name << ";\n";
-                    out << "L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&l_" << name << ".val, &l_" << name
-                        << ".type);\n";
+                    out << "_fr.push(l_" << name << ");\n";
                 }
                 if (state.string_builders.count(name) && !state.global_string_builders.count(name)
                     && !state.module_string_builders.count(name)) {
@@ -1593,13 +1629,22 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
         std::string val_str;
         std::string num_str;
         bool val_is_number = false;
-        if (i < v_count) {
+        bool tuple_here
+            = (tuple_fill_n > 0 && i + 1 >= v_count && i + 1 < v_count + tuple_fill_n);
+        if (tuple_here) {
+            uint32_t _tk = static_cast<uint32_t>(i) - (v_count - 1);
+            num_str = "_tup_" + std::to_string(node_idx) + ".v" + std::to_string(_tk);
+            val_str = "clx::LValue(static_cast<double>(" + num_str + "))";
+            val_is_number = true;
+        }
+        if (!tuple_here && i < v_count) {
             uint32_t vv = ctx.block_statements[first_v + i];
             if (vv < ctx.nodes.size() && yields_number(ctx, state, vv, nullptr, state.current_fast_func))
                 val_is_number = true;
         }
 
-        if (i < v_count) {
+        if (tuple_here) {
+        } else if (i < v_count) {
             if (i == v_count - 1 && last_is_call) {
                 val_str = "_mret_" + std::to_string(node_idx) + "[0]";
                 num_str = val_str + ".as_number()";
@@ -1667,7 +1712,11 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                         if (sit->name != name)
                             continue;
                         if (sit->has_intf) {
-                            if (i < v_count && tmp_is_native[i]) {
+                            if (tuple_fill_n > 0 && i + 1 >= v_count && i + 1 < v_count + tuple_fill_n) {
+                                out << "_intf_l_" << name << " = false;\n";
+                                if (sit->has_ii)
+                                    out << "_ii_l_" << name << " = 0;\n";
+                            } else if (i < v_count && tmp_is_native[i]) {
                                 if (tmp_is_integer[i]) {
                                     out << "_intf_l_" << name << " = true;\n";
                                     if (sit->has_ii)
@@ -1707,7 +1756,8 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                     out << "*l_" << name << "_csnap = l_" << name << ";\n";
             } else if (is_global && v_count == 0) {
             } else if (t_node.as.ident.is_global) {
-                out << "clx::set_env_var(L, _ENV, \"" << name << "\", " << val_str << ");\n";
+                out << "clx::set_env_var_key(L, _ENV, cstr_[" << state.string_pool_index.at(name) << "], "
+                    << val_str << ");\n";
             } else {
                 size_t idx = state.string_pool_index.at(name);
                 out << "L->_G->settable(cstr_[" << idx << "], " << val_str << ");\n";
@@ -1867,16 +1917,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
     }
 
     if (v_count > 0) {
-        out << "if (L->shadow_top > _eg_mid_" << node_idx << ") {\n";
-        out << "size_t _eg_n = L->shadow_top - _eg_mid_" << node_idx << ";\n";
-        out << "for (size_t _eg_i = 0; _eg_i < _eg_n; ++_eg_i) {\n";
-        out << "L->shadow_stack[_eg_base_" << node_idx << " + _eg_i] = L->shadow_stack[_eg_mid_" << node_idx
-            << " + _eg_i];\n";
-        out << "}\n";
-        out << "L->shadow_top = _eg_base_" << node_idx << " + _eg_n;\n";
-        out << "} else {\n";
-        out << "L->shadow_top = _eg_base_" << node_idx << ";\n";
-        out << "}\n";
+        out << "_fr.compact(_rg_base_" << node_idx << ", _rg_mid_" << node_idx << ");\n";
     }
 }
 
@@ -1941,7 +1982,7 @@ void CodeEmitter::emitTableConstructor(const ASTNode &node, uint32_t node_idx) {
             hsize_pow2 <<= 1;
         out << ", " << hsize_pow2 << ");\n";
     } else {
-        out << ", " << explicit_count << ");\nL->shadow_stack[L->shadow_top++] = clx::TypedSlot(&_t.val, &_t.type);\n";
+        out << ", " << explicit_count << ");\n_fr.push(_t);\n";
     }
     if (can_direct)
         out << "clx::LTable* _ta = static_cast<clx::LTable*>(_t.as_pointer());\n";
@@ -1962,26 +2003,23 @@ void CodeEmitter::emitTableConstructor(const ASTNode &node, uint32_t node_idx) {
             out << ";\n";
             state.expect_multivalue = false;
             out << "for (size_t _vi = 0; _vi < _mret_" << node_idx << ".count; ++_vi) {\n";
-            out << "  L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&_mret_" << node_idx
-                << "[_vi].val, "
-                   "&_mret_"
-                << node_idx << "[_vi].type);\n";
+            out << "  _fr.push(_mret_" << node_idx << "[_vi]);\n";
             out << "  static_cast<clx::LTable*>(_t.as_pointer())->settable(";
             out << "clx::LValue(static_cast<double>(" << implicit_seq << " + _vi)), _mret_" << node_idx << "[_vi]);\n";
-            out << "  L->shadow_top--;\n";
+            out << "  _fr.pop();\n";
             out << "}\n";
         } else if (k == 0xFFFFFFFF && can_direct) {
             out << "{ clx::LValue _tv = ";
             emit_node(v);
-            out << "; L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&_tv.val, &_tv.type); _ta->array["
+            out << "; _fr.push(_tv); _ta->array["
                 << (implicit_seq - 1) << "] = _tv.val; _ta->array_types[" << (implicit_seq - 1)
-                << "] = _tv.type; L->shadow_top--; }\n";
+                << "] = _tv.type; _fr.pop(); }\n";
         } else {
             out << "{\n";
             out << "clx::LValue _tv = ";
             emit_node(v);
             out << ";\n";
-            out << "L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&_tv.val, &_tv.type);\n";
+            out << "_fr.push(_tv);\n";
             if (k == 0xFFFFFFFF) {
                 out << "static_cast<clx::LTable*>(_t.as_pointer())->settable(clx::LValue(static_cast<double>("
                     << implicit_seq << ")), _tv);\n";
@@ -1991,12 +2029,12 @@ void CodeEmitter::emitTableConstructor(const ASTNode &node, uint32_t node_idx) {
                 out << ";\n";
                 out << "static_cast<clx::LTable*>(_t.as_pointer())->settable(_tk, _tv);\n";
             }
-            out << "L->shadow_top--;\n";
+            out << "_fr.pop();\n";
             out << "}\n";
         }
     }
     if (!_is_arena)
-        out << "L->shadow_top--;\n";
+        out << "_fr.pop();\n";
     out << "return _t;\n}())";
 }
 
