@@ -32,11 +32,16 @@
 #include <sys/wait.h>
 #endif
 
-//---------- One API frame: a deque of shadow-rooted values plus the upvalues of the C function that owns it.
+//---------- One API frame: a deque of frame-rooted values plus the upvalues of the C function that owns it.
+//---------- `rroots` aliases every element of `stack` (push grows both, truncate shrinks both), so the
+//---------- collector sees in-place slot updates exactly like the old shadow-stack aliases did.
 struct ApiFrame {
     std::deque<clx::LValue> stack;
     std::shared_ptr<std::vector<clx::LUpValue>> ups;
-    size_t shadow_base = 0;
+    clx::Frame<8> rroots;
+
+    explicit ApiFrame(clx::LState *S)
+        : rroots(S) { }
 };
 
 //---------- CFrameReturn: abandons a C function once its continuation ran; n becomes the function's result count
@@ -272,19 +277,31 @@ static clx::LThread *luaapi_owner(lua_State *L) {
     return S->running_thread;
 }
 
-//---------- ShadowRegion: the shadow slot array plus its live height for one owner thread
-struct ShadowRegion {
-    clx::ShadowStack *stack;
-    size_t *top;
-};
-
-//---------- luaapi_region: only the running thread keeps its roots in LState; every other thread owns its own copy
-static ShadowRegion luaapi_region(lua_State *L) {
-    clx::LState *S = L->L;
-    clx::LThread *o = luaapi_owner(L);
-    if (o && o != S->running_thread)
-        return ShadowRegion { &o->shadow, &o->shadow_top };
-    return ShadowRegion { &S->shadow_stack, &S->shadow_top };
+//---------- luaapi_detach_frame: splice one API frame's root range out of whichever root chain holds it
+//---------- (running chain or a stashed per-thread chain). Teardown/reset paths destroy frames non-LIFO,
+//---------- so they detach explicitly instead of relying on the head-only RootRange unlink.
+static void luaapi_detach_frame(clx::LState *S, clx::LThread *t, ApiFrame &f) {
+    clx::RootRange *r = &f.rroots;
+    for (clx::RootRange **p = &S->top_root; *p;) {
+        if (*p == r) {
+            *p = r->prev;
+            break;
+        }
+        p = &(*p)->prev;
+    }
+    clx::LThread *threads[3] = { t, S->main_thread, S->running_thread };
+    for (int i = 0; i < 3; ++i) {
+        clx::LThread *th = threads[i];
+        if (!th)
+            continue;
+        for (clx::RootRange **p = &th->top_root; *p;) {
+            if (*p == r) {
+                *p = r->prev;
+                break;
+            }
+            p = &(*p)->prev;
+        }
+    }
 }
 
 //---------- luaapi_fetch_thread: lazily create the ApiBundle backing one coroutine
@@ -337,10 +354,8 @@ static clx::LThread *luaapi_self_thread(lua_State *L) {
 
 //---------- luaapi_frame: current API frame, orphan-created when a C entry point is entered unprotected
 static ApiFrame &luaapi_frame(lua_State *L) {
-    if (L->frames.empty()) {
-        L->frames.emplace_back();
-        L->frames.back().shadow_base = *luaapi_region(L).top;
-    }
+    if (L->frames.empty())
+        L->frames.emplace_back(L->L);
     return L->frames.back();
 }
 
@@ -364,12 +379,11 @@ static clx::LValue *luaapi_locate(lua_State *L, int idx) {
     return &f->stack[static_cast<size_t>(i)];
 }
 
-//---------- luaapi_push: append a value and root it on the owning thread's shadow stack
+//---------- luaapi_push: append a value and root it in the frame's own root range
 static void luaapi_push(lua_State *L, const clx::LValue &v) {
     ApiFrame &f = luaapi_frame(L);
     f.stack.push_back(v);
-    ShadowRegion r = luaapi_region(L);
-    (*r.stack)[(*r.top)++] = clx::TypedSlot(&f.stack.back().val, &f.stack.back().type);
+    f.rroots.push(f.stack.back());
 }
 
 //---------- luaapi_truncate: shrink the frame to n slots; growth must go through luaapi_push
@@ -377,8 +391,8 @@ static void luaapi_truncate(lua_State *L, size_t n) {
     ApiFrame &f = luaapi_frame(L);
     if (n >= f.stack.size())
         return;
-    *luaapi_region(L).top = f.shadow_base + n;
     f.stack.resize(n);
+    f.rroots.restore(n);
 }
 
 //---------- luaapi_pop: drop the top n slots
@@ -390,20 +404,16 @@ static void luaapi_pop(lua_State *L, int n) {
     luaapi_truncate(L, want);
 }
 
-//---------- ApiFrameGuard: pushes a frame and restores the owner's shadow height + frame on scope exit
+//---------- ApiFrameGuard: pushes an API frame and pops it on scope exit (its root range unlinks by RAII)
 class ApiFrameGuard {
 public:
     ApiFrameGuard(clx::LState *L, lua_State *ls)
         : m_ls(ls) {
-        (void)L;
-        m_base = *luaapi_region(ls).top;
-        m_ls->frames.emplace_back();
-        m_ls->frames.back().shadow_base = m_base;
+        m_ls->frames.emplace_back(L);
         m_ls->catching_frames++;
     }
 
     ~ApiFrameGuard() {
-        *luaapi_region(m_ls).top = m_base;
         m_ls->frames.pop_back();
         m_ls->catching_frames--;
     }
@@ -413,7 +423,6 @@ public:
 
 private:
     lua_State *m_ls;
-    size_t m_base;
 };
 
 //---------- CFuncAdapter::operator — clx entry point that frames the lua_CFunction call
@@ -528,6 +537,8 @@ void luaapi_free_state(LState *L) {
         ApiBundle *tb = g_capi_thread_bundles[i];
         if (tb->st.L != L)
             continue;
+        for (ApiFrame &ff : tb->st.frames)
+            luaapi_detach_frame(L, tb->st.thread, ff);
         tb->st.frames.clear();
         tb->st.registry = LValue();
         tb->st.uservalues = LValue();
@@ -541,6 +552,8 @@ void luaapi_free_state(LState *L) {
     L->unroot_value(b->st.uservalues);
     b->st.registry = LValue();
     b->st.uservalues = LValue();
+    for (ApiFrame &ff : b->st.frames)
+        luaapi_detach_frame(L, b->st.thread, ff);
     b->st.frames.clear();
     L->luaapi = nullptr;
     L->luaapi_cleanup = nullptr;
@@ -550,8 +563,9 @@ void luaapi_free_state(LState *L) {
 
 //---------- luaapi_reset_thread_bundle: clear a recycled coroutine's API frames so it starts from a clean stack
 void luaapi_reset_thread_bundle(LState *L, void *bundle) {
-    (void)L;
     ApiBundle *b = static_cast<ApiBundle *>(bundle);
+    for (ApiFrame &ff : b->st.frames)
+        luaapi_detach_frame(L, b->st.thread, ff);
     b->st.frames.clear();
     b->st.pcall_depth = 0;
     b->st.catching_frames = 0;
