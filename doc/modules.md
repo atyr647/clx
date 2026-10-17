@@ -121,6 +121,24 @@ few standard install locations. The `--modules` name is the filename without
 its extension. Need more details on where it searches or how to write native
 modules? See the [C++ API](./api.md).
 
+## Standard library modules
+
+Each std module ships as its own archive — `libclx_<name>.a` on POSIX,
+`clx_<name>.lib` on Windows (`_size` variants for `--size` builds) — installed
+to `<libdir>/clx` (in-tree: `build/` on POSIX, `lib/clx/` on Windows). A plain
+build links them all; `--minimal` links only `base` + `package`, and any other
+std module comes back with `--modules`:
+
+```bash
+clx main.lua --minimal --modules string,io,math -o main
+```
+
+Names matching a std module (`base`, `package`, `string`, `table`, `math`,
+`io`, `os`, `utf8`, `coroutine`) always resolve to the runtime's archives next
+to `libclx.a`, never to a same-named user file. Using a std global without its
+module (e.g. `string.format` in a bare `--minimal` build) fails at runtime
+with an index-on-nil error — add the module and rebuild.
+
 If your native module depends on external libraries, pass the link flags too:
 
 ```bash
@@ -253,10 +271,10 @@ local proc = require("native_processor")  -- native C++ module
 
 | Option | What it does |
 |--------|--------------|
-| `--modules <list>` | Link prebuilt C++/C modules (comma-separated) |
+| `--modules <list>` | Link std modules (string, table, math, io, os, utf8, coroutine) or prebuilt C++/C modules (comma-separated) |
 | `--fast` | Link `libclx.a` + `libclx_capi.a` (optimize for speed) |
 | `--size` | Link `libclx_size.a` + `libclx_capi_size.a` (default) |
-| `--minimal` | Leave out non-essential libraries (table, io, os, math, utf8, coroutine); keeps base + package + string |
+| `--minimal` | Link base + package only; add std modules back with `--modules` |
 | `--static` | Build a static library that exports `luaopen_*` |
 | `--object` | Build an object file that exports `luaopen_*` |
 
