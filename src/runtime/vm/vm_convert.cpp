@@ -231,8 +231,7 @@ LValue vm_to_clx_value_(LState* clx_L, lua_State* L, int idx)
         if (tbl_key)
             s_convert_cache.map[tbl_key] = t;
 
-        size_t prev_top = clx_L->shadow_top;
-        clx_L->shadow_stack[clx_L->shadow_top++] = TypedSlot(&t.val, &t.type);
+        clx::RootRange t_rr(clx_L, &t, 1);
 
         lua_pushvalue(L, idx);
         int abs_idx = lua_gettop(L);
@@ -255,8 +254,7 @@ LValue vm_to_clx_value_(LState* clx_L, lua_State* L, int idx)
             while (cap < len)
                 cap *= 2;
             const size_t hb_vm = table_heap_bytes(tbl);
-            tbl->array = new TValue[cap]();
-            tbl->array_types = new ValueType[cap]();
+            table_alloc_array(tbl->array, tbl->array_types, cap);
             tbl->array_cap = cap;
             clx_L->account_delta(hb_vm, table_heap_bytes(tbl));
             for (size_t i = 0; i < len; ++i) {
@@ -278,8 +276,6 @@ LValue vm_to_clx_value_(LState* clx_L, lua_State* L, int idx)
         }
 
         lua_pop(L, 1);
-
-        clx_L->shadow_top = prev_top;
 
         s_convert_cache.depth--;
         if (s_convert_cache.depth == 0)
@@ -607,36 +603,30 @@ extern "C" int clx_vm_proxy_call(lua_State* L)
     for (int i = 0; i < nargs; ++i)
         clx_args[i + 1] = clx::vm_to_clx_value_(clx_L, L, i + 2);
 
-    size_t prev_shadow = clx_L->shadow_top;
-    for (size_t i = 0; i < clx_nargs; ++i)
-        clx_L->shadow_stack[clx_L->shadow_top++] = clx::TypedSlot(&clx_args[i].val, &clx_args[i].type);
+    clx::RootRange args_rr(clx_L, clx_args, clx_nargs);
 
     clx::MultiValue ret;
     try {
         ret = clx::call_function(clx_L, call_func, clx_args, clx_nargs, "__call", 0);
     } catch (const clx::LRuntimeException& e) {
-        clx_L->shadow_top = prev_shadow;
         if (heap)
             delete[] clx_args;
         lua_pushlstring(L, e.error_obj.as_string(), e.error_obj.string_len());
         lua_error(L);
         return 0;
     } catch (const std::exception& e) {
-        clx_L->shadow_top = prev_shadow;
         if (heap)
             delete[] clx_args;
         lua_pushstring(L, e.what());
         lua_error(L);
         return 0;
     } catch (...) {
-        clx_L->shadow_top = prev_shadow;
         if (heap)
             delete[] clx_args;
         lua_pushstring(L, "unknown error in __call");
         lua_error(L);
         return 0;
     }
-    clx_L->shadow_top = prev_shadow;
     if (heap)
         delete[] clx_args;
 
@@ -663,9 +653,7 @@ extern "C" int clx_vm_proxy_close(lua_State* L)
     if (close_func.type != clx::Function)
         return 0;
     clx::LValue args[2] = { clx::LValue(clx::Table, tbl), clx::LValue() };
-    size_t prev_shadow = clx_L->shadow_top;
-    clx_L->shadow_stack[clx_L->shadow_top++] = clx::TypedSlot(&args[0].val, &args[0].type);
-    clx_L->shadow_stack[clx_L->shadow_top++] = clx::TypedSlot(&args[1].val, &args[1].type);
+    clx::RootRange close_rr(clx_L, args, 2);
     try {
         clx::call_function(clx_L, close_func, args, 2, "__close", 0);
     } catch (const clx::LRuntimeException& e) {
@@ -675,7 +663,6 @@ extern "C" int clx_vm_proxy_close(lua_State* L)
     } catch (...) {
         std::fprintf(stderr, "error in __close metamethod\n");
     }
-    clx_L->shadow_top = prev_shadow;
     return 0;
 }
 
