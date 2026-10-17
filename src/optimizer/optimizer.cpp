@@ -165,6 +165,8 @@ void Optimizer::run(const ASTContext &ctx, uint32_t root_node) {
     state.native_return_funcs.clear();
     state.func_param_counts.clear();
     state.func_param_native.clear();
+    state.multi_native_return_counts.clear();
+    state.nogc_locals.clear();
     state.dead_stmts.clear();
 
     PassScratch scratch;
@@ -177,10 +179,12 @@ void Optimizer::run(const ASTContext &ctx, uint32_t root_node) {
     pass_array_safety(ctx, state, scratch, root_node);
     pass_table_fields(ctx, state, scratch, root_node);
     pass_numeric_params(ctx, state, scratch, root_node);
+    pass_multi_native(ctx, state, scratch, root_node);
     pass_arena(ctx, state, root_node);
     pass_int_returns_masks(ctx, state, scratch, root_node);
     pass_local_hygiene(ctx, state, root_node);
     pass_struct_locals(ctx, state, scratch, root_node);
+    pass_nogc_locals(ctx, state, scratch, root_node);
 }
 
 }
