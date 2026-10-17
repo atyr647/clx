@@ -317,7 +317,7 @@ Proxy nodes keep the referenced clx object alive from the VM side. The two colle
 ### Garbage Collection
 
 Generational collector (default; `CLX_GC_MODE=incremental` opts out):
-- **Minor collections**: trace roots (shadow stack, threads, permanent roots) plus the remembered set, mark reachable young objects, promote survivors (young to survivor to old), and free unreachable survivor garbage — old objects are never traced or freed here
+- **Minor collections**: trace roots (the root-frame chain, threads, permanent roots) plus the remembered set, mark reachable young objects, promote survivors (young to survivor to old), and free unreachable survivor garbage — old objects are never traced or freed here. See [Runtime](./runtime.md) for the `RootRange`/`Frame`/`FrameGuard` rooting model, which replaced the old shadow stack and its `ScopeGuard` push/restore guards
 - **Write barriers**: storing a young value into an old table, closure, coroutine or upvalue cell records the owner, so the next minor sees the edge
 - **Major collections**: full mark-and-sweep fallback when the old generation outgrows its budget; the incremental collector remains available as the opt-out path
 
