@@ -17,6 +17,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <time.h>
 #include <vector>
 
 namespace clx {
@@ -58,7 +59,10 @@ static void gc_dispose_swept(LState *L, LHeader *curr) {
     auto &GC_SUB = L->allocated_bytes;
     (void)GC_SUB;
     curr->flags &= ~(LFLAG_REMEMBERED | LFLAG_GC_PIN);
-    L->gc_update_old_bytes(curr, curr->age, AGE_YOUNG);
+    //------------------ Old-byte accounting only changes when an OLD object dies (to is always YOUNG
+    //------------------ here); skip the type-switch + size computation for young/survivor garbage.
+    if (curr->age == AGE_OLD)
+        L->gc_update_old_bytes(curr, AGE_OLD, AGE_YOUNG);
     if (curr->flags & LFLAG_VM_PROXY) {
         if (clx_free_vm_proxy_ptr)
             clx_free_vm_proxy_ptr(L, curr);
@@ -79,8 +83,13 @@ static void gc_dispose_swept(LState *L, LHeader *curr) {
                 t->ext->hash_tombs = 0;
             }
             t->array_size = 0;
-            t->next = L->free_tables;
-            L->free_tables = t;
+            if (t->array && t->array != t->small_array) {
+                t->next = L->free_tables_big;
+                L->free_tables_big = t;
+            } else {
+                t->next = L->free_tables;
+                L->free_tables = t;
+            }
         }
     } else if (curr->type == static_cast<uint8_t>(Function)) {
         LCFunction *f = static_cast<LCFunction *>(curr);
@@ -152,19 +161,9 @@ static void gc_drain_finalizables(LState *L) {
             L->allocated_bytes = 0;
         else
             L->allocated_bytes -= t_bytes;
-        if (t->array && t->array != t->small_array) {
-            delete[] t->array;
-            t->array = nullptr;
-        }
-        if (t->array_types && t->array_types != t->small_array_types) {
-            delete[] t->array_types;
-            t->array_types = nullptr;
-        }
+        table_free_array(t->array, t->array_types, t->small_array);
         if (t->ext) {
-            if (t->ext->entries) {
-                free(t->ext->entries);
-                t->ext->entries = nullptr;
-            }
+            table_free_hash(t->ext->entries, t->ext->hash_bitmap);
             t->ext->hash_count = 0;
             t->ext->hash_tombs = 0;
             t->ext->hash_size = 0;
@@ -173,13 +172,19 @@ static void gc_drain_finalizables(LState *L) {
         }
         t->array_size = t->array_cap = 0;
         t->flags &= ~(LFLAG_META_LIST | LFLAG_FINALIZABLE);
-        t->next = L->free_tables;
-        L->free_tables = t;
+        if (t->array && t->array != t->small_array) {
+            t->next = L->free_tables_big;
+            L->free_tables_big = t;
+        } else {
+            t->next = L->free_tables;
+            L->free_tables = t;
+        }
         t = nx;
     }
     L->gc_finalizable = nullptr;
     for (LUserdata *ud = static_cast<LUserdata *>(L->gc_finalizable_ud); ud;) {
         LUserdata *nx = static_cast<LUserdata *>(ud->next);
+        meta_ud_list_remove(L, ud);
         L->invoke_gc_finalizer(ud, "GC_Finalizer");
         size_t ud_bytes = sizeof(LUserdata) + ud->size;
         if (ud_bytes > L->allocated_bytes)
@@ -259,6 +264,14 @@ void gc_barrier_cell(LState *L, const LUpValue &cell, const LValue &newval) {
 
 //------------------ mark helpers shared by major and minor marking
 
+//------------------ chain_contains — membership check on one GC chain
+static bool chain_contains(LHeader *head, const LHeader *h) {
+    for (LHeader *o = head; o; o = o->next)
+        if (o == h)
+            return true;
+    return false;
+}
+
 static CLX_INLINE_HOT LHeader *gc_mark_value(LState *L, const LValue &v, uint8_t markval) {
     if (!v.is_gc_obj())
         return nullptr;
@@ -269,12 +282,7 @@ static CLX_INLINE_HOT LHeader *gc_mark_value(LState *L, const LValue &v, uint8_t
         return nullptr;
     if (v.type == ValueType::UserData) {
 
-        bool real = false;
-        for (LHeader *o = L->allocated_objects; o; o = o->next)
-            if (o == h) {
-                real = true;
-                break;
-            }
+        bool real = chain_contains(L->allocated_objects, h) || chain_contains(L->old_objects, h);
         if (!real)
             return nullptr;
     }
@@ -390,9 +398,7 @@ static bool gc_trace_thread_young(LState *L, LThread *th, LState::GCStack &wl) {
         one(th->yield_args[i]);
     for (size_t i = 0; i < th->resume_args.count; ++i)
         one(th->resume_args[i]);
-    for (size_t i = 0; i < th->shadow_top; ++i)
-        if (th->shadow[i].val)
-            one(LValue(*th->shadow[i].val, *th->shadow[i].type));
+    gc_walk_roots(th->top_root, one);
     return has_nonold;
 }
 
@@ -409,12 +415,9 @@ static bool gc_trace_function_young(LState *L, LCFunction *f, LState::GCStack &w
     return has_nonold;
 }
 
-//------------------ LState::is_allocated_userdata — membership check on allocated_objects
+//------------------ LState::is_allocated_userdata — membership check on both GC chains
 bool LState::is_allocated_userdata(const LHeader *h) const {
-    for (LHeader *o = allocated_objects; o; o = o->next)
-        if (o == h)
-            return true;
-    return false;
+    return chain_contains(allocated_objects, h) || chain_contains(old_objects, h);
 }
 
 //------------------ gc_trace_remember_nonold_children — write-barrier catch-up for
@@ -461,6 +464,8 @@ void LState::gc_minor() {
     //------------------ and re-enter through gc_maybe_collect().
     if (gc_minor_active)
         return;
+    struct timespec _gt0, _gt1;
+    clock_gettime(CLOCK_MONOTONIC, &_gt0);
     ++gc_stats_minors;
     gc_minor_active = true;
     if (gc_stats_remembered_high < gc_remembered.size())
@@ -485,16 +490,14 @@ void LState::gc_minor() {
         gc_push_for_trace(wl, h, v);
     };
 
-    //------------------ roots: shadow stack, state threads, permanent roots
+    //------------------ roots: root-frame chain, state threads, permanent roots
     if (_G)
         push_if_needed(LValue(Table, _G));
     if (main_thread)
         push_if_needed(LValue(Thread, main_thread));
     if (running_thread && running_thread != main_thread)
         push_if_needed(LValue(Thread, running_thread));
-    for (size_t i = 0; i < shadow_top; ++i)
-        if (shadow_stack[i].val)
-            push_if_needed(LValue(*shadow_stack[i].val, *shadow_stack[i].type));
+    gc_walk_roots(top_root, push_if_needed);
     for (const LValue &r : permanent_roots)
         push_if_needed(r);
 
@@ -571,6 +574,18 @@ void LState::gc_minor() {
                 mt->marked = 1;
                 wl.push(mt);
             }
+            //------------------ same for dead finalizable userdata (files): their metatable (+ __gc
+            //------------------ closure) is otherwise swept in-cycle and the drain throws
+            //------------------ std::bad_function_call on the nulled closure.
+            for (LUserdata *ud = metatabled_ud; ud; ud = ud->meta_next) {
+                if (ud->marked != 0)
+                    continue;
+                LTable *mt = ud->metatable;
+                if (!mt || mt->marked != 0 || mt->age == AGE_OLD)
+                    continue;
+                mt->marked = 1;
+                wl.push(mt);
+            }
             continue;
         }
         LHeader *curr = wl.back();
@@ -599,7 +614,10 @@ void LState::gc_minor() {
     auto age_and_promote = [&](LHeader *h) {
         uint8_t from = h->age;
         uint8_t to = (from == AGE_YOUNG) ? AGE_SURVIVOR : AGE_OLD;
-        gc_update_old_bytes(h, from, to);
+        //------------------ Young->survivor promotion never moves old-bytes (both non-old); only
+        //------------------ pay for the size computation on the survivor->old transition.
+        if (to == AGE_OLD)
+            gc_update_old_bytes(h, from, to);
         h->age = to;
 
         if (to == AGE_OLD && h->marked == 1 && !(h->flags & LFLAG_VM_PROXY)) {
@@ -626,9 +644,10 @@ void LState::gc_minor() {
                 for (size_t i = 0; !young_ref && i < th->resume_args.count; ++i)
                     if (needs_root(th->resume_args[i]))
                         young_ref = true;
-                for (size_t i = 0; !young_ref && i < th->shadow_top; ++i)
-                    if (th->shadow[i].val && needs_root(LValue(*th->shadow[i].val, *th->shadow[i].type)))
+                gc_walk_roots(th->top_root, [&](const LValue &v) {
+                    if (!young_ref && needs_root(v))
                         young_ref = true;
+                });
                 if (young_ref)
                     gc_remember(th);
             } else if (h->type == static_cast<uint8_t>(Function)) {
@@ -650,18 +669,35 @@ void LState::gc_minor() {
 
     //------------------ single walk over the allocation chain: age/promote,
 
+    struct timespec _gs0, _gs1;
+    clock_gettime(CLOCK_MONOTONIC, &_gs0);
+    g_alloc_census.gc_minor_mark_us += (uint64_t)(_gs0.tv_sec - _gt0.tv_sec) * 1000000ULL
+        + ((int64_t)_gs0.tv_nsec - (int64_t)_gt0.tv_nsec) / 1000;
     size_t before_sweep = allocated_bytes;
     LHeader **link = &allocated_objects;
     while (*link) {
         LHeader *o = *link;
         if (o->age == AGE_OLD) {
-            link = &o->next;
+            //------------------ Should not happen (promotions move to old_objects below, majors
+            //------------------ re-partition); kept as a counted safety net, not a fast path.
+            g_alloc_census.gc_old_skipped++;
+            *link = o->next;
+            o->next = old_objects;
+            old_objects = o;
             continue;
         }
         if (o->marked == 1) {
             age_and_promote(o);
             o->marked = 0;
-            link = &o->next;
+            if (o->age == AGE_OLD) {
+                //------------------ Segregate: minors never walk old_objects, killing the per-minor
+                //------------------ re-walk of the long-lived set (2.9M wasted visits in binarytrees).
+                *link = o->next;
+                o->next = old_objects;
+                old_objects = o;
+            } else {
+                link = &o->next;
+            }
         } else if (o->age == AGE_SURVIVOR) {
             LHeader *next_obj = o->next;
             gc_dispose_swept(this, o);
@@ -729,13 +765,25 @@ void LState::gc_minor() {
     if (gc_finalizable || gc_finalizable_ud)
         gc_drain_finalizables(this);
 
+    clock_gettime(CLOCK_MONOTONIC, &_gs1);
+    g_alloc_census.gc_minor_sweep_us += (uint64_t)(_gs1.tv_sec - _gs0.tv_sec) * 1000000ULL
+        + ((int64_t)_gs1.tv_nsec - (int64_t)_gs0.tv_nsec) / 1000;
+    ++g_alloc_census.gc_minors;
+
     gc_bytes_at_minor = allocated_bytes;
     gc_minor_active = false;
 
-    //------------------ adaptive minor pacing: next trigger ≈ one current heap-full, clamped
+    //------------------ adaptive minor pacing: next trigger ≈ one current heap-full, clamped.
+    //------------------ Hysteresis on the way down (at most halves per minor): without it the threshold
+    //------------------ collapses to the post-minor live set after every good minor, then oscillates — churn
+    //------------------ workloads like binarytrees re-walk their whole live chain in mark+sweep on each of
+    //------------------ those too-frequent minors. Growth stays immediate via allocated_bytes.
 
     if (!gc_minor_threshold_env) {
         size_t next = allocated_bytes;
+        size_t floor = gc_minor_threshold / 2;
+        if (next < floor)
+            next = floor;
         if (next < kMinorThresholdMin)
             next = kMinorThresholdMin;
         if (next > kMinorThresholdMax)
@@ -748,6 +796,9 @@ void LState::gc_minor() {
     gc_major_pending = (gc_old_bytes >= gc_major_threshold);
 
     wl.clear();
+    clock_gettime(CLOCK_MONOTONIC, &_gt1);
+    g_alloc_census.gc_minor_us += (uint64_t)(_gt1.tv_sec - _gt0.tv_sec) * 1000000ULL
+        + (uint64_t)(_gt1.tv_nsec - _gt0.tv_nsec) / 1000ULL;
 }
 
 //------------------ LState::gc_step — incremental GC sweep step
@@ -851,7 +902,12 @@ void LState::collect_garbage() {
     if (gc_mode == GCMode::Generational && !gc_draining && gc_phase == GCPhase::Idle)
         gc_minor();
     size_t before = allocated_bytes;
+    struct timespec _M0, _M1;
+    clock_gettime(CLOCK_MONOTONIC, &_M0);
     collect_garbage_full();
+    clock_gettime(CLOCK_MONOTONIC, &_M1);
+    g_alloc_census.gc_major_us += (uint64_t)(_M1.tv_sec - _M0.tv_sec) * 1000000ULL
+        + (uint64_t)(_M1.tv_nsec - _M0.tv_nsec) / 1000ULL;
     gc_stats_major_freed += (before > allocated_bytes) ? (before - allocated_bytes) : 0;
     if (gc_mode == GCMode::Generational)
         gc_major_pending = false;
@@ -861,6 +917,15 @@ void LState::collect_garbage() {
 void LState::collect_garbage_full() {
     if (gc_draining)
         return;
+    //------------------ Reunite generations: gc_step sweeps a single chain, so splice old_objects
+    //------------------ back onto the young chain before marking (O(old) on a cold path). Partitioned
+    //------------------ again after the sweep below.
+    while (old_objects) {
+        LHeader *o = old_objects;
+        old_objects = o->next;
+        o->next = allocated_objects;
+        allocated_objects = o;
+    }
     auto &wl = gc_worklist;
     wl.clear();
 
@@ -885,9 +950,7 @@ void LState::collect_garbage_full() {
         push_if_needed(LValue(Thread, main_thread));
     if (running_thread && running_thread != main_thread)
         push_if_needed(LValue(Thread, running_thread));
-    for (size_t i = 0; i < shadow_top; ++i)
-        if (shadow_stack[i].val)
-            push_if_needed(LValue(*shadow_stack[i].val, *shadow_stack[i].type));
+    gc_walk_roots(top_root, push_if_needed);
 
     for (const LValue &r : permanent_roots)
         push_if_needed(r);
@@ -1011,9 +1074,7 @@ void LState::collect_garbage_full() {
                 push_if_needed(th->yield_args[i]);
             for (size_t i = 0; i < th->resume_args.count; ++i)
                 push_if_needed(th->resume_args[i]);
-            for (size_t i = 0; i < th->shadow_top; ++i)
-                if (th->shadow[i].val)
-                    push_if_needed(LValue(*th->shadow[i].val, *th->shadow[i].type));
+            gc_walk_roots(th->top_root, push_if_needed);
         } else if (curr->type == static_cast<uint8_t>(Function)) {
             LCFunction *f = static_cast<LCFunction *>(curr);
             if (f->env)
@@ -1034,6 +1095,15 @@ void LState::collect_garbage_full() {
     for (LTable *obj = metatabled_tables; obj; obj = obj->ext->meta_next) {
         if (obj->marked == 0 && !(obj->flags & LFLAG_VM_PROXY)) {
             LTable *mt = obj->ext ? obj->ext->metatable : nullptr;
+            if (mt && mt->marked == 0) {
+                mt->marked = 2;
+                protect_wl.push_back(mt);
+            }
+        }
+    }
+    for (LUserdata *ud = metatabled_ud; ud; ud = ud->meta_next) {
+        if (ud->marked == 0) {
+            LTable *mt = ud->metatable;
             if (mt && mt->marked == 0) {
                 mt->marked = 2;
                 protect_wl.push_back(mt);
@@ -1186,6 +1256,22 @@ void LState::collect_garbage_full() {
     object_count = 0;
     while (!gc_step())
         ;
+
+    //------------------ Re-partition: minors walk only allocated_objects, so move every AGE_OLD
+    //------------------ survivor back to old_objects. Single O(heap) pass on a cold path.
+    {
+        LHeader **link = &allocated_objects;
+        while (*link) {
+            LHeader *o = *link;
+            if (o->age == AGE_OLD) {
+                *link = o->next;
+                o->next = old_objects;
+                old_objects = o;
+            } else {
+                link = &o->next;
+            }
+        }
+    }
 
     //------------------ generational bookkeeping: the remembered set is NOT cleared here —
 
