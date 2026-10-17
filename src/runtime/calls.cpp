@@ -24,11 +24,9 @@ MultiValue call_function(LState *L, const LValue &func, const LValue *args, size
     L->current_file = file;
     L->current_line = line;
 
-    size_t prev_shadow = L->shadow_top;
-    L->shadow_stack[L->shadow_top++] = TypedSlot(const_cast<TValue *>(&func.val), const_cast<ValueType *>(&func.type));
-    for (size_t ai = 0; ai < count; ++ai)
-        L->shadow_stack[L->shadow_top++]
-            = TypedSlot(const_cast<TValue *>(&args[ai].val), const_cast<ValueType *>(&args[ai].type));
+    LValue *func_ind[1] = { const_cast<LValue *>(&func) };
+
+    RootRange rr(L, const_cast<LValue *>(args), args ? count : 0, func_ind, 1);
 
     if (func.type == Function) {
         LCFunction *f = static_cast<LCFunction *>(func.as_pointer());
@@ -38,13 +36,11 @@ MultiValue call_function(LState *L, const LValue &func, const LValue *args, size
             CallCtxGuard cg(L);
             MultiValue ret = f->direct(L, args, count);
             L->current_func = saved_func;
-            L->shadow_top = prev_shadow;
             return ret;
         }
         CallCtxGuard cg(L);
         MultiValue ret = f->func(L, args, count);
         L->current_func = saved_func;
-        L->shadow_top = prev_shadow;
         return ret;
     }
 
@@ -68,13 +64,10 @@ MultiValue call_function(LState *L, const LValue &func, const LValue *args, size
                 MultiValue ret = call_function_rooted(L, m, new_args, nargs, file, line);
                 if (heap)
                     delete[] new_args;
-                L->shadow_top = prev_shadow;
                 return ret;
             }
         }
     }
-
-    L->shadow_top = prev_shadow;
 
     std::string prefix = "";
     if (file && file[0] != '\0') {
@@ -87,7 +80,6 @@ MultiValue call_function(LState *L, const LValue &func, const LValue *args, size
 
 //------------------ pcall_function — protected call
 MultiValue pcall_function(LState *L, const LValue &func, const LValue *args, size_t count) {
-    size_t shadow_base = L->shadow_top;
     try {
         //------------------ stock luaL_where sees the C pcall frame for its callers: no line, so errors
         //------------------ raised directly under pcall carry no file:line prefix (keep the source name).
@@ -111,15 +103,12 @@ MultiValue pcall_function(LState *L, const LValue &func, const LValue *args, siz
             results.push_back(ret[i]);
         return MultiValue(results, L);
     } catch (const LRuntimeException &e) {
-        L->shadow_top = shadow_base;
-
         LValue err_val = e.error_obj;
         if (err_val.type != String) {
             err_val = LValue(L->intern_string(e.what()));
         }
         return MultiValue({ LValue(false), err_val });
     } catch (const std::exception &e) {
-        L->shadow_top = shadow_base;
         return MultiValue({ LValue(false), LValue(L->intern_string(e.what())) });
     }
 }
@@ -129,12 +118,8 @@ MultiValue call_direct(LState *L, const LValue &func, const LValue *args, size_t
     if (func.type == ValueType::Function) {
         LCFunction *f = static_cast<LCFunction *>(func.as_pointer());
         if (f->direct) {
-            size_t prev_shadow = L->shadow_top;
-            L->shadow_stack[L->shadow_top++]
-                = TypedSlot(const_cast<TValue *>(&func.val), const_cast<ValueType *>(&func.type));
-            for (size_t ai = 0; ai < count; ++ai)
-                L->shadow_stack[L->shadow_top++]
-                    = TypedSlot(const_cast<TValue *>(&args[ai].val), const_cast<ValueType *>(&args[ai].type));
+            LValue *func_ind[1] = { const_cast<LValue *>(&func) };
+            RootRange rr(L, const_cast<LValue *>(args), args ? count : 0, func_ind, 1);
             LCFunction *saved = L->current_func;
             L->current_func = f;
             if (line > 0) {
@@ -144,7 +129,6 @@ MultiValue call_direct(LState *L, const LValue &func, const LValue *args, size_t
             CallCtxGuard cg(L);
             MultiValue ret = f->direct(L, args, count);
             L->current_func = saved;
-            L->shadow_top = prev_shadow;
             return ret;
         }
     }
