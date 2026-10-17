@@ -48,24 +48,16 @@ LThread::~LThread() {
 #endif
 }
 
-//---------- shadow_stash: move LState's live shadow region into a thread that is about to stop running
-static inline void shadow_stash(LState *L, LThread *t) {
-    t->shadow.data = L->shadow_stack.data;
-    t->shadow.cap = L->shadow_stack.cap;
-    t->shadow_top = L->shadow_top;
-    L->shadow_stack.data = nullptr;
-    L->shadow_stack.cap = 0;
-    L->shadow_top = 0;
+//---------- root_stash: move LState's live root-frame chain into a thread that is about to stop running
+static inline void root_stash(LState *L, LThread *t) {
+    t->top_root = L->top_root;
+    L->top_root = nullptr;
 }
 
-//---------- shadow_load: move a thread's shadow region back into LState, leaving the thread's copy empty
-static inline void shadow_load(LState *L, LThread *t) {
-    L->shadow_stack.data = t->shadow.data;
-    L->shadow_stack.cap = t->shadow.cap;
-    L->shadow_top = t->shadow_top;
-    t->shadow.data = nullptr;
-    t->shadow.cap = 0;
-    t->shadow_top = 0;
+//---------- root_load: move a thread's root-frame chain back into LState, leaving the thread's copy empty
+static inline void root_load(LState *L, LThread *t) {
+    L->top_root = t->top_root;
+    t->top_root = nullptr;
 }
 
 static void fiber_entry_impl(LThread *t) {
@@ -100,8 +92,8 @@ static void fiber_entry_impl(LThread *t) {
     }
 
     LThread *caller = t->caller;
-    shadow_stash(L, t);
-    shadow_load(L, caller);
+    root_stash(L, t);
+    root_load(L, caller);
     L->running_thread = caller;
     caller->status = THREAD_RUNNING;
 
@@ -157,7 +149,7 @@ LValue create_thread(LState *L, const LValue &func, double stack_size) {
     t->close_requested = false;
     t->caller = nullptr;
     t->status = THREAD_SUSPENDED;
-    t->shadow_top = 0;
+    t->top_root = nullptr;
     t->started = false;
     t->marked = 0;
     t->age = AGE_YOUNG;
@@ -223,8 +215,8 @@ MultiValue resume(LState *L, const LValue &thread, const LValue *args, size_t co
     t->caller = L->running_thread;
     t->caller->status = THREAD_NORMAL;
     t->status = THREAD_RUNNING;
-    shadow_stash(L, L->running_thread);
-    shadow_load(L, t);
+    root_stash(L, L->running_thread);
+    root_load(L, t);
     L->running_thread = t;
 
 #if defined(_WIN32)
@@ -264,8 +256,8 @@ MultiValue yield(LState *L, const LValue *args, size_t count) {
     t->status = THREAD_SUSPENDED;
 
     LThread *caller = t->caller;
-    shadow_stash(L, t);
-    shadow_load(L, caller);
+    root_stash(L, t);
+    root_load(L, caller);
     L->running_thread = caller;
     caller->status = THREAD_RUNNING;
 
