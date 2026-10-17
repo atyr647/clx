@@ -484,6 +484,10 @@ CLX_INLINE void setmetatable(LState* L, const LValue& obj, const LValue& mt)
         ud->metatable = new_mt;
         if (new_mt && new_mt->age == AGE_YOUNG && ud->age == AGE_OLD)
             gc_barrier_header(L, ud, mt);
+        if (new_mt)
+            meta_ud_list_add(L, ud);
+        else
+            meta_ud_list_remove(L, ud);
     }
 }
 
