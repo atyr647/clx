@@ -136,7 +136,7 @@ else
     print("[FAIL] ", "require searcher/loader path", "| Got:", mod2)
 end
 
--- 10. shadow stack health: deep recursion + errors must not ratchet shadow_top
+-- 10. root-frame health: deep recursion + errors must not grow the root chain
 local function deep(n)
     if n == 0 then error("bottom") end
     return deep(n - 1)
@@ -145,7 +145,7 @@ for i = 1, 100 do
     local ok, e = pcall(deep, 200)
     assert_eq(ok, false, "deep unwind " .. i)
 end
-print("[OK]   ", "shadow stack unwinding stable")
+print("[OK]   ", "root-frame unwinding stable")
 
 print("-----")
 print("PASS  :", passed)
