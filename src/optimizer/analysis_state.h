@@ -83,10 +83,17 @@ struct AnalysisState {
     std::set<std::string_view> direct_callables;
     std::set<std::string_view> fast_callables;
     std::set<std::string_view> native_direct_funcs;
+    std::map<std::string, uint32_t, std::less<>> multi_native_return_counts;
+    std::set<std::string, std::less<>> numeric_builtin_aliases;
     std::map<std::string_view, uint32_t> func_param_counts;
     std::map<std::string_view, std::vector<bool>> func_param_native;
     std::set<std::string_view> reassigned_vars;
     std::set<std::string_view> assigned_targets;
+    //------------------ nogc_locals: (owner scope, local name) proven to never hold a GC-managed
+    //------------------ value (only numbers, booleans, nil, strings — none traced by the collector).
+    //------------------ Codegen skips their frame slot entirely. Owner is the FunctionDef node
+    //------------------ index, or 0xFFFFFFFF for file scope. Filled by pass_nogc_locals.
+    std::set<std::pair<uint32_t, std::string_view>> nogc_locals;
     std::set<std::string_view> int_numeric_arrays;
     //------------------ for_counter_names: numeric-for loop counter identifiers. Codegen emits
     std::set<std::string_view> for_counter_names;
@@ -112,8 +119,21 @@ struct AnalysisState {
     bool in_fast_function = false;
     bool expect_multivalue = false;
     bool in_native_impl = false;
+    //------------------ dbl-overload emission state: emit_dbl_impl selects the triple-bound
+    //------------------ prologue while emitting a FunctionDef body; in_dbl_impl marks calls/returns
+    //------------------ inside a triple-bound body (returns take the native path, self-calls stay boxed).
+    bool emit_dbl_impl = false;
+    bool in_dbl_impl = false;
+    bool emit_multi_impl = false;
+    bool in_multi_impl = false;
+    uint32_t current_multi_count = 0;
+    std::string_view current_multi_func;
     std::string_view current_native_func;
     std::set<std::string_view> native_emitted;
+    //------------------ native_dbl_emitted: native-direct callees with a triple-bound (double,
+    //------------------ int-flag, int-shadow) overload emitted; scoped exactly like native_emitted.
+    std::set<std::string_view> native_dbl_emitted;
+    std::set<std::string_view> multi_emitted;
     std::unordered_map<std::string_view, std::string> hoisted_tables;
     std::string_view current_fast_func;
     std::string ref_capture;
