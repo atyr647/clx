@@ -107,7 +107,8 @@ private:
     std::string hoisted_table_ptr(uint32_t table_idx);
 
     //------------------ try_emit_array_cmp: numeric fast path for two hoisted integer-indexed array reads; returns false to use the generic path.
-    bool try_emit_array_cmp(int cmp_op, uint32_t l_idx, uint32_t r_idx);
+    //------------------ want_bool (condition position) emits a bool lambda instead of an LValue one, so callers skip the box/unbox round trip.
+    bool try_emit_array_cmp(int cmp_op, uint32_t l_idx, uint32_t r_idx, bool want_bool = false);
 
     //------------------ SwapIdiomMatch: a proven `local x = A[i]; A[j] = A[k]; A[l] = x` sequence eligible for fusion.
     struct SwapIdiomMatch {
@@ -120,12 +121,34 @@ private:
     };
 
     //------------------ try_match_swap_idiom: true when statements `pos`..`pos+2` of a block are the array swap idiom
-    //------------------ on one hoisted table. Fusing them removes the boxed temp and its shadow-stack root.
+    //------------------ on one hoisted table. Fusing them removes the boxed temp and its frame root.
     bool try_match_swap_idiom(uint32_t block_idx, uint32_t pos, SwapIdiomMatch &m);
 
     //------------------ emit_swap_idiom: raw two-slot exchange on a hoisted array; generic table_get/table_set fallback
     //------------------ when either index is outside the array part.
     void emit_swap_idiom(const SwapIdiomMatch &m, uint32_t tag);
+
+    //------------------ CmpSwapMatch: an `if (A[i] </<=/>/>= A[j])` guard whose then-block is exactly the
+    //------------------ swap idiom on the same two slots. Fusing them evaluates the keys once and proves
+    //------------------ the bounds/tags once for both the compare and the exchange.
+    struct CmpSwapMatch {
+        uint32_t table_ident = 0xFFFFFFFF;
+        uint32_t ord_l = 0xFFFFFFFF;
+        uint32_t ord_r = 0xFFFFFFFF;
+        uint32_t key_ol = 0xFFFFFFFF;
+        uint32_t key_or = 0xFFFFFFFF;
+        int cmp_op = 0;
+        uint32_t cond_line = 0;
+        uint32_t body_line = 0;
+    };
+
+    //------------------ try_match_cmp_swap: true for a fused compare+swap `if` (then-only shape checked
+    //------------------ loosely — an else attaches to the fused block normally).
+    bool try_match_cmp_swap(uint32_t if_idx, CmpSwapMatch &m);
+
+    //------------------ emit_cmp_swap: one guard lattice feeding a native compare and, when true, a raw
+    //------------------ exchange; generic compare + generic stores when unproven.
+    void emit_cmp_swap(const CmpSwapMatch &m, uint32_t tag);
 
     //------------------ local_root_snapshot_ok: every use lowers inline, so a snapshot root can keep the local in a register.
     bool local_root_snapshot_ok(std::string_view lua_name);
@@ -133,7 +156,10 @@ private:
     //------------------ emit_local_root: root a block local; never-reassigned locals use a snapshot slot and stay in registers.
     void emit_local_root(std::string_view name);
 
-    //------------------ emit_param_root: shadow-stack root for a parameter/generic-for variable (bound at header, not by LocalDecl).
+    //------------------ frame_root_exempt: this block local is in nogc_locals (never holds a GC object) — no frame slot.
+    bool frame_root_exempt(std::string_view name);
+
+    //------------------ emit_param_root: frame root for a parameter/generic-for variable (bound at header, not by LocalDecl).
     void emit_param_root(std::string_view lua_name, std::string_view cpp_name);
 
     //------------------ emit_loop_table_hoists: hoist an LTable* per loop for definitely-tabled locals; added collects names to restore.
@@ -147,10 +173,34 @@ private:
     void emitBlock(const ASTNode &node, uint32_t node_idx, DeferredBlockScope *defer = nullptr);
     void emitFunctionDef(const ASTNode &node, uint32_t node_idx);
     void emit_native_impl_def(std::string_view name, uint32_t v_idx);
+    //------------------ emit_dbl_impl_def: triple-bound (double, int-flag, int-shadow) overload of a
+    //------------------ native-direct single-return function; call sites with double-ready args bypass boxing.
+    void emit_dbl_impl_def(std::string_view name, uint32_t v_idx);
+    //------------------ emit_multi_impl_def: tuple-struct native overload for a multi-double function
+    void emit_multi_impl_def(std::string_view name, uint32_t v_idx, uint32_t tuple_n);
     //------------------ native call helpers: native_call_eligible is the pure
 
-    bool native_call_eligible(uint32_t target_idx, uint32_t first_arg, uint32_t arg_count);
-    bool try_emit_native_call(uint32_t target_idx, uint32_t first_arg, uint32_t arg_count, bool wrap_multi);
+    bool native_call_eligible(uint32_t target_idx, uint32_t first_arg, uint32_t arg_count,
+        bool allow_trailing_single = false, int depth = 0);
+    //------------------ trailing_single_call: trailing call arg provably yielding exactly 1 value
+    //------------------ (native-direct callee, exact arity) — needs no multi-value expansion.
+    uint32_t trailing_single_call(uint32_t first_arg, uint32_t arg_count, int depth = 0);
+    bool try_emit_native_call(uint32_t target_idx, uint32_t first_arg, uint32_t arg_count, bool wrap_multi,
+        bool allow_trailing_single = false);
+    //------------------ unboxed_arg_ok: arg is a literal, exact-flag native local/param/counter, or
+    //------------------ arithmetic over such — its double, int-flag and int-shadow are all exact, so a
+    //------------------ triple-bound call passes the identical value the boxed path would unbox to.
+    bool unboxed_arg_ok(uint32_t arg_idx, int depth = 0);
+    //------------------ dbl_call_eligible: native-direct callee with a triple overload emitted, exact
+    //------------------ arity, and every arg double-ready — the call bypasses LValue boxing entirely.
+    bool dbl_call_eligible(uint32_t target_idx, uint32_t first_arg, uint32_t arg_count);
+    //------------------ dbl_self_ref: target names the triple body being emitted — the wrapper
+    //------------------ name is unusable there (it would capture itself); callers fall back to boxed.
+    bool dbl_self_ref(uint32_t target_idx);
+    bool try_emit_dbl_call(uint32_t target_idx, uint32_t first_arg, uint32_t arg_count);
+    //------------------ multi call helpers: exact-arity tuple calls bypass the closure + MultiValue path
+    bool multi_call_eligible(uint32_t target_idx, uint32_t first_arg, uint32_t arg_count, uint32_t &out_n);
+    void emit_multi_call(std::string_view fname, uint32_t first_arg, uint32_t arg_count);
     void emitReturnStatement(const ASTNode &node, uint32_t node_idx);
     //------------------ emitAssignmentLike: handles GlobalDeclStatement, LocalDecl, and Assignment
     void emitAssignmentLike(const ASTNode &node, uint32_t node_idx);
