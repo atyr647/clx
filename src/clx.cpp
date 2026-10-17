@@ -40,6 +40,28 @@ namespace fs = std::filesystem;
 
 std::vector<std::string> precompiled_modules;
 
+//------------------ Std Lua modules shipped as per-module archives (libclx_<name>.a / clx_<name>.lib
+//------------------ in <libdir>/clx or the build tree). --minimal links base + package only; the rest come
+//------------------ in via --modules <name>. base/package are always linked: LState::open() opens them.
+static const char *kStdModules[] = { "base", "package", "string", "table", "math", "io", "os", "utf8", "coroutine" };
+std::vector<std::string> std_modules;
+
+static bool is_std_module(const std::string &m) {
+    for (const char *s : kStdModules)
+        if (m == s)
+            return true;
+    return false;
+}
+
+static std::string std_module_archive(const std::string &m, bool size_mode, bool msvc_dialect) {
+    std::string stem = msvc_dialect ? ("clx_" + m) : ("libclx_" + m);
+    if (size_mode)
+        stem += msvc_dialect ? "_size.lib" : "_size.a";
+    else
+        stem += msvc_dialect ? ".lib" : ".a";
+    return stem;
+}
+
 static bool dynamic_loading_enabled = false;
 
 //------------------ ENUM: BuildMode - output mode (executable binary, object file, or static library)
@@ -342,7 +364,10 @@ void print_help()
               << "  --debug               Enable debug symbols\n"
               << "  --size                Optimize for size (default)\n"
               << "  --fast                Optimize for speed\n"
-              << "  --cpp                 Generate C++ source file and exit\n"               << "  --minimal             Exclude non-essential Lua modules; keeps base + package + string\n"
+              << "  --cpp                 Generate C++ source file and exit\n"
+              << "  --minimal             Link base + package only; add std modules with --modules string,io,...\n"
+              << "  --modules <a,b>       Link std modules (string,table,math,io,os,utf8,coroutine)\n"
+              << "                        or precompiled user archives\n"
               << "  --dynamic             Link the embedded Lua 5.5 VM (load/loadfile/dofile)\n"
               << "  --version             Print version and exit\n"
               << "  --cxx                 Print the C++ compiler dialect and path clx drives\n"
@@ -410,6 +435,16 @@ int main(int argc, char* argv[])
                             seen.push_back(m);
                     }
                     precompiled_modules.swap(seen);
+                    for (auto& m : precompiled_modules) {
+                        if (is_std_module(m) && std::find(std_modules.begin(), std_modules.end(), m) == std_modules.end())
+                            std_modules.push_back(m);
+                    }
+                    std::vector<std::string> user_only;
+                    for (auto& m : precompiled_modules) {
+                        if (!is_std_module(m))
+                            user_only.push_back(m);
+                    }
+                    precompiled_modules.swap(user_only);
                 }
             }
         } else if (arg == "--object") {
@@ -733,8 +768,13 @@ int main(int argc, char* argv[])
 
         if (!minimal_active)
             appender << "    clx::openlibs(L);\n";
-        else
+        else {
+            for (auto &m : std_modules) {
+                if (m != "base" && m != "package")
+                    appender << "    clx::luastd_" << m << "(L);\n";
+            }
             appender << "    clx::openlibs_minimal(L);\n";
+        }
         if (dynamic_loading_enabled && !minimal_active) {
             appender << "    // --dynamic enabled: link libclx_lua.a (POSIX) or clx_lua.lib (Windows)\n";
             appender << "    //   In-tree: build/clx_lua/libclx_lua.a (or build/clx_lua/clx_lua.lib)\n";
@@ -900,6 +940,50 @@ int main(int argc, char* argv[])
             lib_link += found ? " -L " + runtime_lib_dir + " -l:" + capi_file : " -l:" + capi_file;
 #endif
 #endif
+        }
+    }
+
+    //------------------ Std module archives: base + package always (LState::open needs them), everything
+    //------------------ else for full builds or --modules <name>. Resolved next to the runtime lib
+    //------------------ (<dir>/clx/<file>, <dir>/<file>) so in-tree and installed layouts match on POSIX/Windows.
+    {
+        std::vector<std::string> want = { "base", "package" };
+        if (!minimal_active) {
+            for (const char *s : kStdModules) {
+                if (std::string(s) != "base" && std::string(s) != "package")
+                    want.push_back(s);
+            }
+        } else {
+            for (auto &m : std_modules) {
+                if (m != "base" && m != "package")
+                    want.push_back(m);
+            }
+        }
+        std::vector<fs::path> cand_dirs;
+        if (!runtime_lib_dir.empty()) {
+            cand_dirs.push_back(fs::path(runtime_lib_dir) / "clx");
+#ifdef _WIN32
+            cand_dirs.push_back(fs::path(runtime_lib_dir) / "clx" / "Release");
+#endif
+            cand_dirs.push_back(fs::path(runtime_lib_dir));
+        }
+        for (auto &m : want) {
+            std::string fname = std_module_archive(m, size_mode, msvc_dialect);
+            fs::path found;
+            for (auto &d : cand_dirs) {
+                if (fs::exists(d / fname)) {
+                    found = d / fname;
+                    break;
+                }
+            }
+            if (found.empty()) {
+                std::cerr << "Error: std module \"" << m << "\" archive " << fname
+                          << " not found next to the runtime library"
+                          << (runtime_lib_dir.empty() ? "" : std::string(" (") + runtime_lib_dir + "/clx)") << ".\n"
+                          << "  Rebuild and install clx so <libdir>/clx/" << fname << " exists.\n";
+                return 1;
+            }
+            lib_link += " \"" + found.string() + "\"";
         }
     }
 
