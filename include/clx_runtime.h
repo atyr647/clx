@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -207,6 +208,7 @@ static constexpr uint8_t LFLAG_SLAB = 0x08;
 static constexpr uint8_t LFLAG_REMEMBERED = 0x10;
 static constexpr uint8_t LFLAG_GC_PIN = 0x20;
 static constexpr uint8_t LFLAG_FINALIZABLE = 0x40;
+static constexpr uint8_t LFLAG_META_UD = 0x80;
 
 struct LState;
 struct FuncArena;
@@ -247,19 +249,12 @@ struct TValue {
     CLX_INLINE_HOT TValue(uint64_t u) { payload.u64 = u; }
 };
 
-//------------------ Shadow stack slot (payload pointer + type pointer)
-struct TypedSlot {
-    TValue *val;
-    ValueType *type;
-
-    CLX_INLINE_HOT TypedSlot()
-        : val(nullptr)
-        , type(nullptr) { }
-
-    CLX_INLINE_HOT TypedSlot(TValue *v, ValueType *t)
-        : val(v)
-        , type(t) { }
-};
+//------------------ is_gc_obj_tag: tag-only GC-object test so hot paths (e.g. write barriers fed by raw
+//------------------ TValue/ValueType pairs) need not box a throwaway LValue just to ask the question.
+CLX_INLINE_HOT bool is_gc_obj_tag(ValueType t) {
+    uint8_t tt = static_cast<uint8_t>(t);
+    return tt >= static_cast<uint8_t>(ValueType::Table) && tt <= static_cast<uint8_t>(ValueType::Thread);
+}
 
 //------------------ 16-byte convenience wrapper (runtime C++ API)
 struct LValue {
@@ -303,10 +298,7 @@ struct LValue {
         : val()
         , type(ValueType::Nil) { }
 
-    CLX_INLINE_HOT bool is_gc_obj() const {
-        uint8_t t = static_cast<uint8_t>(type);
-        return t >= static_cast<uint8_t>(ValueType::Table) && t <= static_cast<uint8_t>(ValueType::Thread);
-    }
+    CLX_INLINE_HOT bool is_gc_obj() const { return is_gc_obj_tag(type); }
 
     CLX_INLINE_HOT double as_number() const {
         if (type == ValueType::Int64)
@@ -556,6 +548,7 @@ struct MultiValue {
 
 struct LState;
 struct LTable;
+struct RootRange;
 
 //------------------ Shared upvalue type
 using LUpValue = std::shared_ptr<LValue>;
@@ -585,7 +578,7 @@ struct LCFunction : public LHeader {
 //------------------ Fast path for LCFunction direct calls
 MultiValue call_direct(LState *L, const LValue &func, const LValue *args, size_t count, const char *file, int line);
 
-//------------------ Rooted call wrappers (defined after LState; push args + restore shadow_top around a call)
+//------------------ Rooted call wrappers (defined after LState; alias func + args into a RootRange around a call)
 MultiValue call_function_rooted(
     LState *L, const LValue &func, const LValue *args, size_t count, const char *file, int line);
 MultiValue call_direct_rooted(
@@ -597,6 +590,7 @@ MultiValue call_cfunc_rooted(
 struct LUserdata : public LHeader {
     LTable *metatable;
     size_t size;
+    LUserdata *meta_next = nullptr;
 
     void *data() { return reinterpret_cast<char *>(this) + sizeof(LUserdata); }
 };
@@ -689,6 +683,9 @@ private:
 };
 
 static_assert(sizeof(LTable) <= 96, "LTable must be compact (~96 bytes)");
+//------------------ Layout note (#4): hot array fields (array, array_types, array_size, array_cap) directly
+//------------------ follow the 16-byte LHeader, so header + hot fields occupy the first 64-byte cache line on
+//------------------ the t[i] fast path. (No offsetof assert: LTable is non-standard-layout via LHeader.)
 
 //------------------ Generational write barrier
 
@@ -706,6 +703,51 @@ CLX_INLINE_HOT void gc_barrier_table(LState *L, const LTable *owner, const LValu
     gc_barrier_header(L, const_cast<LTable *>(owner), newval);
 }
 
+//------------------ TEMPORARY allocation census (CLX_ALLOC_STATS=1 dumps at state close). Remove after tuning.
+struct AllocCensus {
+    uint64_t table_new = 0;
+    uint64_t table_recycled = 0;
+    uint64_t table_arena = 0;
+    uint64_t array_new = 0;
+    uint64_t array_grow = 0;
+    uint64_t ext_new = 0;
+    uint64_t hash_resize = 0;
+    uint64_t closure_new = 0;
+    uint64_t closure_recycled = 0;
+    uint64_t str_intern_new = 0;
+    uint64_t str_intern_hit = 0;
+    uint64_t gc_minor_us = 0;
+    uint64_t gc_major_us = 0;
+    uint64_t gc_minor_mark_us = 0;
+    uint64_t gc_minor_sweep_us = 0;
+    uint64_t gc_minors = 0;
+    uint64_t gc_old_skipped = 0;
+};
+inline AllocCensus g_alloc_census;
+inline void dump_alloc_census() {
+    const AllocCensus &c = g_alloc_census;
+    std::fprintf(stderr,
+        "[alloc] table_new=%llu table_recycled=%llu table_arena=%llu array_new=%llu array_grow=%llu ext_new=%llu hash_resize=%llu "
+        "closure_new=%llu closure_recycled=%llu str_new=%llu str_hit=%llu gc_minor_us=%llu gc_major_us=%llu mark_us=%llu sweep_us=%llu minors=%llu oldskip=%llu\n",
+        (unsigned long long)c.table_new, (unsigned long long)c.table_recycled, (unsigned long long)c.table_arena,
+        (unsigned long long)c.array_new, (unsigned long long)c.array_grow, (unsigned long long)c.ext_new,
+        (unsigned long long)c.hash_resize,        (unsigned long long)c.closure_new, (unsigned long long)c.closure_recycled,
+        (unsigned long long)c.str_intern_new, (unsigned long long)c.str_intern_hit,
+        (unsigned long long)c.gc_minor_us, (unsigned long long)c.gc_major_us,
+        (unsigned long long)c.gc_minor_mark_us, (unsigned long long)c.gc_minor_sweep_us,
+        (unsigned long long)c.gc_minors, (unsigned long long)c.gc_old_skipped);
+
+}
+
+//------------------ Tag-based table barrier for sites that already hold a raw TValue/ValueType pair
+//------------------ (in-place array swap/store fast paths). Skips boxing the pair into a temporary
+//------------------ LValue; the box happens lazily inside the cold slow path only when it fires.
+CLX_INLINE_HOT void gc_barrier_table(LState *L, const LTable *owner, const TValue &v, ValueType t) {
+    if (owner->age == AGE_YOUNG || !is_gc_obj_tag(t))
+        return;
+    gc_barrier_header(L, const_cast<LTable *>(owner), LValue(v, t));
+}
+
 void gc_barrier_cell(LState *L, const LUpValue &cell, const LValue &newval);
 
 //------------------ LTable accessor helpers (compact-layout indirection)
@@ -714,8 +756,10 @@ CLX_INLINE LTable *tbl_metatable(const LTable *t) {
 }
 
 CLX_INLINE LTableExt *tbl_ensure_ext(LTable *t) {
-    if (t->ext == nullptr)
+    if (t->ext == nullptr) {
         t->ext = new LTableExt();
+        g_alloc_census.ext_new++;
+    }
     return t->ext;
 }
 
@@ -729,6 +773,58 @@ CLX_INLINE void tbl_set_metatable(LTable *t, LTable *m) {
     }
 }
 
+//------------------ Co-allocated array block: one malloc holding TValue[cap] followed by ValueType[cap].
+//------------------ Zeroed memory == initialized (TValue u64=0, Nil=0), so calloc/malloc+memset both work.
+//------------------ The types pointer always derives from the base: types = base + cap*sizeof(TValue).
+//------------------ Freeing is a single free(base); array_types points inside the block and is never freed.
+CLX_INLINE size_t table_array_block_bytes(size_t cap) {
+    return cap * sizeof(TValue) + cap * sizeof(ValueType);
+}
+CLX_INLINE_HOT void table_alloc_array(TValue *&arr, ValueType *&types, size_t cap) {
+    if (cap == 0) {
+        arr = nullptr;
+        types = nullptr;
+        return;
+    }
+    g_alloc_census.array_new++;
+    char *mem = static_cast<char *>(std::calloc(1, table_array_block_bytes(cap)));
+    if (!mem)
+        throw std::bad_alloc();
+    arr = reinterpret_cast<TValue *>(mem);
+    types = reinterpret_cast<ValueType *>(mem + cap * sizeof(TValue));
+}
+CLX_INLINE_HOT void table_free_array(TValue *&arr, ValueType *&types, const TValue *small) {
+    if (arr && arr != small)
+        std::free(arr);
+    arr = nullptr;
+    types = nullptr;
+}
+//------------------ Fused hash block: one calloc holding entries[cap] followed by bitmap words.
+//------------------ entries sits at offset 0, so freeing entries frees the whole block; hash_bitmap
+//------------------ points inside and is never freed separately. cap*24 is always 8-byte aligned
+//------------------ (sizeof(HashEntry)==24), so the bitmap needs no padding. Arena-owned tables never
+//------------------ use this: their entries live in the arena with a null bitmap until first resize.
+CLX_INLINE size_t table_hash_block_bytes(size_t cap) {
+    return cap * sizeof(HashEntry) + ((cap + 63) / 64) * sizeof(uint64_t);
+}
+CLX_INLINE_HOT void table_alloc_hash(HashEntry *&entries, uint64_t *&bitmap, size_t cap) {
+    if (cap == 0) {
+        entries = nullptr;
+        bitmap = nullptr;
+        return;
+    }
+    char *mem = static_cast<char *>(std::calloc(1, table_hash_block_bytes(cap)));
+    if (!mem)
+        throw std::bad_alloc();
+    entries = reinterpret_cast<HashEntry *>(mem);
+    bitmap = reinterpret_cast<uint64_t *>(mem + cap * sizeof(HashEntry));
+}
+CLX_INLINE_HOT void table_free_hash(HashEntry *&entries, uint64_t *&bitmap) {
+    if (entries)
+        std::free(entries);
+    entries = nullptr;
+    bitmap = nullptr;
+}
 //------------------ table_heap_bytes: heap bytes owned by a table's side buffers (mirrors the free paths); arena tables own none
 CLX_INLINE size_t table_heap_bytes(const LTable *t) {
     if (t->flags & LFLAG_ARENA)
@@ -853,6 +949,7 @@ static CLX_INLINE_HOT bool lvalue_eq_fast(const LValue &a, const LValue &b) {
     return false;
 }
 
+
 //------------------ Bump arena for interned strings
 struct StringArena {
     struct Block {
@@ -941,10 +1038,13 @@ struct StringPool {
             if (s.empty()) {
                 s = make_slot(str, len, h);
                 count++;
+                g_alloc_census.str_intern_new++;
                 return s.baked;
             }
-            if (slot_matches(s.baked, str, len, h))
+            if (slot_matches(s.baked, str, len, h)) {
+                g_alloc_census.str_intern_hit++;
                 return s.baked;
+            }
             idx = (idx + 1) & mask;
         }
     }
@@ -1076,36 +1176,6 @@ private:
 //------------------ Coroutine thread status enum
 enum ThreadStatus { THREAD_SUSPENDED = 0, THREAD_RUNNING = 1, THREAD_DEAD = 2, THREAD_NORMAL = 3 };
 
-//------------------ Shadow stack (growable, replaced fixed MAX_SHADOW_STACK array)
-struct ShadowStack {
-    TypedSlot *data = nullptr;
-    size_t cap = 0;
-
-    CLX_INLINE_HOT TypedSlot &operator[](size_t i) {
-        if (i >= cap)
-            grow(i + 1);
-        return data[i];
-    }
-
-    void grow(size_t need) {
-        size_t nc = cap ? cap * 2 : 256;
-        while (nc < need)
-            nc *= 2;
-        data = static_cast<TypedSlot *>(std::realloc(data, nc * sizeof(TypedSlot)));
-        cap = nc;
-    }
-
-    void reset() {
-        if (data) {
-            std::free(data);
-            data = nullptr;
-            cap = 0;
-        }
-    }
-
-    ~ShadowStack() { reset(); }
-};
-
 //------------------ Coroutine thread
 struct LThread : public LHeader {
     LState *state;
@@ -1126,9 +1196,8 @@ struct LThread : public LHeader {
     int yield_count = 0;
     //---------- luaapi: backing ApiBundle for the Lua 5.5 C API (owned by libclx_capi)
     void *luaapi = nullptr;
-    //---------- shadow: this thread's own GC-root region; empty while the thread is running (its region lives in LState)
-    ShadowStack shadow;
-    size_t shadow_top = 0;
+    //---------- top_root: this thread's root-frame chain head; empty while the thread is running (the head lives in LState)
+    RootRange *top_root = nullptr;
 #if defined(_WIN32)
     LPVOID fiber;
 #elif (defined(__APPLE__) || defined(__linux__)) && (defined(__aarch64__) || defined(__x86_64__))
@@ -1152,11 +1221,22 @@ struct LState {
     LTable *_G;
     LCFunction *current_func = nullptr;
     LHeader *allocated_objects;
+    //------------------ Old-generation chain: minors promote here and never walk it (see gc_minor sweep),
+    //------------------ so stop-the-world minors skip long-lived objects entirely. Majors reunite both
+    //------------------ chains before sweeping and re-partition after; close/membership walks cover both.
+    LHeader *old_objects = nullptr;
     LTable *free_tables;
+    //------------------ Big-buffer free list: tables retaining a heap array park here so size-unknown
+    //------------------ creations ({}) never inherit a 90KB array they will not use while the table that
+    //------------------ needs it allocates another (linear pool growth wave-over-wave; see create_table).
+    LTable *free_tables_big = nullptr;
     LCFunction *free_functions;
     LThread *free_threads = nullptr;
     size_t free_fiber_threads = 0;
     LTable *metatabled_tables = nullptr;
+    //------------------ Metatabled-userdata list: files register here so the protect passes can shield
+    //------------------ their metatable (+ __gc closure) when the userdata itself dies in the same cycle.
+    LUserdata *metatabled_ud = nullptr;
 
     //------------------ LTable slab arena: bump-allocated object slabs (freed whole at close)
 
@@ -1170,9 +1250,8 @@ struct LState {
     LThread *main_thread = nullptr;
     LThread *running_thread = nullptr;
 
-    static constexpr size_t MAX_SHADOW_STACK = 262144;
-    ShadowStack shadow_stack;
-    size_t shadow_top;
+    //---------- top_root: head of the running thread's RootRange chain (one frame per generated function)
+    RootRange *top_root = nullptr;
 
     const char *current_file;
     int current_line;
@@ -1458,36 +1537,159 @@ struct LState {
     void register_loaded_module(const std::string &name, const LValue &module);
 };
 
-//------------------ Stack scope guard
-struct ScopeGuard {
-    LState *L;
-    size_t prev_top;
+//------------------ RootRange — one GC-root frame. The constructor links it into the owning thread's chain, the
+//------------------ destructor unlinks it (RAII, so unwinding unroots without any explicit restore). `base[0..n)` is
+//------------------ marked by value; every `ind[i]` is an alias to a live LValue and marked by dereference.
+struct RootRange {
+    RootRange *prev;
+    LState *owner;
+    LValue *base;
+    size_t n;
+    LValue **ind;
+    size_t ind_n;
 
-    CLX_INLINE_HOT ScopeGuard(LState *state)
-        : L(state)
-        , prev_top(state->shadow_top) { }
+    CLX_INLINE_HOT RootRange(LState *L, LValue *b, size_t count, LValue **iv = nullptr, size_t iv_count = 0)
+        : prev(L->top_root)
+        , owner(L)
+        , base(b)
+        , n(count)
+        , ind(iv)
+        , ind_n(iv_count) {
+        L->top_root = this;
+    }
 
-    ~ScopeGuard() { L->shadow_top = prev_top; }
+    CLX_INLINE_HOT ~RootRange() {
+        if (owner->top_root == this)
+            owner->top_root = prev;
+    }
+
+    RootRange(const RootRange &) = delete;
+    RootRange &operator=(const RootRange &) = delete;
 };
 
-//------------------ Rooted call wrappers: push func + args on the shadow stack (GC rooting) around a call, then restore
+//------------------ FrameBase — watermark logic shared by every Frame instantiation. `used` counts live
+//------------------ aliases; blocks save it and restore it, which reuses slots across disjoint blocks.
+//------------------ `compact(base, mid)` folds callee-pushed tail entries down over a discarded base region
+//------------------ (the old multi-assign compaction), handling the empty-tail case the same way.
+struct FrameBase : RootRange {
+    size_t used = 0;
+    LValue **_heap = nullptr;
+    size_t _cap = 0;
+
+    CLX_INLINE_HOT explicit FrameBase(LState *L)
+        : RootRange(L, nullptr, 0, nullptr, 0) { }
+
+    CLX_INLINE_HOT ~FrameBase() { delete[] _heap; }
+
+    CLX_INLINE_COLD void grow() {
+        size_t ncap = _cap ? _cap * 2 : 64;
+        LValue **nh = new LValue *[ncap];
+        for (size_t i = 0; i < used; ++i)
+            nh[i] = ind[i];
+        delete[] _heap;
+        _heap = nh;
+        ind = nh;
+        _cap = ncap;
+    }
+
+    //------------------ push lives on the base (non-virtual, still inlined at callers) so that fast
+    //------------------ lambdas — which only ever see a FrameBase& — can root their locals in the
+    //------------------ caller's frame. Slots accumulate until the owning function returns, exactly like
+    //------------------ the old shadow stack; a private sub-frame per fast call would defeat C++ tail
+    //------------------ calls (its destructor runs after the recursive call) and overflow the stack.
+    CLX_INLINE_HOT void push(const LValue &v) {
+        if (used >= _cap)
+            grow();
+        ind[used++] = const_cast<LValue *>(&v);
+        ind_n = used;
+    }
+
+    CLX_INLINE_HOT size_t mark() const { return used; }
+
+    CLX_INLINE_HOT void restore(size_t m) {
+        used = m;
+        ind_n = m;
+    }
+
+    CLX_INLINE_HOT void pop() {
+        --used;
+        ind_n = used;
+    }
+
+    CLX_INLINE_HOT void pop_n(size_t k) {
+        used -= k;
+        ind_n = used;
+    }
+
+    CLX_INLINE_HOT void compact(size_t base, size_t mid) {
+        if (used > mid) {
+            size_t tail = used - mid;
+            for (size_t i = 0; i < tail; ++i)
+                ind[base + i] = ind[mid + i];
+            used = base + tail;
+        } else {
+            used = base;
+        }
+        ind_n = used;
+    }
+};
+
+//------------------ Frame<N> — the single root frame emitted at the top of every generated function and of the
+//------------------ main chunk. Slots are indirect (each aliases an LValue with a stable address: a local, an
+//------------------ argument array element, an upvalue cell, or a runtime temporary), so a reassigned local is
+//------------------ always seen by the collector. N inline slots cover every realistic function; a heap spill
+//------------------ (transparent to the collector, which only ever reads `ind[0..ind_n)`) covers the rest.
+template <size_t N>
+struct Frame : FrameBase {
+    LValue *_inline_buf[N];
+
+    CLX_INLINE_HOT explicit Frame(LState *L)
+        : FrameBase(L) {
+        ind = _inline_buf;
+        _cap = N;
+    }
+
+    Frame(const Frame &) = delete;
+    Frame &operator=(const Frame &) = delete;
+};
+
+//------------------ FrameGuard — RAII watermark save/restore for one block scope (unwind-safe by construction)
+struct FrameGuard {
+    FrameBase *f;
+    size_t m;
+
+    CLX_INLINE_HOT explicit FrameGuard(FrameBase &fr)
+        : f(&fr)
+        , m(fr.mark()) { }
+
+    CLX_INLINE_HOT ~FrameGuard() { f->restore(m); }
+
+    FrameGuard(const FrameGuard &) = delete;
+    FrameGuard &operator=(const FrameGuard &) = delete;
+};
+
+//------------------ gc_walk_roots — mark every root in one thread's frame chain
+template <typename F> static void gc_walk_roots(RootRange *head, F &&mark) {
+    for (RootRange *r = head; r; r = r->prev) {
+        for (size_t i = 0; i < r->n; ++i)
+            mark(r->base[i]);
+        for (size_t i = 0; i < r->ind_n; ++i)
+            mark(*r->ind[i]);
+    }
+}
+
+//------------------ Rooted call wrappers: alias func + args into a RootRange around a call; RAII unlinks it
 CLX_INLINE_HOT MultiValue call_function_rooted(
     LState *L, const LValue &func, const LValue *args, size_t count, const char *file, int line) {
-    ScopeGuard sg(L);
-    L->shadow_stack[L->shadow_top++] = TypedSlot(const_cast<TValue *>(&func.val), const_cast<ValueType *>(&func.type));
-    for (size_t i = 0; i < count; ++i)
-        L->shadow_stack[L->shadow_top++]
-            = TypedSlot(const_cast<TValue *>(&args[i].val), const_cast<ValueType *>(&args[i].type));
+    LValue *ind[1] = { const_cast<LValue *>(&func) };
+    RootRange rr(L, const_cast<LValue *>(args), args ? count : 0, ind, 1);
     return call_function(L, func, args, count, file, line);
 }
 
 CLX_INLINE_HOT MultiValue call_direct_rooted(
     LState *L, const LValue &func, const LValue *args, size_t count, const char *file, int line) {
-    ScopeGuard sg(L);
-    L->shadow_stack[L->shadow_top++] = TypedSlot(const_cast<TValue *>(&func.val), const_cast<ValueType *>(&func.type));
-    for (size_t i = 0; i < count; ++i)
-        L->shadow_stack[L->shadow_top++]
-            = TypedSlot(const_cast<TValue *>(&args[i].val), const_cast<ValueType *>(&args[i].type));
+    LValue *ind[1] = { const_cast<LValue *>(&func) };
+    RootRange rr(L, const_cast<LValue *>(args), args ? count : 0, ind, 1);
     return call_direct(L, func, args, count, file, line);
 }
 
@@ -1550,11 +1752,8 @@ CLX_INLINE void call_ctx_pop(LState *L) {
 //------------------ Rooted call wrapper for direct C function pointers (hoisted builtins, direct impls)
 CLX_INLINE_HOT MultiValue call_cfunc_rooted(
     LState *L, CFunctionType f, const LValue *args, size_t count, const char *file, int line) {
-    ScopeGuard sg(L);
+    RootRange rr(L, const_cast<LValue *>(args), args ? count : 0);
     CallCtxGuard cg(L);
-    for (size_t i = 0; i < count; ++i)
-        L->shadow_stack[L->shadow_top++]
-            = TypedSlot(const_cast<TValue *>(&args[i].val), const_cast<ValueType *>(&args[i].type));
     if (line > 0) {
         L->current_file = file;
         L->current_line = line;
@@ -1565,11 +1764,8 @@ CLX_INLINE_HOT MultiValue call_cfunc_rooted(
 //------------------ Raw pointer overload: skips std::function construction on hot builtin calls
 CLX_INLINE_HOT MultiValue call_cfunc_rooted(
     LState *L, RawCFunction f, const LValue *args, size_t count, const char *file, int line) {
-    ScopeGuard sg(L);
+    RootRange rr(L, const_cast<LValue *>(args), args ? count : 0);
     CallCtxGuard cg(L);
-    for (size_t i = 0; i < count; ++i)
-        L->shadow_stack[L->shadow_top++]
-            = TypedSlot(const_cast<TValue *>(&args[i].val), const_cast<ValueType *>(&args[i].type));
     if (line > 0) {
         L->current_file = file;
         L->current_line = line;
@@ -1580,11 +1776,8 @@ CLX_INLINE_HOT MultiValue call_cfunc_rooted(
 //------------------ Roots args[] across the direct-call fast path; else collections inside the callee miss survivor-aged args.
 CLX_INLINE_HOT MultiValue call_cfunc_direct(
     LState *L, const CFunctionType &f, const LValue *args, size_t count, const char *file = "", int line = 0) {
-    ScopeGuard sg(L);
+    RootRange rr(L, const_cast<LValue *>(args), args ? count : 0);
     CallCtxGuard cg(L);
-    for (size_t i = 0; i < count; ++i)
-        L->shadow_stack[L->shadow_top++]
-            = TypedSlot(const_cast<TValue *>(&args[i].val), const_cast<ValueType *>(&args[i].type));
     if (line > 0) {
         L->current_file = file;
         L->current_line = line;
@@ -1614,6 +1807,27 @@ CLX_INLINE void meta_list_remove(LState *L, LTable *t) {
         t->ext->meta_next = nullptr;
     }
     t->flags &= ~LFLAG_META_LIST;
+}
+
+//------------------ Metatabled-userdata list (dead-__gc protection fast path)
+CLX_INLINE void meta_ud_list_add(LState *L, LUserdata *ud) {
+    if (ud->flags & LFLAG_META_UD)
+        return;
+    ud->meta_next = L->metatabled_ud;
+    L->metatabled_ud = ud;
+    ud->flags |= LFLAG_META_UD;
+}
+
+CLX_INLINE void meta_ud_list_remove(LState *L, LUserdata *ud) {
+    if (!(ud->flags & LFLAG_META_UD))
+        return;
+    LUserdata **pp = &L->metatabled_ud;
+    while (*pp && *pp != ud)
+        pp = &(*pp)->meta_next;
+    if (*pp == ud)
+        *pp = ud->meta_next;
+    ud->meta_next = nullptr;
+    ud->flags &= ~LFLAG_META_UD;
 }
 
 inline std::string file_line_prefix(LState *L) {
@@ -2049,6 +2263,7 @@ CLX_INLINE FuncArena::~FuncArena() {
 }
 
 CLX_INLINE_HOT LValue arena_create_table(LState *L, FuncArena *a, size_t asize, size_t hsize) {
+    g_alloc_census.table_arena++;
 #if CLX_ARENA_DEFAULT_FIELDS > 0
     if (asize < CLX_ARENA_DEFAULT_FIELDS)
         asize = CLX_ARENA_DEFAULT_FIELDS;
@@ -2125,6 +2340,20 @@ CLX_INLINE_HOT LValue get_env_var(LState *L, const LValue &env, const char *name
 CLX_INLINE_HOT void set_env_var(LState *L, const LValue &env, const char *name, const LValue &val) {
     LTable *t = static_cast<LTable *>(env.val.payload.ptr);
     LValue key = LValue(L->intern_string(name));
+    t->settable(key, val);
+}
+
+//------------------ Keyed environment access: same raw gettable/settable as get/set_env_var but with a
+//------------------ pre-interned (codegen-pooled cstr_) key, so hot global reads/writes skip per-execution interning.
+CLX_INLINE_HOT LValue get_env_var_key(LState *L, const LValue &env, const LValue &key) {
+    LTable *t = static_cast<LTable *>(env.val.payload.ptr);
+    (void)L;
+    return t->gettable(key);
+}
+
+CLX_INLINE_HOT void set_env_var_key(LState *L, const LValue &env, const LValue &key, const LValue &val) {
+    LTable *t = static_cast<LTable *>(env.val.payload.ptr);
+    (void)L;
     t->settable(key, val);
 }
 
@@ -2384,6 +2613,25 @@ CLX_INLINE_HOT LValue div(LState *L, const LValue &a, const LValue &b) {
     if (a.to_number(l) && b.to_number(r))
         return LValue(l / r);
     return call_bin_metamethod(L, a, b, L->str_div, "__div");
+}
+
+//------------------ coerce_number: checked conversion to double for native-impl entries and reads.
+//------------------ Numbers pass through (Int64 exactly); strings parse like arithmetic coercion;
+//------------------ anything else throws the same arithmetic error the generic path would raise.
+//------------------ Unlike as_number() (which maps non-numbers to 0.0), this never silences a
+//------------------ type error. Metamethods are not consulted, matching the native_direct bodies.
+CLX_INLINE_HOT double coerce_number(LState *L, const LValue &v) {
+    if (v.type == ValueType::Double) [[likely]]
+        return v.val.payload.f64;
+    if (v.type == ValueType::Int64) [[likely]]
+        return static_cast<double>(v.val.payload.i64);
+    double out;
+    if (v.to_number(out))
+        return out;
+    size_t idx = (v.type == ValueType::Int64) ? static_cast<size_t>(ValueType::Double)
+                                              : static_cast<size_t>(v.type);
+    throw LRuntimeException(LValue(L->intern_string(
+        file_line_prefix(L) + "attempt to perform arithmetic on a " + VALUE_TYPE_NAMES[idx] + " value")));
 }
 
 //------------------ Equality with metamethod fallback
