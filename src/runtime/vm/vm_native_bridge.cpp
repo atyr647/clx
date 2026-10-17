@@ -144,11 +144,7 @@ extern "C" int clx_vm_native_bridge_call(lua_State *L) {
         }
     }
 
-    size_t prev_top = clx_L->shadow_top;
-    for (int i = 0; i < nargs; ++i) {
-        if (cv_args[i].is_gc_obj())
-            clx_L->shadow_stack[clx_L->shadow_top++] = TypedSlot(&cv_args[i].val, &cv_args[i].type);
-    }
+    RootRange cv_rr(clx_L, cv_args.data(), cv_args.size());
 
     try {
         MultiValue mv = call_function(clx_L, nb->clx_callable, cv_args.data(), cv_args.size(), __FILE__, __LINE__);
@@ -164,8 +160,6 @@ extern "C" int clx_vm_native_bridge_call(lua_State *L) {
             luaL_unref(L, LUA_REGISTRYINDEX, trk.reg_ref);
         }
 
-        clx_L->shadow_top = prev_top;
-
         size_t nret = mv.count;
         for (size_t i = 0; i < nret; ++i)
             clx_to_vm_value_(clx_L, L, mv[i]);
@@ -174,7 +168,6 @@ extern "C" int clx_vm_native_bridge_call(lua_State *L) {
 
         for (size_t t = 0; t < table_tracks.size(); ++t)
             luaL_unref(L, LUA_REGISTRYINDEX, table_tracks[t].reg_ref);
-        clx_L->shadow_top = prev_top;
         LValue err = e.error_obj;
         if (err.type != String) {
             err = clx_L->intern_lvalue(e.what(), std::strlen(e.what()));
