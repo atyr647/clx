@@ -127,14 +127,13 @@ static MultiValue utf8_codes(LState *L, const LValue *args, size_t count) {
     const char *raw = get_string(L, args, count, len, 1, "utf8.codes");
     const char *s = L->intern_string(raw, len);
     LValue u_lv = newuserdata(L, sizeof(CodesUd));
-    L->shadow_stack[L->shadow_top++] = { &u_lv.val, &u_lv.type };
+    RootRange rr(L, &u_lv, 1);
     LUserdata *u = static_cast<LUserdata *>(u_lv.as_pointer());
     CodesUd *ud = static_cast<CodesUd *>(u->data());
     ud->pos = 0;
     ud->len = len;
     ud->s = s;
     LValue func = L->create_closure(CFunctionType(codes_iter));
-    L->shadow_top--;
     return MultiValue({ func, u_lv, clx::nil() });
 }
 
