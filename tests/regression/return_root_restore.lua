@@ -1,12 +1,12 @@
 -- Regression test: a return expression must be evaluated while the function's
--- locals are still rooted on the shadow stack.
+-- locals are still rooted in its root frame.
 --
--- emitReturnStatement restored L->shadow_top to the function-entry value *before*
--- evaluating the returned expression. For `return { f(), l }` that meant f() -- and
--- the create_table that starts the constructor -- ran with `l` unreachable: a
--- collection swept it (array_size := 0, the LTable recycled) while the constructor
--- stored a copy of it. binarytrees hit this as a cyclic tree and an unbounded
--- ItemCheck recursion.
+-- emitReturnStatement once restored the root set to the function-entry watermark
+-- *before* evaluating the returned expression. For `return { f(), l }` that meant
+-- f() -- and the create_table that starts the constructor -- ran with `l`
+-- unreachable: a collection swept it (array_size := 0, the LTable recycled) while
+-- the constructor stored a copy of it. binarytrees hit this as a cyclic tree and
+-- an unbounded ItemCheck recursion.
 
 local pass, fail = 0, 0
 local function eq(actual, expected, name)
