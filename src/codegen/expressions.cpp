@@ -96,9 +96,12 @@ void CodeEmitter::emit_native(uint32_t n_idx) {
                 std::string_view cpp_name;
                 this->is_local(name, is_boxed, cpp_name);
                 std::string_view emit_name = cpp_name.empty() ? name : cpp_name;
-                if (is_boxed)
-                    out << "(*l_" << emit_name << ").as_number()";
-                else
+                if (is_boxed) {
+                    if (state.in_multi_impl)
+                        out << "clx::coerce_number(L, (*l_" << emit_name << "))";
+                    else
+                        out << "(*l_" << emit_name << ").as_number()";
+                } else
                     out << "l_" << emit_name;
                 return;
             }
@@ -200,7 +203,10 @@ void CodeEmitter::emit_native(uint32_t n_idx) {
             {
                 auto hit = state.hoisted_lookups.find(n_idx);
                 if (hit != state.hoisted_lookups.end()) {
-                    out << "(" << hit->second << ").as_number()";
+                    if (state.in_multi_impl)
+                        out << "clx::coerce_number(L, (" << hit->second << "))";
+                    else
+                        out << "(" << hit->second << ").as_number()";
                     return;
                 }
             }
@@ -234,16 +240,30 @@ void CodeEmitter::emit_native(uint32_t n_idx) {
                             ctx.nodes[n.as.table_access.key].as.string.length);
                         if (it->second.count(fn)) {
                             size_t idx = state.string_pool_index.at(fn);
+                            if (state.in_multi_impl)
+                                out << "clx::coerce_number(L, ";
                             out << "clx::table_get(L, ";
                             emit_node(n.as.table_access.table);
-                            out << ", cstr_[" << idx << "]).as_number()";
+                            if (state.in_multi_impl)
+                                out << ", cstr_[" << idx << "])";
+                            else
+                                out << ", cstr_[" << idx << "]).as_number()";
+                            if (state.in_multi_impl)
+                                out << ")";
                             return;
                         }
                     }
                 }
+                if (state.in_multi_impl)
+                    out << "clx::coerce_number(L, ";
                 out << "(";
                 emit_node(n_idx);
-                out << ").as_number()";
+                if (state.in_multi_impl)
+                    out << ")";
+                else
+                    out << ").as_number()";
+                if (state.in_multi_impl)
+                    out << ")";
                 return;
             }
             if (!t_name.empty() && state.pure_numeric_arrays.count(t_name)) {
@@ -253,6 +273,8 @@ void CodeEmitter::emit_native(uint32_t n_idx) {
                 return;
             }
             if (state.bce_safe_nodes.count(n_idx)) {
+                if (state.in_multi_impl)
+                    out << "clx::coerce_number(L, ";
                 out << "([&](){ clx::LValue _tb" << n_idx << " = ";
                 emit_node(n.as.table_access.table);
                 out << "; if (_tb" << n_idx << ".type != clx::ValueType::Table) clx::throw_index_error(L, _tb" << n_idx
@@ -261,11 +283,17 @@ void CodeEmitter::emit_native(uint32_t n_idx) {
                 emit_native(n.as.table_access.key);
                 out << "); return (_k" << n_idx << " - 1 < _t" << n_idx << "->array_size) ? clx::LValue(_t" << n_idx
                     << "->array[_k" << n_idx << " - 1], _t" << n_idx << "->array_types[_k" << n_idx
-                    << " - 1]) : clx::table_get_int(L, _tb" << n_idx << ", _k" << n_idx << "); }()).as_number()";
+                    << " - 1]) : clx::table_get_int(L, _tb" << n_idx << ", _k" << n_idx << "); }())";
+                if (state.in_multi_impl)
+                    out << ")";
+                else
+                    out << ".as_number()";
                 return;
             }
             bool pure_t = ctx.nodes[n.as.table_access.table].type == NodeType::Identifier;
             if (pure_t) {
+                if (state.in_multi_impl)
+                    out << "clx::coerce_number(L, ";
                 out << "([&](){ clx::LValue _b" << n_idx << " = ";
                 emit_node(n.as.table_access.table);
                 out << "; if (_b" << n_idx << ".type != clx::ValueType::Table) clx::throw_index_error(L, _b" << n_idx
@@ -274,9 +302,19 @@ void CodeEmitter::emit_native(uint32_t n_idx) {
                 out << ") - 1; auto* _t" << n_idx << " = static_cast<clx::LTable*>(_b" << n_idx
                     << ".as_pointer()); return (_idx" << n_idx << " < _t" << n_idx << "->array_size) ? clx::LValue(_t"
                     << n_idx << "->array[_idx" << n_idx << "], _t" << n_idx << "->array_types[_idx" << n_idx
-                    << "]).as_number() : clx::table_get_int(L, ";
+                    << "])";
+                if (state.in_multi_impl)
+                    out << " : ";
+                else
+                    out << ".as_number() : ";
+                out << "clx::table_get_int(L, ";
                 emit_node(n.as.table_access.table);
-                out << ", _idx" << n_idx << " + 1).as_number(); }())";
+                if (state.in_multi_impl)
+                    out << ", _idx" << n_idx << " + 1); }())";
+                else
+                    out << ", _idx" << n_idx << " + 1).as_number(); }())";
+                if (state.in_multi_impl)
+                    out << ")";
                 return;
             }
         }
@@ -291,31 +329,31 @@ void CodeEmitter::emit_native(uint32_t n_idx) {
                     is_fast = true;
             }
             if (is_fast) {
-                if (fname == state.current_fast_func) {
-                    out << "self(self";
-                    if (n.as.call_expr.arg_count > 0 || state.func_param_counts[fname] > 0)
-                        out << ", ";
-                } else {
-                    out << "_fast_" << fname << "(";
-                }
+                if (fname == state.current_fast_func)
+                    out << "self(self, _fr";
+                else
+                    out << "_fast_" << fname << "(_fr";
                 for (uint32_t i = 0; i < n.as.call_expr.arg_count; ++i) {
+                    out << ", ";
                     emit_native(ctx.block_statements[n.as.call_expr.first_arg + i]);
-                    if (i < n.as.call_expr.arg_count - 1)
-                        out << ", ";
                 }
-                for (uint32_t i = n.as.call_expr.arg_count; i < state.func_param_counts[fname]; ++i) {
-                    if (i > 0 || n.as.call_expr.arg_count > 0)
-                        out << ", ";
-                    out << "0.0";
-                }
+                for (uint32_t i = n.as.call_expr.arg_count; i < state.func_param_counts[fname]; ++i)
+                    out << ", 0.0";
                 out << ")";
                 return;
             }
         }
     }
+    if (state.in_multi_impl)
+        out << "clx::coerce_number(L, ";
     out << "(";
     emit_node(n_idx);
-    out << ").as_number()";
+    if (state.in_multi_impl)
+        out << ")";
+    else
+        out << ").as_number()";
+    if (state.in_multi_impl)
+        out << ")";
 }
 
 //------------------ emit_condition: emits a boolean C++ expression for use in if/while
@@ -359,6 +397,17 @@ void CodeEmitter::emit_condition(uint32_t c_idx) {
                 emit_native(c.as.bin_op.right);
                 return;
             }
+        }
+        if (op == static_cast<int>(BinaryOp::Lt) || op == static_cast<int>(BinaryOp::Gt)
+            || op == static_cast<int>(BinaryOp::Le) || op == static_cast<int>(BinaryOp::Ge)) {
+            bool swapped = op == static_cast<int>(BinaryOp::Gt) || op == static_cast<int>(BinaryOp::Ge);
+            uint32_t ord_l = swapped ? c.as.bin_op.right : c.as.bin_op.left;
+            uint32_t ord_r = swapped ? c.as.bin_op.left : c.as.bin_op.right;
+            int cmp_op = (op == static_cast<int>(BinaryOp::Lt) || op == static_cast<int>(BinaryOp::Gt))
+                ? static_cast<int>(BinaryOp::Lt)
+                : static_cast<int>(BinaryOp::Le);
+            if (try_emit_array_cmp(cmp_op, ord_l, ord_r, true))
+                return;
         }
     }
     if (c.type == NodeType::UnaryOp && c.as.unary_op.op == static_cast<int>(UnaryOp::Not)) {
@@ -491,24 +540,17 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
             out << "clx::num_box(";
         else
             out << "clx::LValue(static_cast<double>(";
-        if (fname == state.current_fast_func) {
-            out << "self(self";
-            if (node.as.call_expr.arg_count > 0 || state.func_param_counts[fname] > 0)
-                out << ", ";
-        } else {
-            out << "_fast_" << fname << "(";
-        }
+        if (fname == state.current_fast_func)
+            out << "self(self, _fr";
+        else
+            out << "_fast_" << fname << "(_fr";
 
         for (uint32_t i = 0; i < node.as.call_expr.arg_count; ++i) {
+            out << ", ";
             emit_native(ctx.block_statements[node.as.call_expr.first_arg + i]);
-            if (i < node.as.call_expr.arg_count - 1)
-                out << ", ";
         }
-        for (uint32_t i = node.as.call_expr.arg_count; i < state.func_param_counts[fname]; ++i) {
-            if (i > 0 || node.as.call_expr.arg_count > 0)
-                out << ", ";
-            out << "0.0";
-        }
+        for (uint32_t i = node.as.call_expr.arg_count; i < state.func_param_counts[fname]; ++i)
+            out << ", 0.0";
         if (state.int_returning_funcs.count(fname))
             out << ")))";
         else if (masked) {
@@ -521,13 +563,31 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
         return;
     }
 
-    //------------------ native-direct call: the set is exact-1-only, so a
-
-    if (!is_method_call && node.as.call_expr.target < ctx.nodes.size()
-        && native_call_eligible(node.as.call_expr.target, node.as.call_expr.first_arg, node.as.call_expr.arg_count)) {
+    //------------------ unboxed-direct call: triple-bound overload with every arg double-ready —
+    //------------------ bypasses LValue boxing at the boundary. Excludes self-recursion inside a
+    //------------------ triple body (the wrapper name is unusable there; the native branch below
+    //------------------ routes it through the boxed wrapper instead).
+    if (!is_method_call && !is_fast && !fname.empty() && !dbl_self_ref(node.as.call_expr.target)
+        && dbl_call_eligible(node.as.call_expr.target, node.as.call_expr.first_arg, node.as.call_expr.arg_count)) {
         if (want_multi)
             out << "clx::MultiValue(";
-        try_emit_native_call(node.as.call_expr.target, node.as.call_expr.first_arg, node.as.call_expr.arg_count, false);
+        try_emit_dbl_call(node.as.call_expr.target, node.as.call_expr.first_arg, node.as.call_expr.arg_count);
+        if (want_multi)
+            out << ")";
+        return;
+    }
+
+    //------------------ native-direct call: the set is exact-1-only, so a
+    //------------------ trailing single-value call contributes exactly one argument.
+    bool trailing_single_arg = !is_method_call
+        && trailing_single_call(node.as.call_expr.first_arg, node.as.call_expr.arg_count) != 0xFFFFFFFF;
+    if (!is_method_call && node.as.call_expr.target < ctx.nodes.size()
+        && native_call_eligible(node.as.call_expr.target, node.as.call_expr.first_arg,
+            node.as.call_expr.arg_count, trailing_single_arg)) {
+        if (want_multi)
+            out << "clx::MultiValue(";
+        try_emit_native_call(node.as.call_expr.target, node.as.call_expr.first_arg, node.as.call_expr.arg_count,
+            false, trailing_single_arg);
         if (want_multi)
             out << ")";
         return;
@@ -553,7 +613,7 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
     }
 
     out << "([&]() {\n";
-    out << "    size_t _ssave_call = L->shadow_top;\n";
+    out << "    size_t _ssave_call = _fr.mark();\n";
     out << "    bool _psm_call = L->pending_call_is_method;\n";
     out << "    bool _pns_call = L->pending_call_name_short;\n";
     out << "    L->pending_call_is_method = " << (is_method_call ? "true" : "false") << ";\n";
@@ -565,7 +625,7 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
         out << "    clx::LValue _m_self = ";
         emit_node(ctx.nodes[tgt].as.table_access.table);
         out << ";\n";
-        out << "    L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&_m_self.val, &_m_self.type);\n";
+        out << "    _fr.push(_m_self);\n";
 
         bool key_is_native = false;
         uint32_t k_idx = ctx.nodes[tgt].as.table_access.key;
@@ -586,7 +646,7 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
             emit_node(k_idx);
             out << ");\n";
         }
-        out << "    L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&_m_func.val, &_m_func.type);\n";
+        out << "    _fr.push(_m_func);\n";
     }
 
     if (last_expands) {
@@ -594,8 +654,7 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
         if (node.as.call_expr.arg_count > 1) {
             for (uint32_t i = 0; i < node.as.call_expr.arg_count - 1; ++i) {
                 if (i > 0)
-                    out << "    L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&_dyn_buf[" << (i - 1)
-                        << "].val, &_dyn_buf[" << (i - 1) << "].type);\n";
+                    out << "    _fr.push(_dyn_buf[" << (i - 1) << "]);\n";
                 out << "    _dyn_buf[_dyn_count++] = ";
                 if (is_method_call && i == 0)
                     out << "_m_self";
@@ -605,15 +664,21 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
             }
         }
 
-        state.expect_multivalue = true;
-        out << "    clx::MultiValue _mret = ";
-        emit_node(last_arg);
-        out << ";\n";
-        state.expect_multivalue = false;
+        uint32_t trailing_single = trailing_single_call(node.as.call_expr.first_arg, node.as.call_expr.arg_count);
+        if (trailing_single != 0xFFFFFFFF) {
+            out << "    _dyn_buf[_dyn_count++] = ";
+            emit_node(trailing_single);
+            out << ";\n";
+        } else {
+            state.expect_multivalue = true;
+            out << "    clx::MultiValue _mret = ";
+            emit_node(last_arg);
+            out << ";\n";
+            state.expect_multivalue = false;
 
-        out << "    for (size_t _mi = 0; _mi < _mret.count; ++_mi) _dyn_buf[_dyn_count++] = _mret[_mi];\n";
-        out << "    for (size_t _mi = 0; _mi < _dyn_count; ++_mi) L->shadow_stack[L->shadow_top++] = "
-               "clx::TypedSlot(&_dyn_buf[_mi].val, &_dyn_buf[_mi].type);\n";
+            out << "    for (size_t _mi = 0; _mi < _mret.count; ++_mi) _dyn_buf[_dyn_count++] = _mret[_mi];\n";
+        }
+        out << "    for (size_t _mi = 0; _mi < _dyn_count; ++_mi) _fr.push(_dyn_buf[_mi]);\n";
 
         if (is_direct) {
             out << "    const clx::CFunctionType &_gc_self = " << impl_call(fname) << ";\n";
@@ -655,7 +720,7 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
             out << ", _dyn_buf, _dyn_count, \"" << ctx.filename << "\", " << node.line << ");\n";
         }
 
-        out << "    L->shadow_top = _ssave_call;\n";
+        out << "    _fr.restore(_ssave_call);\n";
         out << "    clx::call_ctx_pop(L);\n";
         out << "    L->pending_call_is_method = _psm_call;\n";
         out << "    L->pending_call_name_short = _pns_call;\n";
@@ -688,8 +753,7 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
             out << "    clx::LValue args[" << node.as.call_expr.arg_count << "];\n";
             for (uint32_t i = 0; i < node.as.call_expr.arg_count; ++i) {
                 if (i > 0)
-                    out << "    L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&args[" << (i - 1) << "].val, &args["
-                        << (i - 1) << "].type);\n";
+                    out << "    _fr.push(args[" << (i - 1) << "]);\n";
                 out << "    args[" << i << "] = ";
                 if (is_method_call && i == 0)
                     out << "_m_self";
@@ -697,8 +761,7 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
                     emit_node(ctx.block_statements[node.as.call_expr.first_arg + i]);
                 out << ";\n";
             }
-            out << "    L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&args[" << (node.as.call_expr.arg_count - 1)
-                << "].val, &args[" << (node.as.call_expr.arg_count - 1) << "].type);\n";
+            out << "    _fr.push(args[" << (node.as.call_expr.arg_count - 1) << "]);\n";
             bool _sub1 = false;
             bool _subvar = false;
             int64_t _subi = 0;
@@ -738,9 +801,9 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
                 }
             }
             if (_sub1) {
-                out << "    size_t _ssaved = L->shadow_top;\n";
+                out << "    size_t _ssaved = _fr.mark();\n";
                 out << "    for (size_t i = 0; i < " << node.as.call_expr.arg_count
-                    << "; ++i) L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&args[i].val, &args[i].type);\n";
+                    << "; ++i) _fr.push(args[i]);\n";
                 out << "    clx::MultiValue _main_ret;\n";
                 if (_subvar) {
                     out << "    int64_t _sk = 0;\n";
@@ -763,7 +826,7 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
                 out << "        _main_ret = clx::call_cfunc_rooted(L, clx::str_sub, args, "
                     << node.as.call_expr.arg_count << ", \"" << ctx.filename << "\", " << node.line << ");\n";
                 out << "    }\n";
-                out << "    L->shadow_top = _ssaved;\n";
+                out << "    _fr.restore(_ssaved);\n";
             } else if (is_direct) {
                 out << "    const clx::CFunctionType &_gc_self = " << impl_call(fname) << ";\n";
                 out << "    clx::MultiValue _main_ret = clx::call_cfunc_direct(L, _gc_self, args, "
@@ -850,7 +913,7 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
             }
         }
 
-        out << "    L->shadow_top = _ssave_call;\n";
+        out << "    _fr.restore(_ssave_call);\n";
         out << "    clx::call_ctx_pop(L);\n";
         out << "    L->pending_call_is_method = _psm_call;\n";
         out << "    L->pending_call_name_short = _pns_call;\n";
@@ -879,7 +942,8 @@ void CodeEmitter::emitParenExpression(const ASTNode &node, uint32_t node_idx) {
 }
 
 //------------------ native call helpers (see codegen.h)
-bool CodeEmitter::native_call_eligible(uint32_t target_idx, uint32_t first_arg, uint32_t arg_count) {
+bool CodeEmitter::native_call_eligible(uint32_t target_idx, uint32_t first_arg, uint32_t arg_count,
+    bool allow_trailing_single, int depth) {
     if (target_idx >= ctx.nodes.size() || ctx.nodes[target_idx].type != NodeType::Identifier
         || ctx.nodes[target_idx].as.ident.is_global)
         return false;
@@ -890,19 +954,46 @@ bool CodeEmitter::native_call_eligible(uint32_t target_idx, uint32_t first_arg, 
     if (arg_count > 0) {
         uint32_t last = ctx.block_statements[first_arg + arg_count - 1];
         if (last < ctx.nodes.size()
-            && (ctx.nodes[last].type == NodeType::CallExpression || ctx.nodes[last].type == NodeType::Vararg))
-            return false;
+            && (ctx.nodes[last].type == NodeType::CallExpression || ctx.nodes[last].type == NodeType::Vararg)) {
+            if (!allow_trailing_single || trailing_single_call(first_arg, arg_count, depth + 1) == 0xFFFFFFFF)
+                return false;
+        }
     }
     return true;
 }
 
-bool CodeEmitter::try_emit_native_call(uint32_t target_idx, uint32_t first_arg, uint32_t arg_count, bool wrap_multi) {
-    if (!native_call_eligible(target_idx, first_arg, arg_count))
+//------------------ trailing_single_call: trailing call arg provably yielding exactly 1 value.
+//------------------ Only native-direct callees at exact arity qualify (every return holds exactly
+//------------------ one value, no call-passthrough, no varargs — see pass_callables). The strict
+//------------------ inner check rejects nested trailing calls, so the recursion terminates.
+uint32_t CodeEmitter::trailing_single_call(uint32_t first_arg, uint32_t arg_count, int depth) {
+    if (depth > 32 || arg_count == 0)
+        return 0xFFFFFFFF;
+    uint32_t last = ctx.block_statements[first_arg + arg_count - 1];
+    uint32_t nidx = last;
+    while (nidx < ctx.nodes.size() && ctx.nodes[nidx].type == NodeType::ParenExpression)
+        nidx = ctx.nodes[nidx].as.paren_expr.expr;
+    if (nidx >= ctx.nodes.size() || ctx.nodes[nidx].type != NodeType::CallExpression)
+        return 0xFFFFFFFF;
+    const auto &ce = ctx.nodes[nidx].as.call_expr;
+    if (ce.target >= ctx.nodes.size() || ctx.nodes[ce.target].type != NodeType::Identifier
+        || ctx.nodes[ce.target].as.ident.is_global)
+        return 0xFFFFFFFF;
+    if (!native_call_eligible(ce.target, ce.first_arg, ce.arg_count, true, depth + 1))
+        return 0xFFFFFFFF;
+    return nidx;
+}
+
+bool CodeEmitter::try_emit_native_call(uint32_t target_idx, uint32_t first_arg, uint32_t arg_count, bool wrap_multi,
+    bool allow_trailing_single) {
+    if (!native_call_eligible(target_idx, first_arg, arg_count, allow_trailing_single))
         return false;
     std::string_view fname(ctx.nodes[target_idx].as.ident.name, ctx.nodes[target_idx].as.ident.length);
     if (wrap_multi)
         out << "clx::MultiValue(";
-    if (state.in_native_impl && fname == state.current_native_func)
+    //------------------ inside a triple-bound body, self has the triple signature, so even
+    //------------------ self-recursion routes through the boxed wrapper (rare, always correct).
+    if (state.in_native_impl && !state.in_dbl_impl && fname == state.current_native_func)
         out << "self(self, L";
     else
         out << "native_" << fname << "(L";
@@ -914,6 +1005,84 @@ bool CodeEmitter::try_emit_native_call(uint32_t target_idx, uint32_t first_arg, 
     if (wrap_multi)
         out << ")";
     return true;
+}
+
+//------------------ dbl_call_eligible: triple-bound overload emitted, exact arity, every arg
+//------------------ double-ready with an exact int-flag (see unboxed_arg_ok) — the call passes
+//------------------ (double, int-flag, int-shadow) triples and skips LValue boxing entirely.
+bool CodeEmitter::dbl_call_eligible(uint32_t target_idx, uint32_t first_arg, uint32_t arg_count) {
+    if (target_idx >= ctx.nodes.size() || ctx.nodes[target_idx].type != NodeType::Identifier
+        || ctx.nodes[target_idx].as.ident.is_global)
+        return false;
+    std::string_view fname(ctx.nodes[target_idx].as.ident.name, ctx.nodes[target_idx].as.ident.length);
+    if (state.native_dbl_emitted.count(fname) == 0)
+        return false;
+    auto npc = state.func_param_counts.find(fname);
+    if (npc == state.func_param_counts.end() || arg_count != npc->second)
+        return false;
+    for (uint32_t i = 0; i < arg_count; ++i) {
+        if (!unboxed_arg_ok(ctx.block_statements[first_arg + i]))
+            return false;
+    }
+    return true;
+}
+
+bool CodeEmitter::dbl_self_ref(uint32_t target_idx) {
+    if (!state.in_dbl_impl || target_idx >= ctx.nodes.size()
+        || ctx.nodes[target_idx].type != NodeType::Identifier)
+        return false;
+    std::string_view tn(ctx.nodes[target_idx].as.ident.name, ctx.nodes[target_idx].as.ident.length);
+    return tn == state.current_native_func;
+}
+
+bool CodeEmitter::try_emit_dbl_call(uint32_t target_idx, uint32_t first_arg, uint32_t arg_count) {
+    if (!dbl_call_eligible(target_idx, first_arg, arg_count))
+        return false;
+    std::string_view fname(ctx.nodes[target_idx].as.ident.name, ctx.nodes[target_idx].as.ident.length);
+    out << "native_" << fname << "_dbl(L";
+    for (uint32_t i = 0; i < arg_count; ++i) {
+        uint32_t a_idx = ctx.block_statements[first_arg + i];
+        out << ", ";
+        emit_native(a_idx);
+        out << ", (" << int_flag_expr(a_idx, 1) << "), (" << int_value_expr(a_idx, 1) << ")";
+    }
+    out << ")";
+    return true;
+}
+
+//------------------ multi_call_eligible: exact-arity call to an already-emitted tuple impl.
+//------------------ The multi_emitted gate keeps lexically-earlier bodies on the generic closure.
+bool CodeEmitter::multi_call_eligible(uint32_t target_idx, uint32_t first_arg, uint32_t arg_count, uint32_t &out_n) {
+    if (target_idx >= ctx.nodes.size() || ctx.nodes[target_idx].type != NodeType::Identifier
+        || ctx.nodes[target_idx].as.ident.is_global)
+        return false;
+    std::string_view fname(ctx.nodes[target_idx].as.ident.name, ctx.nodes[target_idx].as.ident.length);
+    auto mit = state.multi_native_return_counts.find(fname);
+    if (mit == state.multi_native_return_counts.end())
+        return false;
+    if (state.multi_emitted.count(fname) == 0)
+        return false;
+    auto npc = state.func_param_counts.find(fname);
+    if (npc == state.func_param_counts.end() || arg_count != npc->second)
+        return false;
+    if (arg_count > 0) {
+        uint32_t last = ctx.block_statements[first_arg + arg_count - 1];
+        if (last < ctx.nodes.size()
+            && (ctx.nodes[last].type == NodeType::CallExpression || ctx.nodes[last].type == NodeType::Vararg))
+            return false;
+    }
+    out_n = mit->second;
+    return true;
+}
+
+//------------------ emit_multi_call: direct tuple-struct call; every parameter is an LValue.
+void CodeEmitter::emit_multi_call(std::string_view fname, uint32_t first_arg, uint32_t arg_count) {
+    out << "native_" << fname << "(L";
+    for (uint32_t i = 0; i < arg_count; ++i) {
+        out << ", ";
+        emit_node(ctx.block_statements[first_arg + i]);
+    }
+    out << ")";
 }
 
 //------------------ emitUnaryOp: handles NodeType::UnaryOp
@@ -993,7 +1162,7 @@ void CodeEmitter::emitUnaryOp(const ASTNode &node, uint32_t node_idx) {
 }
 
 //------------------ try_emit_array_cmp: numeric array fast path for two hoisted integer-indexed reads
-bool CodeEmitter::try_emit_array_cmp(int cmp_op, uint32_t l_idx, uint32_t r_idx) {
+bool CodeEmitter::try_emit_array_cmp(int cmp_op, uint32_t l_idx, uint32_t r_idx, bool want_bool) {
     if (l_idx == 0xFFFFFFFF || r_idx == 0xFFFFFFFF || l_idx >= ctx.nodes.size() || r_idx >= ctx.nodes.size())
         return false;
     const ASTNode &ln = ctx.nodes[l_idx];
@@ -1017,7 +1186,25 @@ bool CodeEmitter::try_emit_array_cmp(int cmp_op, uint32_t l_idx, uint32_t r_idx)
 
     const char *cmp = (cmp_op == static_cast<int>(BinaryOp::Le)) ? "<=" : "<";
     const char *fn = (cmp_op == static_cast<int>(BinaryOp::Le)) ? "le" : "lt";
-    out << "([&]() -> clx::LValue { clx::LTable* _ca = " << lp << "; clx::LTable* _cb = " << rp
+    const char *arr_open;
+    const char *arr_ret1;
+    const char *arr_ret1_end;
+    const char *arr_ret2;
+    const char *arr_tail;
+    if (want_bool) {
+        arr_open = "([&]() -> bool { clx::LTable* _ca = ";
+        arr_ret1 = "";
+        arr_ret1_end = " _cb->array[_kb - 1].payload.i64;";
+        arr_ret2 = "((";
+        arr_tail = ").as_bool(); })()";
+    } else {
+        arr_open = "([&]() -> clx::LValue { clx::LTable* _ca = ";
+        arr_ret1 = "clx::LValue(";
+        arr_ret1_end = " _cb->array[_kb - 1].payload.i64);";
+        arr_ret2 = "clx::LValue((";
+        arr_tail = "); })()";
+    }
+    out << arr_open << lp << "; clx::LTable* _cb = " << rp
         << "; int64_t _ka = static_cast<int64_t>(";
     emit_native(lk);
     out << "); int64_t _kb = static_cast<int64_t>(";
@@ -1026,12 +1213,13 @@ bool CodeEmitter::try_emit_array_cmp(int cmp_op, uint32_t l_idx, uint32_t r_idx)
            " && static_cast<size_t>(_kb) <= _cb->array_size) [[likely]] {"
            " clx::ValueType _tya = _ca->array_types[_ka - 1]; clx::ValueType _tyb = _cb->array_types[_kb - 1];"
            " if (_tya == clx::ValueType::Int64 && _tyb == clx::ValueType::Int64) [[likely]]"
-           " return clx::LValue(_ca->array[_ka - 1].payload.i64 "
-        << cmp
-        << " _cb->array[_kb - 1].payload.i64);"
-           " if ((_tya == clx::ValueType::Int64 || _tya == clx::ValueType::Double)"
-           " && (_tyb == clx::ValueType::Int64 || _tyb == clx::ValueType::Double)) return clx::LValue(("
-           "_tya == clx::ValueType::Int64 ? static_cast<double>(_ca->array[_ka - 1].payload.i64)"
+           " return "
+        << arr_ret1
+        << "_ca->array[_ka - 1].payload.i64 "
+        << cmp << arr_ret1_end
+        << " if ((_tya == clx::ValueType::Int64 || _tya == clx::ValueType::Double)"
+           " && (_tyb == clx::ValueType::Int64 || _tyb == clx::ValueType::Double)) return "
+        << arr_ret2 << "_tya == clx::ValueType::Int64 ? static_cast<double>(_ca->array[_ka - 1].payload.i64)"
            " : _ca->array[_ka - 1].payload.f64) "
         << cmp
         << " (_tyb == clx::ValueType::Int64 ? static_cast<double>(_cb->array[_kb - 1].payload.i64)"
@@ -1040,7 +1228,7 @@ bool CodeEmitter::try_emit_array_cmp(int cmp_op, uint32_t l_idx, uint32_t r_idx)
     emit_node(l_idx);
     out << ", ";
     emit_node(r_idx);
-    out << "); })()";
+    out << arr_tail;
     return true;
 }
 
@@ -1317,38 +1505,37 @@ void CodeEmitter::emitBinaryOp(const ASTNode &node, uint32_t node_idx) {
             out << "*_p = '\\0'; return clx::LValue(L->intern_string(_buf, static_cast<size_t>(_p - _buf))); }())";
         } else {
             out << "([&](){\n";
-            out << "    size_t _ssave_cat = L->shadow_top;\n";
+            out << "    size_t _ssave_cat = _fr.mark();\n";
             out << "    clx::LValue args[" << operands.size() << "];\n";
             for (size_t i = 0; i < operands.size(); ++i) {
                 if (i > 0)
-                    out << "    L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&args[" << (i - 1) << "].val, &args["
-                        << (i - 1) << "].type);\n";
+                    out << "    _fr.push(args[" << (i - 1) << "]);\n";
                 out << "    args[" << i << "] = ";
                 emit_node(operands[i]);
                 out << ";\n";
             }
             out << "    clx::LValue _cat_r = clx::concat_multi(L, args, " << operands.size() << ");\n";
-            out << "    L->shadow_top = _ssave_cat;\n";
+            out << "    _fr.restore(_ssave_cat);\n";
             out << "    return _cat_r;\n";
             out << "}())";
         }
         return;
     }
     if (op == static_cast<int>(BinaryOp::And)) {
-        out << "([&](){ size_t _eg_ab = L->shadow_top; clx::LValue _a = ";
+        out << "([&](){ size_t _rg_ab = _fr.mark(); clx::LValue _a = ";
         emit_node(node.as.bin_op.left);
-        out << "; L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&_a.val, &_a.type); auto _eg_r = _a.as_bool() ? (";
+        out << "; _fr.push(_a); auto _rg_r = _a.as_bool() ? (";
         emit_node(node.as.bin_op.right);
-        out << ") : _a; L->shadow_top = _eg_ab; return _eg_r; }())";
+        out << ") : _a; _fr.restore(_rg_ab); return _rg_r; }())";
         return;
     }
     if (op == static_cast<int>(BinaryOp::Or)) {
-        out << "([&](){ size_t _eg_ab = L->shadow_top; clx::LValue _a = ";
+        out << "([&](){ size_t _rg_ab = _fr.mark(); clx::LValue _a = ";
         emit_node(node.as.bin_op.left);
-        out << "; L->shadow_stack[L->shadow_top++] = clx::TypedSlot(&_a.val, &_a.type); auto _eg_r = _a.as_bool() ? _a "
+        out << "; _fr.push(_a); auto _rg_r = _a.as_bool() ? _a "
                ": (";
         emit_node(node.as.bin_op.right);
-        out << "); L->shadow_top = _eg_ab; return _eg_r; }())";
+        out << "); _fr.restore(_rg_ab); return _rg_r; }())";
         return;
     }
 
@@ -1519,10 +1706,10 @@ void CodeEmitter::emitIdentifier(const ASTNode &node, uint32_t node_idx) {
         } else if (state.global_constants.count(name)) {
             out << "clx::LValue(static_cast<double>(" << state.global_constants[name] << "))";
         } else if (state.string_builders.count(name)) {
-            out << "(sb_" << emit_name << ".empty() ? clx::get_env_var(L, _ENV, \"" << name << "\") : clx::LValue(sb_"
-                << emit_name << ".to_string(L)))";
+            out << "(sb_" << emit_name << ".empty() ? clx::get_env_var_key(L, _ENV, cstr_["
+                << state.string_pool_index.at(name) << "]) : clx::LValue(sb_" << emit_name << ".to_string(L)))";
         } else {
-            out << "clx::get_env_var(L, _ENV, \"" << name << "\")";
+            out << "clx::get_env_var_key(L, _ENV, cstr_[" << state.string_pool_index.at(name) << "])";
         }
     } else if (is_native && !is_boxed && !node.as.ident.is_captured) {
         box_native_identifier(emit_name, name);
