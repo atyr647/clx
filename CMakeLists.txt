@@ -56,6 +56,9 @@ else()
     endif()
 endif()
 
+# Core runtime: always linked (state, GC, tables, calls, threads, values, lib opener).
+# luastd_base/luastd_package live in their own archives but are linked unconditionally
+# because LState::open() opens base + package on every state.
 set(RUNTIME_SOURCES
     src/runtime/threads.cpp
     src/runtime/values.cpp
@@ -63,17 +66,16 @@ set(RUNTIME_SOURCES
     src/runtime/state.cpp
     src/runtime/gc.cpp
     src/runtime/calls.cpp
-    src/runtime/base.cpp 
-    src/runtime/package.cpp 
-    src/runtime/math.cpp 
-    src/runtime/coroutine.cpp 
-    src/runtime/strings.cpp 
-    src/runtime/table.cpp 
-    src/runtime/os.cpp 
-    src/runtime/utf8.cpp 
-    src/runtime/io.cpp
     src/runtime/openlibs.cpp
+    src/runtime/fulllibs.cpp
 )
+
+#------------------ Std Lua modules: one static archive each (libclx_<name>.a / clx_<name>.lib),
+#------------------ installed to <libdir>/clx. --minimal links base + package only; anything else comes
+#------------------ in via --modules <name>. Source file differs from module name only for string.
+set(CLX_MODULES base package math coroutine string table os utf8 io)
+set(CLX_MODULE_string_SRC src/runtime/strings.cpp)
+set(CLX_MODULE_table_SRC src/runtime/table.cpp)
 
 # The Lua 5.5 C API bridge is built into its own archive; the driver links it only when a precompiled C module needs it.
 set(CAPI_SOURCE src/runtime/luaapi.cpp)
@@ -153,6 +155,47 @@ if(UNIX)
 if(WIN32)
     set_target_properties(clx_static_size PROPERTIES OUTPUT_NAME "clx_size")
     endif()
+
+#──────────────── Std module archives (libclx_<name>.a + libclx_<name>_size.a)
+set(CLX_MOD_FAST_TARGETS "")
+set(CLX_MOD_SIZE_TARGETS "")
+function(clx_add_module mod src)
+    foreach(variant "" "_size")
+        add_library(clxmod_${mod}${variant} STATIC ${src})
+        if("${variant}" STREQUAL "")
+            list(APPEND CLX_MOD_FAST_TARGETS clxmod_${mod}${variant})
+        else()
+            list(APPEND CLX_MOD_SIZE_TARGETS clxmod_${mod}${variant})
+        endif()
+        if(ipo_supported AND CLX_LTO_FLAG)
+            set_property(TARGET clxmod_${mod}${variant} PROPERTY INTERPROCEDURAL_OPTIMIZATION $<$<CONFIG:Release>:TRUE>)
+        endif()
+        target_include_directories(clxmod_${mod}${variant} BEFORE PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        set_target_properties(clxmod_${mod}${variant} PROPERTIES OUTPUT_NAME "clx_${mod}${variant}")
+        if(WIN32)
+            set_target_properties(clxmod_${mod}${variant} PROPERTIES
+                ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/lib/clx
+                ARCHIVE_OUTPUT_DIRECTORY_DEBUG ${CMAKE_CURRENT_SOURCE_DIR}/lib/clx
+                ARCHIVE_OUTPUT_DIRECTORY_RELEASE ${CMAKE_CURRENT_SOURCE_DIR}/lib/clx
+                MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+        else()
+            # Flat next to libclx.a: build/clx/ collides with the clx driver executable.
+            set_target_properties(clxmod_${mod}${variant} PROPERTIES
+                ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+        endif()
+        install(TARGETS clxmod_${mod}${variant} ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}/clx)
+    endforeach()
+    set(CLX_MOD_FAST_TARGETS "${CLX_MOD_FAST_TARGETS}" PARENT_SCOPE)
+    set(CLX_MOD_SIZE_TARGETS "${CLX_MOD_SIZE_TARGETS}" PARENT_SCOPE)
+endfunction()
+
+foreach(_mod IN LISTS CLX_MODULES)
+    if(DEFINED CLX_MODULE_${_mod}_SRC)
+        clx_add_module(${_mod} ${CLX_MODULE_${_mod}_SRC})
+    else()
+        clx_add_module(${_mod} src/runtime/${_mod}.cpp)
+    endif()
+endforeach()
 
 #──────────────── clx_capi — Lua 5.5 C API bridge (libclx_capi.a / libclx_capi_size.a)
 add_library(clx_capi STATIC ${CAPI_SOURCE})
@@ -306,12 +349,41 @@ elseif(MSVC)
     endif()
 endif()
 
+# Std module archives inherit the fast/size optimization split of the core runtime libs.
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU" AND NOT MSVC)
+    if(ARCH_IS_X86)
+        foreach(_m IN LISTS CLX_MOD_FAST_TARGETS)
+            target_compile_options(${_m} PRIVATE $<$<CONFIG:Release>:-O3;${CLX_LTO_FLAG};-ffloat-store;-fno-math-errno;${CLX_ARCH_GCC_FLAG}>)
+        endforeach()
+        foreach(_m IN LISTS CLX_MOD_SIZE_TARGETS)
+            target_compile_options(${_m} PRIVATE $<$<CONFIG:Release>:-Os;${CLX_LTO_FLAG};-ffloat-store;-fno-math-errno;${CLX_ARCH_GCC_FLAG}>)
+        endforeach()
+    elseif(ARCH_IS_ARM)
+        foreach(_m IN LISTS CLX_MOD_FAST_TARGETS)
+            target_compile_options(${_m} PRIVATE $<$<CONFIG:Release>:-O3;${CLX_LTO_FLAG};-fstrict-aliasing;-fno-math-errno;${CLX_ARCH_GCC_FLAG}>)
+        endforeach()
+        foreach(_m IN LISTS CLX_MOD_SIZE_TARGETS)
+            target_compile_options(${_m} PRIVATE $<$<CONFIG:Release>:-Os;${CLX_LTO_FLAG};-fstrict-aliasing;-fno-math-errno;${CLX_ARCH_GCC_FLAG}>)
+        endforeach()
+    endif()
+elseif(MSVC)
+    foreach(_m IN LISTS CLX_MOD_FAST_TARGETS)
+        target_compile_options(${_m} PRIVATE $<$<CONFIG:Release>:/O2;/Ob2;${CLX_ARCH_MSVC_FLAG};/fp:strict>)
+    endforeach()
+    foreach(_m IN LISTS CLX_MOD_SIZE_TARGETS)
+        target_compile_options(${_m} PRIVATE $<$<CONFIG:Release>:/O1;/Ob1;${CLX_ARCH_MSVC_FLAG};/fp:strict>)
+    endforeach()
+endif()
+
 if(APPLE)
     target_compile_options(clx PRIVATE -Wno-deprecated-declarations)
     target_compile_options(clx_static PRIVATE -Wno-deprecated-declarations)
     target_compile_options(clx_static_size PRIVATE -Wno-deprecated-declarations)
     target_compile_options(clx_capi PRIVATE -Wno-deprecated-declarations)
     target_compile_options(clx_capi_size PRIVATE -Wno-deprecated-declarations)
+    foreach(_m IN LISTS CLX_MOD_FAST_TARGETS CLX_MOD_SIZE_TARGETS)
+        target_compile_options(${_m} PRIVATE -Wno-deprecated-declarations)
+    endforeach()
 endif()
 
 install(TARGETS clx RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
