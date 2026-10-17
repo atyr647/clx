@@ -7,6 +7,7 @@
 
 #include "../include/clx_simd.h"
 #include "clx.h"
+#include "internal.h"
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
@@ -56,7 +57,6 @@ clx::MultiValue lua_xpcall(clx::LState *L, const clx::LValue *args, size_t count
     size_t arg_count = count - 2;
     const clx::LValue *func_args = (arg_count > 0) ? (args + 2) : nullptr;
 
-    size_t shadow_base = L->shadow_top;
     try {
         clx::MultiValue ret
             = clx::call_function_rooted(L, func, func_args, arg_count, L->current_file, L->current_line);
@@ -74,7 +74,6 @@ clx::MultiValue lua_xpcall(clx::LState *L, const clx::LValue *args, size_t count
         return clx::MultiValue(results, L);
 
     } catch (const clx::LRuntimeException &e) {
-        L->shadow_top = shadow_base;
         clx::LValue err_obj = e.error_obj;
         clx::MultiValue msgh_ret;
 
@@ -87,7 +86,6 @@ clx::MultiValue lua_xpcall(clx::LState *L, const clx::LValue *args, size_t count
         return clx::MultiValue({ clx::boolean(false), msgh_ret.count > 0 ? msgh_ret[0] : clx::LValue() });
 
     } catch (const std::exception &e) {
-        L->shadow_top = shadow_base;
         clx::LValue err_obj = clx::string(L, e.what());
         clx::MultiValue msgh_ret;
 
@@ -120,13 +118,23 @@ static MultiValue lua_setmetatable(LState *L, const LValue *args, size_t count) 
 }
 
 //------------------ clx_print: prints values to stdout (global print function)
+//------------------ print_write — stdout via the io batch when linked (shared ordering with
+//------------------ io.write), direct cout under --minimal where io.o is dropped.
+static void print_write(const char *p, size_t n) {
+    if (clx_io_write_ptr)
+        clx_io_write_ptr(stdout, p, n);
+    else
+        std::cout.write(p, static_cast<std::streamsize>(n));
+}
+
 static MultiValue print(LState *L, const LValue *args, size_t count) {
     for (size_t i = 0; i < count; ++i) {
-        std::cout << args[i].to_string(L);
+        std::string s = args[i].to_string(L);
+        print_write(s.data(), s.size());
         if (i < count - 1)
-            std::cout << "\t";
+            print_write("\t", 1);
     }
-    std::cout << "\n";
+    print_write("\n", 1);
     return MultiValue();
 }
 
@@ -367,11 +375,18 @@ static MultiValue warn(LState *L, const LValue *args, size_t count) {
         return MultiValue();
 
     for (size_t i = 0; i < count; ++i) {
+        std::string s = args[i].to_string(L);
         if (i > 0)
-            std::cerr << " ";
-        std::cerr << args[i].to_string(L);
+            s.insert(0, " ");
+        if (clx_io_write_ptr)
+            clx_io_write_ptr(stderr, s.data(), s.size());
+        else
+            std::cerr << s;
     }
-    std::cerr << "\n";
+    if (clx_io_write_ptr)
+        clx_io_write_ptr(stderr, "\n", 1);
+    else
+        std::cerr << "\n";
     return MultiValue();
 }
 
