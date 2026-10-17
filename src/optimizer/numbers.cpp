@@ -81,6 +81,51 @@ void pass_constants_and_bounds(const ASTContext &ctx, AnalysisState &state, Pass
         }
     }
 
+    state.numeric_builtin_aliases.clear();
+    for (const auto &node : ctx.nodes) {
+        uint32_t t_idx = 0xFFFFFFFF, v_idx = 0xFFFFFFFF;
+        if (node.type == NodeType::LocalDecl && node.as.local_decl.ident_count == 1
+            && node.as.local_decl.value_count == 1) {
+            t_idx = ctx.block_statements[node.as.local_decl.first_ident];
+            v_idx = ctx.block_statements[node.as.local_decl.first_value];
+        } else if (node.type == NodeType::Assignment && node.as.assign.target_count == 1
+            && node.as.assign.value_count == 1) {
+            t_idx = ctx.block_statements[node.as.assign.first_target];
+            v_idx = ctx.block_statements[node.as.assign.first_value];
+        } else {
+            continue;
+        }
+        if (t_idx >= ctx.nodes.size() || v_idx >= ctx.nodes.size())
+            continue;
+        if (ctx.nodes[t_idx].type != NodeType::Identifier || ctx.nodes[v_idx].type != NodeType::TableAccess)
+            continue;
+        const auto &ta = ctx.nodes[v_idx].as.table_access;
+        if (ta.table >= ctx.nodes.size() || ta.key >= ctx.nodes.size())
+            continue;
+        if (ctx.nodes[ta.table].type != NodeType::Identifier || ctx.nodes[ta.key].type != NodeType::String)
+            continue;
+        std::string_view mod(ctx.nodes[ta.table].as.ident.name, ctx.nodes[ta.table].as.ident.length);
+        std::string_view key(ctx.nodes[ta.key].as.string.text, ctx.nodes[ta.key].as.string.length);
+        if (mod != "math")
+            continue;
+        static const char *numeric_fns[] = { "abs", "acos", "asin", "atan", "atan2", "ceil", "cos",
+            "cosh", "deg", "exp", "floor", "fmod", "log", "max", "min", "pow", "rad", "sin",
+            "sinh", "sqrt", "tan", "tanh", nullptr };
+        bool is_num = false;
+        for (const char **f = numeric_fns; *f; ++f) {
+            if (key == *f) {
+                is_num = true;
+                break;
+            }
+        }
+        if (!is_num)
+            continue;
+        std::string_view alias(ctx.nodes[t_idx].as.ident.name, ctx.nodes[t_idx].as.ident.length);
+        if (state.reassigned_vars.count(alias))
+            continue;
+        state.numeric_builtin_aliases.emplace(alias);
+    }
+
     auto block_writes_table = [&](auto &self, uint32_t block_idx, std::string_view table_name) -> bool {
         if (block_idx == 0xFFFFFFFF || block_idx >= ctx.nodes.size())
             return false;
@@ -936,6 +981,195 @@ void pass_int_returns_masks(const ASTContext &ctx, AnalysisState &state, PassScr
                 state.int_typed_locals.insert(ln);
             }
         }
+    }
+}
+
+//------------------ nogc_is_expanding: true if a value expression can expand to multiple values
+//------------------ (uncaptured call or vararg, ignoring parenthesis truncation which disables it).
+static bool nogc_is_expanding(const ASTContext &ctx, uint32_t node_idx) {
+    uint32_t nidx = node_idx;
+    while (nidx < ctx.nodes.size() && ctx.nodes[nidx].type == NodeType::ParenExpression)
+        nidx = ctx.nodes[nidx].as.paren_expr.expr;
+    if (nidx >= ctx.nodes.size())
+        return false;
+    return ctx.nodes[nidx].type == NodeType::CallExpression || ctx.nodes[nidx].type == NodeType::Vararg;
+}
+
+//------------------ nogc_rhs_ok: true if a value expression can only produce numbers, booleans,
+//------------------ nil or strings. The collector traces only Table/Thread/Function/UserData
+//------------------ (gc_push_for_trace) and never touches strings, so such values need no frame
+//------------------ slot. Soundness-critical: unknown node types default to false. In clx (unlike
+//------------------ stock Lua) binary/unary operators on non-table/userdata operands never consult
+//------------------ metamethods (find_bin_metamethod checks Table/UserData only), so arithmetic,
+//------------------ bitwise, concat and comparisons of non-GC operands yield plain values or throw.
+static bool nogc_rhs_ok(const ASTContext &ctx, const AnalysisState &state,
+    const std::set<std::string_view> &cands, uint32_t node_idx, int depth) {
+    if (depth > 64 || node_idx == 0xFFFFFFFF || node_idx >= ctx.nodes.size())
+        return false;
+    const auto &n = ctx.nodes[node_idx];
+    switch (n.type) {
+    case NodeType::Number:
+    case NodeType::Integer:
+    case NodeType::String:
+    case NodeType::TrueLiteral:
+    case NodeType::FalseLiteral:
+    case NodeType::NilLiteral:
+        return true;
+    case NodeType::ParenExpression:
+        return nogc_rhs_ok(ctx, state, cands, n.as.paren_expr.expr, depth + 1);
+    case NodeType::UnaryOp: {
+        int op = n.as.unary_op.op;
+        if (op == static_cast<int>(UnaryOp::Not) || op == static_cast<int>(UnaryOp::Len))
+            return true;
+        return nogc_rhs_ok(ctx, state, cands, n.as.unary_op.expr, depth + 1);
+    }
+    case NodeType::BinaryOp: {
+        int op = n.as.bin_op.op;
+        if (op == static_cast<int>(BinaryOp::Eq) || op == static_cast<int>(BinaryOp::Ne)
+            || op == static_cast<int>(BinaryOp::Lt) || op == static_cast<int>(BinaryOp::Gt)
+            || op == static_cast<int>(BinaryOp::Le) || op == static_cast<int>(BinaryOp::Ge))
+            return true;
+        return nogc_rhs_ok(ctx, state, cands, n.as.bin_op.left, depth + 1)
+            && nogc_rhs_ok(ctx, state, cands, n.as.bin_op.right, depth + 1);
+    }
+    case NodeType::TableAccess:
+        if (yields_number(ctx, state, node_idx, nullptr, "", nullptr))
+            return true;
+        return struct_field_kind(ctx, state, node_idx) == FieldKind::Str;
+    case NodeType::CallExpression: {
+        uint32_t tgt = n.as.call_expr.target;
+        if (tgt < ctx.nodes.size() && ctx.nodes[tgt].type == NodeType::Identifier
+            && !ctx.nodes[tgt].as.ident.is_global) {
+            std::string_view fname(ctx.nodes[tgt].as.ident.name, ctx.nodes[tgt].as.ident.length);
+            if (state.native_return_funcs.count(fname) || state.int_returning_funcs.count(fname))
+                return true;
+            if (state.numeric_builtin_aliases.count(std::string(fname)))
+                return true;
+        }
+        return false;
+    }
+    case NodeType::Identifier: {
+        if (n.as.ident.is_global)
+            return false;
+        std::string_view nm(n.as.ident.name, n.as.ident.length);
+        if (cands.count(nm))
+            return true;
+        if (std::find(state.native_numbers.begin(), state.native_numbers.end(), nm)
+            != state.native_numbers.end())
+            return true;
+        if (state.int_typed_locals.count(std::string(nm)))
+            return true;
+        if (state.native_integers.count(std::string(nm)))
+            return true;
+        return state.for_counter_names.count(nm) > 0;
+    }
+    default:
+        return false;
+    }
+}
+
+//------------------ pass_nogc_locals: block locals proven to never hold a GC-managed value.
+//------------------ A candidate survives only if every reaching assignment (declaration values
+//------------------ and later stores, with Lua multi-value adjustment) is nogc-clean. Captured
+//------------------ locals, parameters and unknown RHS kinds stay rooted. Runs last so that
+//------------------ yields_number, native/int-returning funcs and builtin aliases are final.
+void pass_nogc_locals(const ASTContext &ctx, AnalysisState &state, PassScratch &sk, uint32_t root_node) {
+    (void)root_node;
+    (void)sk;
+    std::map<uint32_t, std::set<std::string_view>> cands;
+    for (uint32_t i = 0; i < ctx.nodes.size(); ++i) {
+        const auto &nd = ctx.nodes[i];
+        if (nd.type != NodeType::LocalDecl)
+            continue;
+        uint32_t owner = owner_of_node(state, i);
+        for (uint32_t k = 0; k < nd.as.local_decl.ident_count; ++k) {
+            uint32_t idi = ctx.block_statements[nd.as.local_decl.first_ident + k];
+            if (idi >= ctx.nodes.size() || ctx.nodes[idi].type != NodeType::Identifier)
+                continue;
+            if (ctx.nodes[idi].as.ident.is_captured)
+                continue;
+            cands[owner].emplace(ctx.nodes[idi].as.ident.name, ctx.nodes[idi].as.ident.length);
+        }
+    }
+    if (cands.empty())
+        return;
+    auto paired_rhs = [&](const auto &stmt, uint32_t first_v, uint32_t v_count, uint32_t ti) -> uint32_t {
+        (void)stmt;
+        if (v_count == 0)
+            return 0xFFFFFFFF;
+        if (ti < v_count - 1)
+            return ctx.block_statements[first_v + ti];
+        if (ti == v_count - 1)
+            return ctx.block_statements[first_v + ti];
+        uint32_t last = ctx.block_statements[first_v + v_count - 1];
+        if (nogc_is_expanding(ctx, last))
+            return last;
+        return 0xFFFFFFFF;
+    };
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (uint32_t i = 0; i < ctx.nodes.size(); ++i) {
+            const auto &nd = ctx.nodes[i];
+            uint32_t t_count = 0, first_t = 0, v_count = 0, first_v = 0;
+            bool is_decl = nd.type == NodeType::LocalDecl;
+            if (is_decl) {
+                t_count = nd.as.local_decl.ident_count;
+                first_t = nd.as.local_decl.first_ident;
+                v_count = nd.as.local_decl.value_count;
+                first_v = nd.as.local_decl.first_value;
+            } else if (nd.type == NodeType::Assignment) {
+                t_count = nd.as.assign.target_count;
+                first_t = nd.as.assign.first_target;
+                v_count = nd.as.assign.value_count;
+                first_v = nd.as.assign.first_value;
+            } else {
+                continue;
+            }
+            uint32_t owner = owner_of_node(state, i);
+            auto cit = cands.find(owner);
+            if (cit == cands.end() || cit->second.empty())
+                continue;
+            std::set<std::string_view> exclude;
+            if (is_decl) {
+                for (uint32_t k = 0; k < t_count; ++k) {
+                    uint32_t idi = ctx.block_statements[first_t + k];
+                    if (idi < ctx.nodes.size() && ctx.nodes[idi].type == NodeType::Identifier
+                        && !ctx.nodes[idi].as.ident.is_global)
+                        exclude.emplace(ctx.nodes[idi].as.ident.name, ctx.nodes[idi].as.ident.length);
+                }
+            }
+            for (uint32_t ti = 0; ti < t_count; ++ti) {
+                uint32_t tgt = ctx.block_statements[first_t + ti];
+                if (tgt >= ctx.nodes.size() || ctx.nodes[tgt].type != NodeType::Identifier)
+                    continue;
+                if (ctx.nodes[tgt].as.ident.is_global)
+                    continue;
+                std::string_view tn(ctx.nodes[tgt].as.ident.name, ctx.nodes[tgt].as.ident.length);
+                if (cit->second.count(tn) == 0)
+                    continue;
+                uint32_t rhs = paired_rhs(nd, first_v, v_count, ti);
+                bool ok;
+                if (rhs == 0xFFFFFFFF) {
+                    ok = true;
+                } else if (is_decl) {
+                    std::set<std::string_view> scoped = cit->second;
+                    for (const auto &e : exclude)
+                        scoped.erase(e);
+                    ok = nogc_rhs_ok(ctx, state, scoped, rhs, 0);
+                } else {
+                    ok = nogc_rhs_ok(ctx, state, cit->second, rhs, 0);
+                }
+                if (!ok) {
+                    cit->second.erase(tn);
+                    changed = true;
+                }
+            }
+        }
+    }
+    for (const auto &kv : cands) {
+        for (const auto &nm : kv.second)
+            state.nogc_locals.emplace(kv.first, nm);
     }
 }
 
