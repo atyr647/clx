@@ -202,10 +202,10 @@ static MultiValue pack_require(LState *L, const LValue *args, size_t count) {
         LValue loader_fn = (res.count > 0) ? res[0] : LValue();
         if (loader_fn.type == Function) {
             //------------------ The loader runs with the env passed to require (nil = real _G)
-            L->shadow_stack[L->shadow_top++] = TypedSlot(&loader_args[0].val, &loader_args[0].type);
             LTable *saved_G = L->_G;
             LValue saved_G_val(ValueType::Table, saved_G);
-            L->shadow_stack[L->shadow_top++] = TypedSlot(&saved_G_val.val, &saved_G_val.type);
+            LValue *loader_ind[1] = { &saved_G_val };
+            RootRange loader_rr(L, loader_args, 1, loader_ind, 1);
             if (env.type == Table)
                 L->_G = static_cast<LTable *>(env.as_pointer());
             MultiValue mod;
@@ -213,11 +213,9 @@ static MultiValue pack_require(LState *L, const LValue *args, size_t count) {
                 mod = call_function(L, loader_fn, loader_args, 1, __FILE__, __LINE__);
             } catch (...) {
                 L->_G = saved_G;
-                L->shadow_top -= 2;
                 throw;
             }
             L->_G = saved_G;
-            L->shadow_top -= 2;
 
             LValue result = (mod.count > 0) ? mod[0] : LValue(true);
             if (result.type == Nil)
