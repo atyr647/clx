@@ -104,6 +104,15 @@ inline bool yields_number(const ASTContext &ctx, const AnalysisState &state, uin
 
         if (tbl_idx < ctx.nodes.size() && ctx.nodes[tbl_idx].type == NodeType::Identifier) {
             std::string_view tn(ctx.nodes[tbl_idx].as.ident.name, ctx.nodes[tbl_idx].as.ident.length);
+            if (tn == "math" && n.as.table_access.key < ctx.nodes.size()
+                && ctx.nodes[n.as.table_access.key].type == NodeType::String) {
+                std::string_view mk(
+                    ctx.nodes[n.as.table_access.key].as.string.text, ctx.nodes[n.as.table_access.key].as.string.length);
+                if (mk == "huge" || mk == "pi" || mk == "maxinteger" || mk == "mininteger") {
+                    result = true;
+                    goto done;
+                }
+            }
             FieldKind _sfk = struct_field_kind(ctx, state, node_idx);
             if (_sfk == FieldKind::Int || _sfk == FieldKind::Double) {
                 result = true;
@@ -199,9 +208,32 @@ inline bool yields_number(const ASTContext &ctx, const AnalysisState &state, uin
 
     if (n.type == NodeType::CallExpression) {
         uint32_t tgt = n.as.call_expr.target;
+        if (tgt < ctx.nodes.size() && ctx.nodes[tgt].type == NodeType::TableAccess) {
+            const auto &ta = ctx.nodes[tgt].as.table_access;
+            if (ta.table < ctx.nodes.size() && ta.key < ctx.nodes.size()
+                && ctx.nodes[ta.table].type == NodeType::Identifier
+                && ctx.nodes[ta.key].type == NodeType::String) {
+                std::string_view mod(ctx.nodes[ta.table].as.ident.name, ctx.nodes[ta.table].as.ident.length);
+                std::string_view key(
+                    ctx.nodes[ta.key].as.string.text, ctx.nodes[ta.key].as.string.length);
+                if (mod == "math"
+                    && (key == "abs" || key == "acos" || key == "asin" || key == "atan" || key == "atan2"
+                        || key == "ceil" || key == "cos" || key == "cosh" || key == "deg" || key == "exp"
+                        || key == "floor" || key == "fmod" || key == "log" || key == "max" || key == "min"
+                        || key == "pow" || key == "rad" || key == "sin" || key == "sinh" || key == "sqrt"
+                        || key == "tan" || key == "tanh")) {
+                    result = true;
+                    goto done;
+                }
+            }
+        }
         if (ctx.nodes[tgt].type == NodeType::Identifier && !ctx.nodes[tgt].as.ident.is_global) {
             std::string_view fname(ctx.nodes[tgt].as.ident.name, ctx.nodes[tgt].as.ident.length);
             if (state.native_return_funcs.count(fname)) {
+                result = true;
+                goto done;
+            }
+            if (state.numeric_builtin_aliases.count(std::string(fname))) {
                 result = true;
                 goto done;
             }
