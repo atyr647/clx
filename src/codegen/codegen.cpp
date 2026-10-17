@@ -176,6 +176,21 @@ std::string CodeEmitter::int_flag_expr(uint32_t expr_idx, int depth) {
     }
     if (n.type == NodeType::UnaryOp && n.as.unary_op.op == static_cast<int>(UnaryOp::Minus))
         return int_flag_expr(n.as.unary_op.expr, depth + 1);
+    //------------------ math.maxinteger/mininteger are always Int64 (stock Lua guarantees the
+    //------------------ constants); huge/pi are floats and stay "false". The global check keeps a
+    //------------------ shadowing local named `math` on the conservative path.
+    if (n.type == NodeType::TableAccess) {
+        uint32_t tbl_idx = n.as.table_access.table;
+        uint32_t key_idx = n.as.table_access.key;
+        if (tbl_idx < ctx.nodes.size() && key_idx < ctx.nodes.size()
+            && ctx.nodes[tbl_idx].type == NodeType::Identifier && ctx.nodes[tbl_idx].as.ident.is_global
+            && ctx.nodes[key_idx].type == NodeType::String) {
+            std::string_view tn(ctx.nodes[tbl_idx].as.ident.name, ctx.nodes[tbl_idx].as.ident.length);
+            std::string_view mk(ctx.nodes[key_idx].as.string.text, ctx.nodes[key_idx].as.string.length);
+            if (tn == "math" && (mk == "maxinteger" || mk == "mininteger"))
+                return "true";
+        }
+    }
     return "false";
 }
 
@@ -254,6 +269,21 @@ std::string CodeEmitter::int_value_expr(uint32_t expr_idx, int depth) {
     }
     if (n.type == NodeType::UnaryOp && n.as.unary_op.op == static_cast<int>(UnaryOp::Minus))
         return "clx::int_neg(" + int_value_expr(n.as.unary_op.expr, depth + 1) + ")";
+    //------------------ math.maxinteger/mininteger shadows (mirrors the int_flag_expr case above).
+    if (n.type == NodeType::TableAccess) {
+        uint32_t tbl_idx = n.as.table_access.table;
+        uint32_t key_idx = n.as.table_access.key;
+        if (tbl_idx < ctx.nodes.size() && key_idx < ctx.nodes.size()
+            && ctx.nodes[tbl_idx].type == NodeType::Identifier && ctx.nodes[tbl_idx].as.ident.is_global
+            && ctx.nodes[key_idx].type == NodeType::String) {
+            std::string_view tn(ctx.nodes[tbl_idx].as.ident.name, ctx.nodes[tbl_idx].as.ident.length);
+            std::string_view mk(ctx.nodes[key_idx].as.string.text, ctx.nodes[key_idx].as.string.length);
+            if (tn == "math" && mk == "maxinteger")
+                return "INT64_MAX";
+            if (tn == "math" && mk == "mininteger")
+                return "INT64_MIN";
+        }
+    }
     if (n.type == NodeType::CallExpression) {
         uint32_t tgt = n.as.call_expr.target;
         if (tgt >= ctx.nodes.size() || ctx.nodes[tgt].type != NodeType::Identifier || ctx.nodes[tgt].as.ident.is_global)
@@ -284,6 +314,50 @@ std::string CodeEmitter::int_value_expr(uint32_t expr_idx, int depth) {
         return any ? r + ")" : "0";
     }
     return "0";
+}
+
+//------------------ unboxed_arg_ok: true when an argument's double, int-flag and int-shadow are
+//------------------ all exact without boxing: integer/number literals, unboxed native locals/params
+//------------------ with exact runtime flags, integer counters, and arithmetic over such. Anything
+//------------------ else (table reads, calls, boxed locals, varargs) can hide an Int64 behind a false
+//------------------ flag, so it stays on the boxed path. Depth-bounded like int_flag_expr.
+bool CodeEmitter::unboxed_arg_ok(uint32_t arg_idx, int depth) {
+    if (depth > 24 || arg_idx >= ctx.nodes.size())
+        return false;
+    const auto &n = ctx.nodes[arg_idx];
+    if (n.type == NodeType::Number || n.type == NodeType::Integer)
+        return true;
+    if (n.type == NodeType::ParenExpression)
+        return unboxed_arg_ok(n.as.paren_expr.expr, depth + 1);
+    if (n.type == NodeType::Identifier && !n.as.ident.is_global) {
+        std::string_view nm(n.as.ident.name, n.as.ident.length);
+        if (state.for_counter_names.count(nm))
+            return true;
+        bool boxed = false;
+        std::string_view cpp;
+        if (!is_local(nm, boxed, cpp))
+            return false;
+        if (boxed)
+            return false;
+        for (auto it = locals.rbegin(); it != locals.rend(); ++it) {
+            if (it->name == nm)
+                return (it->is_int_counter || (it->has_intf && it->has_ii)) ? true : false;
+        }
+        return false;
+    }
+    if (n.type == NodeType::BinaryOp) {
+        int op = n.as.bin_op.op;
+        bool ok = op == static_cast<int>(BinaryOp::Add) || op == static_cast<int>(BinaryOp::Sub)
+            || op == static_cast<int>(BinaryOp::Mul) || op == static_cast<int>(BinaryOp::Div)
+            || op == static_cast<int>(BinaryOp::Pow) || op == static_cast<int>(BinaryOp::FloorDiv)
+            || op == static_cast<int>(BinaryOp::Mod);
+        if (!ok)
+            return false;
+        return unboxed_arg_ok(n.as.bin_op.left, depth + 1) && unboxed_arg_ok(n.as.bin_op.right, depth + 1);
+    }
+    if (n.type == NodeType::UnaryOp && n.as.unary_op.op == static_cast<int>(UnaryOp::Minus))
+        return unboxed_arg_ok(n.as.unary_op.expr, depth + 1);
+    return false;
 }
 
 //------------------ emit: generates C++ code for the AST rooted at root_node
@@ -325,6 +399,14 @@ void CodeEmitter::emit(uint32_t root_node, std::string_view module_name) {
     state.current_fast_func = "";
     state.current_native_func = "";
     state.native_emitted.clear();
+    state.native_dbl_emitted.clear();
+    state.multi_emitted.clear();
+    state.emit_dbl_impl = false;
+    state.in_dbl_impl = false;
+    state.emit_multi_impl = false;
+    state.in_multi_impl = false;
+    state.current_multi_count = 0;
+    state.current_multi_func = "";
     state.hoisted_tables.clear();
     state.ref_capture.clear();
     state.raw_lambda_cell.clear();
@@ -489,7 +571,26 @@ void CodeEmitter::emit(uint32_t root_node, std::string_view module_name) {
     if (!state.string_pool.empty()) {
         out << "static clx::LValue cstr_[" << state.string_pool.size() << "];\n";
     }
-    out << "static inline clx::LValue clx_gettable_safe(clx::LValue val) { return val; }\n\n";
+    out << "static inline clx::LValue clx_gettable_safe(clx::LValue val) { return val; }\n";
+    {
+        bool need2 = false, need3 = false, need4 = false;
+        for (const auto &kv : state.multi_native_return_counts) {
+            if (kv.second == 2)
+                need2 = true;
+            else if (kv.second == 3)
+                need3 = true;
+            else if (kv.second == 4)
+                need4 = true;
+        }
+        if (need2)
+            out << "struct ClxTup2 { double v0; double v1; };\n";
+        if (need3)
+            out << "struct ClxTup3 { double v0; double v1; double v2; };\n";
+        if (need4)
+            out << "struct ClxTup4 { double v0; double v1; double v2; double v3; };\n";
+        if (need2 || need3 || need4)
+            out << "\n";
+    }
 
     for (const auto &_sskv : state.struct_shapes) {
         const StructShape &_ss = _sskv.second;
@@ -510,6 +611,7 @@ void CodeEmitter::emit(uint32_t root_node, std::string_view module_name) {
         out << "\n";
 
     out << "CLX_API clx::LValue luaopen_" << module_name << "(clx::LState* L) {\n";
+    out << "    clx::Frame<16> _fr(L);\n";
     out << "    clx::LValue _ENV(clx::ValueType::Table, L->_G);\n";
     out << "    L->current_file = \"" << ctx.filename << "\";\n";
     out << "    L->current_line = 0;\n";
