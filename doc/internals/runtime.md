@@ -71,6 +71,28 @@ Generational collector, enabled by default:
 
 Set `CLX_GC_MODE=incremental` to opt back out to the legacy incremental collector. Tune the generations with `CLX_GC_MINOR_KB` and `CLX_GC_MAJOR_KB`.
 
+#### GC roots: root frames, not guards
+
+GC roots live in a chain of **root frames**, not on a manually managed stack. The
+primitives are in `include/clx_runtime.h`:
+
+- `RootRange` — one frame: a `base[0..n)` array marked by value plus `ind[]` aliases
+  marked by dereference. The constructor links it into the owning thread's `top_root`
+  chain; the destructor unlinks it, so unwinding unroots automatically with no explicit
+  restore.
+- `Frame<N>` / `FrameBase` — the single root frame emitted at the top of every generated
+  function (`clx::Frame<16> _fr(L)`). Locals, args, and temporaries are rooted with
+  `_fr.push(x)`. `N` inline slots cover realistic functions; a heap spill covers the rest,
+  transparently to the collector.
+- `FrameGuard` — RAII watermark save/restore for one block scope (loops, blocks). The
+  old `ScopeGuard` + `shadow_top` push/restore machinery is gone.
+
+Consequences for generated code: `return` statements emit **no** root restore — the return
+expression is evaluated with the full root set live (see
+`tests/regression/return_root_restore.lua`), and the frame unlinks itself when the C++
+function exits. Coroutine switches stash/load the whole root-frame chain
+(`root_stash`/`root_load` in `src/runtime/threads.cpp`) instead of copying a stack region.
+
 ### 2. Base Library (src/runtime/base.cpp)
 
 Implements core Lua functions:
@@ -289,7 +311,7 @@ clx supports all standard Lua metamethods:
 
 ### To-be-closed Variables (`<close>`)
 
-CLX supports Lua 5.4+ `<close>` attribute via `CloseGuard` (`clx_runtime.h`). When a variable is declared `local x <close> = ...`, the codegen emits a `CloseGuard` that calls the `__close` metamethod when the variable goes out of scope. `CloseGuard` manages its own shadow stack entries independently of `ScopeGuard`.
+CLX supports Lua 5.4+ `<close>` attribute via `CloseGuard` (`clx_runtime.h`). When a variable is declared `local x <close> = ...`, the codegen emits a `CloseGuard` that calls the `__close` metamethod when the variable goes out of scope. `CloseGuard` holds its value directly as a by-value `LValue` member (kept alive for the guard's lifetime); it does not participate in the root-frame chain — rooting locals is the owning `Frame`'s job.
 
 ## Memory Layout
 
