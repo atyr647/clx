@@ -10,8 +10,9 @@ clx emits arithmetic expressions and delegates to the C++ compiler, which perfor
 
 ```lua
 local x = 1 + 2 + 3  -- Compiled as: local x = 6
-local y = "hello" .. " " .. "world"  -- Compiled as: local y = "hello world"
 ```
+
+String concatenation of literals is not folded at the Lua level: multi-operand concat emits a runtime `StringBuilder` fill with the literals memcpy'd in, and the C++ compiler may still fold it after inlining.
 
 ### Numeric fast-path
 
@@ -48,15 +49,21 @@ local result = a + b  -- When a and b are known numbers, uses add directly
 Beyond plain numeric inference, the optimizer tracks which locals, function parameters, and
 function return values are **integer**-typed (`int64_t` rather than `double`). This enables:
 
-- `int64_t` loop counters for numeric `for` loops (no floating-point counter):
+- `int64_t` loop counters for numeric `for` loops whose controls are provably numeric
+  (on this path there is no floating-point counter):
 
 ```lua
--- Generated C++:
+-- Generated C++ (start/limit/step all proven numeric):
 -- for (int64_t i_val = 1; i_val <= n; i_val++) { ... }
 for i = 1, n do
     ...
 end
 ```
+
+  Controls that cannot be proven numeric (e.g. a bare parameter used only as the limit)
+  take the generic path and run a `double` counter over `to_number`-converted bounds —
+  which loses the loop variable's integer subtype (recorded as item 9 in the
+  maintainer-local `deviations.md` at the repository root).
 
 - unboxed integer locals (`int64_t l_x;`) instead of `double` when the optimizer proves the variable is only assigned integer values;
 - integer-returning functions whose result is used directly in integer arithmetic;
@@ -64,17 +71,21 @@ end
 
 The optimizer records `int_returning_funcs`, `int_typed_locals`, and `native_integers` in the analysis state (`analysis_state.h`), and `is_purely_integer_expr()` proves integer-ness for whole expressions so arithmetic stays in the integer domain end-to-end.
 
-### Int64 overflow safety
+### Int64 arithmetic: wrap-on-overflow
 
 Integer arithmetic (`add`, `sub`, `mul`) with two `Int64` operands uses native C++ integer
-operations for speed. Each operation checks for overflow before returning:
+operations computed in `uint64_t` (well-defined wrap-around), staying in the integer domain —
+matching stock Lua 5.5, which wraps: `math.maxinteger + 1 == math.mininteger`,
+`-math.mininteger == math.mininteger`, `math.mininteger // -1 == math.mininteger`.
 
-- **add**: Detects same-sign inputs producing a different-sign result
-- **sub**: Detects different-sign inputs where the result sign matches the subtrahend
-- **mul**: Verifies `result / operand == other_operand`, with special-case for `INT64_MIN * -1`
+- **add / sub / mul**: raw two's-complement wrap via `int_add_lv`/`int_sub_lv`/`int_mul_lv`
+- **unm (`-x`)**: wraps (`-math.mininteger == math.mininteger`)
+- **`//` (idiv)**: integer floor division; `b == -1` wraps `INT64_MIN` to `INT64_MIN`
+- **`%` (mod)**: Lua floor-modulo semantics (result takes the divisor's sign); `b == -1` returns 0
+- **`pow`, and mixed int/float operands**: promote to double (float domain)
 
-On overflow, the result is promoted to `double` (matching Lua 5.5 semantics). `mod`, `idiv`,
-`pow`, and `unm` always promote to double for all numeric inputs.
+Do not reintroduce promote-on-overflow for int64 ops — a July 2026 fix that promoted on
+overflow was factually wrong and was replaced with wrapping.
 
 ### Non-fast function parameter numeric promotion
 
@@ -102,10 +113,11 @@ When a function receives a table as a parameter (e.g., `advance(bodies, dt)` whe
 is an array of record-like tables), the optimizer cannot prove that `bodies[i].x` yields a
 number without tracing the pattern.
 
-Pass 3 in the optimizer detects `local bi = bodies[i]` where `bodies` is a function parameter,
-then traces field accesses (`bi.x`, `bi.y`) in BinaryOp nodes to infer numeric fields. Both
-the parameter name and the local name are registered in `g_numeric_table_fields` so
-`yields_number()` proves field reads yield numbers.
+The `pass_table_fields` optimizer pass detects `local bi = bodies[i]` where `bodies` is a
+function parameter, then traces field accesses (`bi.x`, `bi.y`) in BinaryOp nodes to infer
+numeric fields. Both the parameter name and the local name are registered in
+`numeric_table_fields` (on the analysis state) so `yields_number()` proves field reads yield
+numbers.
 
 ```lua
 -- Before: bodies[i].x goes through clx::table_get → as_number()
@@ -255,10 +267,13 @@ local x = obj.value
 local y = obj.value  -- Cache hit if same key and no structural mutation
 ```
 
-**Hash version guards**: Tables increment `hash_version` only on structural changes (inserts
-and deletes that alter the hash probe sequence), not on value-only overwrites. This means
-read-then-write patterns (e.g., `t[k] = t[k] + 1`) hit the cache on the read even when the
-value is overwritten, because the structural shape hasn't changed.
+**Hash version guards**: `hash_version` is the *sole structural invalidator* of the inline
+cache, and the only hash-part mutation that bumps it is a rehash (which relocates entries).
+Plain inserts and deletes never move entries — key-payload + type checks reject stale slots —
+so they intentionally leave the version alone; metatable set and table recycle also bump it.
+Value-only overwrites never bump it. This means read-then-write patterns (e.g.,
+`t[k] = t[k] + 1`) hit the cache on the read even when the value is overwritten, because the
+structural shape hasn't changed.
 
 **Works for any hash key**: The inline cache operates on raw key payload bits, not on
 identifier names. It works for globals, locals, function parameters, and computed string
@@ -293,9 +308,9 @@ Each `LTableExt` carries a `hash_bitmap` recording which hash slots are occupied
 - GC hash-part marking scan only occupied slots;
 - hash occupancy checks O(1).
 
-The bitmap is maintained on insert, resize, and delete, and SIMD-accelerated scans read it in
-32-byte chunks with scalar tails for non-aligned sizes. Portability: AVX2 where available,
-else SSE2/NEON, else scalar.
+The bitmap is maintained on insert, resize, and delete. Iteration is scalar: a 64-bit word
+loop with `ctz` to skip empty runs (`hash_bitmap` scans in `next()` and the GC). SIMD is used
+for the dense `ValueType` type-arrays above, not for the bitmap.
 
 ## 5. String optimizations
 
@@ -305,9 +320,10 @@ String storage is backed by a block-based **StringArena** (64 KB blocks, bump-al
 the open-addressed `StringPool` hash map. Each pool slot owns a baked allocation:
 
 ```text
-[uint16 hash hi][uint32 len][char data...\0]
-[  8 bytes  ][ 4 bytes ]
+[uint32 hash_low @0][pad @4][uint32 len @8][pad @12][char data...\0 @16]
 ```
+
+The LValue points at the data (`mem + 16`), skipping the 16-byte header.
 
 Benefits:
 
@@ -319,11 +335,13 @@ Benefits:
 
 ### Baked hashes (16-byte header)
 
-For interned strings, the 64-bit wyhash is baked into the allocation header 16 bytes before
-the data pointer (`ptr[-16..-9]`). Reading the hash costs a single 8-byte load — zero recompute:
+For interned strings, the low 32 bits of the wyhash are baked into the allocation header —
+4 bytes at `ptr[-16]` — and the length is a 4-byte field at `ptr[-8]`. Reading the hash costs
+a single 4-byte load (`clx_memcpy(&h_low, ptr - 16, 4)`), zero recompute:
 
 ```cpp
-uint64_t h = string_baked_hash(str_ptr);  // Single load
+uint32_t h_low;
+clx_memcpy(&h_low, str_ptr - 16, 4);  // single 4-byte load
 ```
 
 ### 64-bit wyhash
@@ -391,9 +409,10 @@ for (int64_t i_val = 1; i_val <= 100; i_val++) {
 }
 ```
 
-Generic for loops emit direct `LCFunction` pointer calls in the loop body, avoiding
-indirect call overhead. Inline `ipairs(t)` patterns are detected and emitted as direct
-`while` loops over `table_get_int` with no iterator function calls.
+Generic for loops over `ipairs`/`pairs` of a **promoted pure numeric array** are lowered to a
+plain C++ `for` over the `std::vector<double>` local — no triplet protocol, no iterator
+function calls. Generic `for` over anything else emits direct `LCFunction` pointer calls in
+the loop body, avoiding indirect call overhead.
 
 ### Loop-invariant table header hoisting
 
@@ -534,8 +553,8 @@ Fast paths are annotated with `[[likely]]` attributes and hot runtime helpers ar
 `CLX_INLINE_HOT` (`always_inline`/`__forceinline`):
 
 ```cpp
-if (a.type() == LType::Integer && b.type() == LType::Integer) [[likely]]
-    return LValue(a.as_integer() + b.as_integer());
+if (a.type == ValueType::Int64 && b.type == ValueType::Int64) [[likely]]
+    return LValue(a.val.payload.i64 + b.val.payload.i64);
 ```
 
 ### Inlining
@@ -546,13 +565,17 @@ with `always_inline` attributes.
 
 ### Tail-call optimization
 
-The `CLX_MUSTTAIL` attribute enforces guaranteed tail calls on supported compilers:
+The `CLX_MUSTTAIL` attribute (`clx_runtime.h`) requests a guaranteed tail call on the one
+compiler/platform combination that supports it:
 
-- **Clang**: `[[clang::musttail]]` via `__has_builtin(__builtin_musttail)`
-- **GCC**: `[[gnu::musttail]]` via `__has_cpp_attribute(gnu::musttail)`
-- **MSVC / other**: TCO should be autodetected by the compiler
+- **GCC (x86/x86_64, optimization on)**: `[[gnu::musttail]]`
+- **Clang, MSVC, aarch64-GCC, `-O0`**: the macro is empty — Clang bans closure→free musttail;
+  MSVC has no equivalent attribute
 
-This is used for tail-recursive function calls and certain dispatch paths, converting O(n) stack usage into O(1) for tail-recursive patterns.
+Codegen emits `CLX_MUSTTAIL` at a single site: a zero-argument direct call in return
+position. All other recursion in return position evaluates into a temporary and returns it,
+so constant-stack behaviour for ordinary Lua tail recursion depends on the C++ compiler's own
+tail-call elimination, not on an enforced attribute.
 
 ### SIMD vectorization
 
@@ -566,15 +589,17 @@ local function vector_add(a, b, n)
 end
 ```
 
-Can be compiled to use AVX/SSE instructions for parallel addition. Default build includes
-`-march=native` flag.
+Can be compiled to use AVX/SSE instructions for parallel addition. The architecture flag
+baked in at build time is `sse2` (`-msse2`) on x86 by default and `-mcpu=native` on ARM;
+opt into AVX2 with `CLX_ARCH=avx2` (or pass an explicit `-march=`/`-mcpu=` flag).
 
 ### Dead Code Elimination (DCE)
 
 In executable mode (non-debug), clx enables function-section-level DCE:
 
-- **gcc/clang**: `-ffunction-sections -fdata-sections -Wl,--gc-sections`
-- **MSVC**: `/Gy /link /OPT:REF /OPT:ICF`
+- **gcc/clang**: `-ffunction-sections -fdata-sections` plus `-Wl,--gc-sections` (Linux) or
+  `-Wl,-dead_strip` (macOS); strip with `-s` (Linux) or `-Wl,-x` (macOS)
+- **MSVC**: `/Gy /link /OPT:REF /OPT:ICF` (plus `/LTCG` for real `cl`, omitted for clang-cl)
 
 This eliminates unused functions and data from the final binary.
 
@@ -589,7 +614,11 @@ When using `-flto=auto` (Link Time Optimization), the compiler can:
 clx program.lua -flto=auto -O3
 ```
 
-Note: `-flto=auto` is enabled by default in release mode.
+Note: `-flto=auto` is enabled by default only with explicit `--fast` on non-Windows
+builds. The default `--size` mode does not use LTO. User-provided compiler flags are
+*appended after* clx's defaults (the last `-O`/`/O` flag wins for optimization level); the
+only default a user flag suppresses is the baked arch flag, when the user supplies their own
+`-march=`/`-mcpu=`/`-msse*`/`-mavx*`/`/arch:`.
 
 ## 8. Runtime optimizations
 
@@ -667,23 +696,35 @@ Buffering mode mirrors stock: stderr unbuffered, tty output line-buffered, else 
 
 The batch is optional-module-safe: `~LState` and `print`/`warn` call it only through nullable
 hooks (`clx_io_flush_all_ptr`, `clx_io_write_ptr`, assigned by `luastd_io` — same pattern as
-`clx_free_vm_proxy_ptr`), so `--minimal` (base + package + string) still drops `io.o` entirely
+`clx_free_vm_proxy_ptr`), so `--minimal` (base + package) still drops `io.o` entirely
 via `--gc-sections`.
 
 ## Optimization levels
 
+The default link mode is `--size` (optimize for size). `--fast` opts into the speed profile;
+`--debug` forces the debug profile.
+
 ### Debug mode (`--debug`)
-- No optimizations (`-O0`)
-- Full debug symbols (`-g`)
-- `#line` directives in generated C++ map every statement to the original Lua file and line, enabling GDB/LLDB source-level debugging of `.lua` files
-- Slow-path code generation
+- No optimizations (`-O0 -g` on gcc/clang; `/Od /Zi /MDd /EHsc /utf-8` on MSVC)
+- Full debug symbols
+- `#line` directives in generated C++ map every statement to the original Lua file and line, enabling GDB/LLDB source-level debugging of `.lua` files (emitted unconditionally, not debug-only)
+- Same code generation as release — there is no separate slow-path codegen
 - DCE disabled
 
-### Release mode (default)
-- `-O3 -flto=auto -fno-rtti -fvisibility=hidden`
-- All optimizations enabled
-- Dead code elimination
-- Binary stripped (`-s`)
+### Size mode (default, `--size`)
+- gcc/clang: `-O1 -foptimize-sibling-calls -fno-inline-functions -fvisibility=hidden`
+- MSVC: `/O1 /Ob0 /GL /GR- /MD /EHsc /GS- /fp:fast /Gw /Gy /utf-8`
+- Dead code elimination, binary stripped
+
+### Speed mode (`--fast`)
+- gcc/clang (non-Windows): `-O3 -flto=auto -fvisibility=hidden`
+- gcc/clang (Windows): `-O3 -fvisibility=hidden` (no LTO)
+- MSVC: `/O2 /Ot /GL /GR- /MD /EHsc /GS- /fp:fast /Gw /Gy /utf-8`
+- Dead code elimination, binary stripped
+
+The baked architecture flag (`sse2`/`avx`/`avx2`/`native` on x86, `native`/`generic` on ARM)
+is appended to whichever profile is active, unless the user passes their own
+`-march=`/`-mcpu=`/`-msse*`/`-mavx*`/`/arch:` flag.
 
 ## Performance Tips
 
@@ -701,20 +742,27 @@ clx program.lua -O3 -march=native -flto=auto
 
 ## Compiler remarks
 
-### GCC/Clang (Linux/macOS)
+### Default profile (`--size`, gcc/clang)
 
-Default release flags:
 ```
--O3 -flto=auto -fno-rtti -fvisibility=hidden -ffunction-sections -fdata-sections
--Wl,--gc-sections -s -ldl
+-O1 -foptimize-sibling-calls -fno-inline-functions -fvisibility=hidden
+-ffunction-sections -fdata-sections          # compile (DCE)
+-Wl,--gc-sections -s                        # link (Linux); macOS: -Wl,-dead_strip -Wl,-x
 ```
 
-### MSVC (Windows)
+### Speed profile (`--fast`, gcc/clang, non-Windows)
 
-Default release flags:
 ```
-/O2 /Ot /GL /GR- /MD /EHsc /GS- /fp:fast /Gw /Gy
-/link /OPT:REF /OPT:ICF
+-O3 -flto=auto -fvisibility=hidden
+-ffunction-sections -fdata-sections
+-Wl,--gc-sections -s                        # link (Linux); macOS: -Wl,-dead_strip -Wl,-x
+```
+
+### Default profile (`--size`, MSVC)
+
+```
+/O1 /Ob0 /GL /GR- /MD /EHsc /GS- /fp:fast /Gw /Gy /utf-8
+/Gy /link /LTCG /OPT:REF /OPT:ICF           # DCE (real cl); clang-cl omits /LTCG
 ```
 
 Key MSVC optimizations:
