@@ -176,7 +176,7 @@ The code generator produces C++ code:
 - Slow-path code for dynamic operations
 - Loop transformation (numeric for, generic for with direct `LCFunction` pointer calls)
 - Expression emission with `[[likely]]` branch prediction hints
-- Per-LTable `InlineCache` (4 entries) for string-keyed table access, checked inside `LTable::gettable()`/`LTable::settable()`
+- Per-LTable `InlineCache` (8 entries, `LTABLE_IC_SIZE`) for string-keyed table access, checked inside `LTable::gettable()`/`LTable::settable()`
 - StringBuilder-based string concatenation
 - Wyhash-based string hashing
 
