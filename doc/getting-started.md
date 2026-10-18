@@ -10,7 +10,7 @@ into a fast native executable, so you can keep writing plain Lua.
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/clx.git
+git clone https://github.com/samyeyo/clx.git
 cd clx
 
 # Build (release mode)
@@ -25,7 +25,7 @@ cd clx
 # Uninstall clx
 ./build.sh uninstall
 
-# Clean build directory
+# Remove installed files from /usr/local, then delete the build directory
 ./build.sh clean
 ```
 
@@ -181,29 +181,30 @@ end
 ### Tables and Metatables
 
 ```lua
--- Table with methods
-local vector = {
-    x = 0, y = 0,
+-- Operator overloading via a shared metatable
+local VectorMeta = {}
+VectorMeta.__index = VectorMeta
 
-    add = function(self, other)
-        return { x = self.x + other.x, y = self.y + other.y }
-    end,
+function VectorMeta:add(other)
+    return setmetatable({ x = self.x + other.x, y = self.y + other.y }, VectorMeta)
+end
 
-    __tostring = function(self)
-        return "(" .. self.x .. "," .. self.y .. ")"
-    end
-}
+VectorMeta.__add = function(a, b)
+    return a:add(b)
+end
 
--- Metatable for operator overloading
-setmetatable(vector, {
-    __add = function(a, b)
-        return a:add(b)
-    end
-})
+VectorMeta.__tostring = function(self)
+    return "(" .. self.x .. "," .. self.y .. ")"
+end
 
-local v1 = { x = 1, y = 2 }
-local v2 = { x = 3, y = 4 }
-local v3 = v1 + v2  -- Uses __add
+local function vec(x, y)
+    return setmetatable({ x = x, y = y }, VectorMeta)
+end
+
+local v1 = vec(1, 2)
+local v2 = vec(3, 4)
+local v3 = v1 + v2   -- Uses VectorMeta.__add
+print(v3.x, v3.y)    -- 4  6
 ```
 
 ### Coroutines
@@ -219,7 +220,7 @@ end
 local function consumer()
     local co = coroutine.create(producer)
     while true do
-        local status, value = coroutine.resume(co)
+        local status, value = coroutine.resume(co, 5)  -- pass producer's max
         if not status or value == nil then break end
         print("Received: " .. value)
     end
@@ -336,10 +337,11 @@ clx script.lua --cpp
 Runtime errors show the Lua file and line where the problem happened:
 
 ```
-Error: script.lua:10: attempt to perform arithmetic on a number value
+script.lua:10: attempt to perform arithmetic on a table value
 ```
 
-The format is `filename:line: message`.
+The format is `filename:line: message`. The message names the *offending* value's
+type (a table, nil, string, or boolean) — arithmetic on a plain number does not error.
 
 ## Next Steps
 
