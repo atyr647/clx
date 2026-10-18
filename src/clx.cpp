@@ -375,8 +375,8 @@ void print_help()
               << "  --help                Display this help message\n\n"
               << "Compiler Options:\n"
               << "  Any options starting with '-' not recognized by clx are passed to the C++ compiler.\n"
-              << "  If no compiler options are provided, default optimization flags are used.\n"
-              << "  Example: clx file.lua -O3 -march=native\n";
+              << "  Default optimization flags are always applied first; your options are appended\n"
+              << "  after them, so the last flag wins. Example: clx file.lua -O3 -march=native\n";
 }
 
 //------------------ CLX: main - entry point, parses CLI arguments, compiles Lua to C++, links output
