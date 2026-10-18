@@ -97,8 +97,14 @@ struct AnalysisState {
     std::set<std::string_view> int_numeric_arrays;
     //------------------ for_counter_names: numeric-for loop counter identifiers. Codegen emits
     std::set<std::string_view> for_counter_names;
-    //------------------ for_counter_int: numeric-for loop counter names holding integer values
-    std::set<std::string_view> for_counter_int;
+    //------------------ referenced_globals: global names read by generated code, filled by codegen
+    //------------------ identifier emission. The driver unions them across modules to emit filtered
+    //------------------ std registration (only referenced base functions get linked). Owning strings:
+    //------------------ the per-file AST backing string_views dies before main is emitted.
+    std::set<std::string> referenced_globals;
+    //------------------ uses_dynamic_env: user code reads _G/_ENV as a value (dynamic global access
+    //------------------ invisible to referenced_globals). Forces full std registration.
+    bool uses_dynamic_env = false;
     std::set<std::string_view> constant_upvalues;
     std::set<std::string_view> string_builders;
     std::set<std::string_view> global_string_builders;
