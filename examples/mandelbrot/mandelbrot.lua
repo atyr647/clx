@@ -4,7 +4,7 @@ local sokol = require("sokol_clx")
 local WIN_W, WIN_H = 600, 450
 
 -- Internal render resolution
-local W, H = 400, 300
+local W, H = 560, 400
 local MAX_ITER = 128
 local LOG2 = 0.6931471805599453
 
