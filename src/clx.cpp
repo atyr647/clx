@@ -18,6 +18,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -680,6 +681,11 @@ int main(int argc, char* argv[])
             resolved.empty() ? fs::path(mod + exts[0]) : resolved, mod);
     }
 
+    //------------------ Referenced globals, unioned across input modules: drives the filtered std open
+    //------------------ sequence in main (only referenced base functions get registered — and linked).
+    std::set<std::string> all_referenced_globals;
+    bool any_dynamic_env = false;
+
     for (const auto& input_file : input_files) {
         std::ifstream t(input_file);
         if (!t.is_open()) {
@@ -730,6 +736,9 @@ int main(int argc, char* argv[])
             std::cerr << e.what() << "\n";
             return 1;
         }
+        for (const auto& g : analysis.referenced_globals)
+            all_referenced_globals.insert(g);
+        any_dynamic_env = any_dynamic_env || analysis.uses_dynamic_env;
         cpp_files.push_back(cpp_file.string());
     }
     if (mode == BuildMode::Executable) {
@@ -764,7 +773,36 @@ int main(int argc, char* argv[])
         if (dynamic_loading_enabled)
             appender << "extern \"C\" void clx_register_load_builtins(clx::LState *L);\n";
         appender << "int main(int argc, char* argv[]) {\n";
-        appender << "    clx::LState* L = clx::open(argc, argv);\n";
+        //------------------ Filtered std startup: register only referenced base functions so the linker
+        //------------------ strips the rest (per-function registrars in base.cpp). Falls back to the legacy
+        //------------------ full open when module code can touch anything: precompiled/C modules, --dynamic,
+        //------------------ dynamic _G/_ENV access, or require/package (loaded modules may use any base fn).
+        static const char* kBaseFns[] = { "print", "require", "error", "assert", "tostring", "tonumber",
+            "rawequal", "rawget", "rawset", "rawlen", "setmetatable", "getmetatable", "collectgarbage",
+            "type", "pcall", "xpcall", "warn", "next", "pairs", "ipairs", "select", nullptr };
+        bool need_full = !precompiled_modules.empty() || dynamic_loading_enabled || any_dynamic_env
+            || all_referenced_globals.count("require") || all_referenced_globals.count("package");
+        std::set<std::string> need_base;
+        if (!need_full) {
+            for (const char** f = kBaseFns; *f; ++f) {
+                if (all_referenced_globals.count(*f))
+                    need_base.insert(*f);
+            }
+            if (need_base.count("pairs"))
+                need_base.insert("next"); //------------------ pairs() returns the global next iterator
+        }
+        if (need_full) {
+            appender << "    clx::LState* L = clx::open(argc, argv);\n";
+        } else {
+            appender << "    clx::LState* L = clx::open_bare(argc, argv);\n";
+            for (const char** f = kBaseFns; *f; ++f) {
+                if (need_base.count(*f))
+                    appender << "    clx::luastd_base_" << *f << "(L);\n";
+            }
+            appender << "    { clx::LValue _g"
+                         " = clx::LValue(clx::ValueType::Table, L->_G);\n";
+            appender << "      clx::set_field(L, _g, \"_VERSION\", clx::string(L, \"Lua 5.5\")); }\n";
+        }
 
         if (!minimal_active)
             appender << "    clx::openlibs(L);\n";
