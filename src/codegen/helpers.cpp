@@ -688,4 +688,14 @@ std::string cpp_escape(std::string_view s) {
     return r;
 }
 
+//------------------ note_global_ref: records a global read for filtered std registration (see
+//------------------ AnalysisState::referenced_globals). _G/_ENV reads set the dynamic-env fallback instead.
+void CodeEmitter::note_global_ref(std::string_view name) {
+    if (name == "_G" || name == "_ENV") {
+        state.uses_dynamic_env = true;
+        return;
+    }
+    state.referenced_globals.insert(std::string(name));
+}
+
 }
