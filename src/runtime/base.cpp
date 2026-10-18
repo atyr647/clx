@@ -531,4 +531,34 @@ void luastd_base(LState *L) {
     clx::set_field(L, g, "_VERSION", clx::string(L, "Lua 5.5"));
 }
 
+//------------------ Per-function registrars for filtered std startup (see luastd_base_filtered expose
+//------------------ via the driver-emitted open sequence). Each references exactly one base function, so
+//------------------ the linker strips every registrar — and its function — the program never uses.
+#define CLX_BASE_REG(name, fn)                                   \
+    void luastd_base_##name(LState *L) {                         \
+        clx::set_function(L, LValue(Table, L->_G), #name, fn);   \
+    }
+CLX_BASE_REG(print, print)
+CLX_BASE_REG(require, require)
+CLX_BASE_REG(error, lua_error)
+CLX_BASE_REG(assert, assert)
+CLX_BASE_REG(tostring, tostring)
+CLX_BASE_REG(tonumber, tonumber)
+CLX_BASE_REG(rawequal, lua_rawequal)
+CLX_BASE_REG(rawget, rawget)
+CLX_BASE_REG(rawset, rawset)
+CLX_BASE_REG(rawlen, lua_rawlen)
+CLX_BASE_REG(setmetatable, lua_setmetatable)
+CLX_BASE_REG(getmetatable, lua_getmetatable)
+CLX_BASE_REG(collectgarbage, collectgarbage)
+CLX_BASE_REG(type, type)
+CLX_BASE_REG(pcall, lua_pcall)
+CLX_BASE_REG(xpcall, lua_xpcall)
+CLX_BASE_REG(warn, warn)
+CLX_BASE_REG(next, lua_next)
+CLX_BASE_REG(pairs, pairs)
+CLX_BASE_REG(ipairs, ipairs)
+CLX_BASE_REG(select, select)
+#undef CLX_BASE_REG
+
 }
