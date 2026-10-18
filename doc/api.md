@@ -52,8 +52,14 @@ const char* s = v.as_string(); // as a string
 clx::is_number(v);   clx::is_string(v);   clx::is_table(v);
 clx::is_function(v); clx::is_integer(v);  clx::is_nil(v);
 clx::is_bool(v);     clx::is_userdata(v);
-clx::type_name(v);   // "number", "string", ...
 ```
+
+```cpp
+clx::type_name(v);   // "number", "integer", "string", ...
+```
+
+(`type_name` distinguishes the integer subtype: it returns `"integer"` for `Int64` values,
+not `"number"`.)
 
 ## Conversions
 
@@ -96,7 +102,7 @@ Read and write with the `get_field` / `set_field` helpers (which respect
 ```cpp
 clx::LValue v = clx::get_field(L, t, "key");     // t["key"], with __index
 clx::set_field(L, t, "key", val);                 // t["key"] = val
-clx::LValue v = clx::raw_get(L, t, 7);            // raw access, any key type
+clx::LValue raw = clx::raw_get(L, t, 7);          // raw access, any key type
 ```
 
 Iterate a table with a C++ range loop:
@@ -129,10 +135,12 @@ Or use `pcall` to catch errors instead of throwing:
 clx::MultiValue r = clx::pcall(L, f, args, 2);  // {true, ...} or {false, err}
 ```
 
-A variadic form accepts native C++ values directly:
+A variadic form accepts native C++ values directly. Use `clx::string(L, s)` for strings —
+the raw `LValue(const char*)` constructor stores a non-interned pointer with no length
+header, so length-based operations (`#s`, concat, string equality) would read garbage:
 
 ```cpp
-clx::MultiValue r = clx::call(L, f, clx::number(1), "hello", 3.14);
+clx::MultiValue r = clx::call(L, f, clx::number(1), clx::string(L, "hello"), clx::number(3.14));
 ```
 
 ## Coroutines
@@ -140,7 +148,7 @@ clx::MultiValue r = clx::call(L, f, clx::number(1), "hello", 3.14);
 ```cpp
 clx::LValue t = clx::create_thread(L, func);
 clx::MultiValue r = clx::resume(L, t, args, 1);  // resume a coroutine
-clx::MultiValue r = clx::yield(L, args, 1);      // yield from a coroutine
+clx::MultiValue y = clx::yield(L, args, 1);      // yield from a coroutine
 ```
 
 `resume` returns `{true, ...results}` or `{false, error_message}`.
@@ -158,8 +166,9 @@ throw clx::LRuntimeException(clx::string(L, "oops"));
 There are helpers for common argument errors:
 
 ```cpp
-clx::arg_error(L, 1, "number"); // "bad argument #1 (number expected)"
-clx::type_error(L, 1, "number"); // "bad argument #1 (number expected, got X)"
+clx::arg_error(L, 1, "number");   // "bad argument #1 (number expected)"
+// type_error formats the same way with ", got X" and needs the argument array:
+clx::type_error(L, 1, "number", args, n); // "bad argument #1 (number expected, got X)"
 ```
 
 ## Writing a module
@@ -188,7 +197,7 @@ CLX_API clx::LValue luaopen_mylib(clx::LState* L) {
     clx::LValue t = clx::table(L);
     clx::set_lazy_funcs(L, t, my_funcs, 1);
     clx::set_global(L, "mylib", t);
-    return clx::LValue();
+    return t;
 }
 ```
 
@@ -198,7 +207,8 @@ Compile this into an object or library, then link it with:
 clx main.lua --modules mylib
 ```
 
-Your module then becomes available as `require("mylib")`.
+Your module then becomes available as `require("mylib")` (return the table — a nil return
+value makes `require` fall through and yield `true` instead of the module).
 
 ## Porting an existing Lua C module?
 
