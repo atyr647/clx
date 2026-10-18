@@ -4,9 +4,12 @@ The clx runtime library (`libclx.a`) implements Lua's core semantics in C++. It 
 
 ## Components
 
-### 1. Core VM (src/runtime/runtime.cpp)
+### 1. Core VM (src/runtime/)
 
-The virtual machine core implements:
+The virtual machine core is split across several translation units (see the file list in
+[Architecture](./architecture.md)): value representation and arithmetic in `values.cpp` +
+`clx_runtime.h`, tables in `tables.cpp`, threads/fibers in `threads.cpp`, GC in `gc.cpp`,
+state lifecycle in `state.cpp`, and call dispatch in `calls.cpp`. It provides:
 - Value representation (separate `ValueType` tag + 8-byte payload, with Integer type and TAG_ISTR inline strings)
 - Garbage collection (generational by default, incremental opt-out)
 - Table operations with inline caching
@@ -45,16 +48,19 @@ clx uses a 16-byte `LValue` (8-byte payload + separate `ValueType` tag) to repre
 └─────────────────────────────────────┘
 ```
 
-The `LType` enum distinguishes between Number (double), Integer (native int64), and other types. Integer arithmetic uses native operations without floating-point conversion. Overflow in `add`, `sub`, `mul` promotes to double (matching Lua 5.5 semantics).
+The `ValueType` enum distinguishes between Number (double), Integer (native int64), and other
+types. Integer arithmetic uses native `int64_t` operations without floating-point conversion.
+Overflow in `add`, `sub`, `mul` **wraps** (two's-complement, computed in `uint64_t`), matching
+stock Lua 5.5 (`math.maxinteger + 1 == math.mininteger`). Integer results stay in the integer
+domain; only mixed int/float operands and `pow` promote to double.
 
 ##### TAG_ISTR — Inline Strings
 
 Strings ≤6 bytes are stored directly in the LValue's 64-bit `val` field (no heap allocation, no interning):
 
-- **Tag**: top 16 bits (63-48) = `0xFFF9 + len`, where len = 0-5
-- **Data**: bytes 0-5 (bits 0-47) store characters contiguously from byte 0 upward, null-terminated at byte `len`
+- **Layout**: the top **byte** (bits 63–56) stores the length (0–6); byte 6 (bits 55–48) is padding; bytes 0–5 store characters contiguously from byte 0 upward
 - **`as_string()`**: returns `reinterpret_cast<const char*>(&val)` — works for both TAG_ISTR (inline) and TAG_STRING (heap interned pointer)
-- **`string_len()`**: reads length from tag for TAG_ISTR, or from baked header for TAG_STRING
+- **`string_len()`**: reads length from the top byte for TAG_ISTR, or from the baked 4-byte header field for TAG_STRING
 - **Equality**: `val == val` works for identically-typed strings with same content; cross-type (TAG_ISTR vs TAG_STRING) falls back to `memcmp`
 - **Hashing**: `lvalue_hash` for TAG_ISTR uses `swar_hash_8()` (loads all ≤8 bytes into one register with a single `memcpy`) so hashes match TAG_STRING for the same content
 - **`clx::string(L, s)`**: returns `LValue::istr()` for `len ≤ 6`, falls back to interned string for longer
@@ -157,9 +163,11 @@ Full coroutine support using OS-level fibers/context:
 | `coroutine.isyieldable` | Check if coroutine can yield |
 | `coroutine.close` | Close a suspended coroutine |
 
-Implementation uses `ucontext` on Linux, Windows Fibers on Windows, and hand-written ARM64
-assembly (`src/runtime/coro_switch_aarch64.s`) on macOS Apple Silicon — the stock `ucontext`
-shim on Darwin ARM64 is deprecated and corrupts the stack.
+Implementation uses hand-written assembly on the common platforms — Windows Fibers on
+Windows, ARM64 asm on Apple **and** Linux (`src/runtime/coro_switch_aarch64.S`), x86_64 asm
+on Linux (`coro_switch_x86_64.s`) — with `ucontext` as the fallback elsewhere (e.g. macOS
+x86_64). The stock `ucontext` shim on Darwin ARM64 is deprecated and corrupts the stack,
+which is why the asm path exists.
 
 ### 5. String Library (src/runtime/strings.cpp)
 
@@ -186,7 +194,7 @@ Pattern matching features:
 - Balanced matching with `%b`
 - Frontier pattern with `%f`
 
-### 6. Lazy Function Registration (src/runtime/runtime.cpp)
+### 6. Lazy Function Registration (src/runtime/calls.cpp)
 
 `set_lazy_funcs(L, table, lazy_regs, count)` attaches a `__index` metamethod that creates `LCFunction` closures lazily on first access and caches them on the table. Uses `constexpr`-friendly `LazyReg` arrays (raw function pointers, no `std::function`) so registration tables live in static read-only storage.
 
@@ -200,7 +208,10 @@ Table manipulation:
 | `table.remove` | Remove element |
 | `table.concat` | Concatenate elements |
 | `table.sort` | Sort array elements |
+| `table.pack` | Pack varargs into a table |
 | `table.unpack` | Unpack array to values |
+| `table.move` | Move elements between tables |
+| `table.create` | Pre-allocated array table |
 
 ### 8. Module Loading
 
@@ -215,7 +226,10 @@ clx supports lexical scoping with full closure capture:
 - Shared upvalues (multiple closures sharing the same captured variable)
 - Loop variable capture (closures created in a for loop each capture the correct iteration value)
 - Triple nesting and arbitrary capture depth
-- Tail call optimization (TCO) for recursive calls — no stack growth
+- Tail calls in return position are emitted as plain `return f(...)` temporaries; constant-stack
+  recursion for tail-recursive patterns depends on the C++ compiler's tail-call elimination
+  (the `CLX_MUSTTAIL` attribute covers only one zero-arg direct-call site — see
+  [Optimizations](./optimizations.md))
 
 ### 10. Goto and Labels
 
@@ -224,7 +238,7 @@ Full `goto` / `::label::` support with proper lexical scoping:
 - Duplicate labels in different scopes resolve correctly
 - Goto can create loops (backward jumps)
 
-### 11. String Pool & Inlining (src/runtime/runtime.cpp + LValue)
+### 11. String Pool & Inlining (include/clx_runtime.h + LValue)
 
 Strings ≤6 bytes use **TAG_ISTR** — stored inline in the LValue (no heap allocation):
 
@@ -237,17 +251,19 @@ The top byte stores the length (0–6). Bytes 0–5 store up to 6 characters. By
 
 Longer strings are interned via the StringPool:
 
-- **Baked allocation**: `[uint16 hash hi][uint32 len][char data...\0]` (16-byte header)
+- **Baked allocation**: 16-byte header `[uint32 hash_low @0][pad @4][uint32 len @8][pad @12][char data...\0 @16]`
 - **One probe on hit**: No double lookup or side map
-- **Pre-hashed strings**: 64-bit hash stored at `ptr[-16..ptr[-9]` for zero recompute
+- **Pre-hashed strings**: low 32 bits of the hash stored at `ptr[-16]` for near-zero recompute (single 4-byte load)
 - **Arena-backed**: strings are bump-allocated from a 64 KB-block `StringArena`
 - **Intern preallocated**: Supports adopting pre-formatted buffers (zero-allocation concat)
 
-Cross-type safety: `lvalue_hash` and `lvalue_eq_fast` in `runtime.cpp` handle TAG_ISTR↔TAG_STRING lookups correctly — hashes match because both content-types use the same `swar_hash_8()` for strings ≤8 bytes.
+Cross-type safety: `lvalue_hash` and `lvalue_eq_fast` (in `include/clx_runtime.h`) handle
+TAG_ISTR↔TAG_STRING lookups correctly — hashes match because both content-types use the same
+`swar_hash_8()` for strings ≤8 bytes.
 - For strings ≤8 bytes, `swar_hash_8()` loads all bytes into a single register (one unaligned `memcpy`) and mixes via `wyhash64(data ^ len)` — no branching, no function call overhead.
 - For strings >8 bytes, `wyhash_str()` is used (processes in 8-byte chunks).
 
-### 12. StringBuilder (include/clx.h)
+### 12. StringBuilder (include/clx_runtime.h)
 
 O(n) string concatenation avoiding quadratic blow-up:
 
@@ -349,22 +365,25 @@ on a single cache line. Arrays of size ≤ 2 use `small_array`/`small_array_type
 Hash entries are stored in a contiguous `HashEntry` array (24 bytes each: key TValue, val
 TValue, ktype, vtype). A `hash_bitmap` tracks occupied slots for fast iteration.
 
-`hash_version` is incremented on structural mutations (inserts, deletes, rehashes) to enable
-InlineCache invalidation; value-only overwrites do not invalidate the cache.
+`hash_version` is bumped only by hash **rehash** (the sole structural invalidator — rehashing
+relocates entries), plus metatable set and table recycle. Plain inserts and deletes never move
+entries and intentionally leave the version alone; value-only overwrites do not invalidate the
+cache.
 
 ### String Layout
 
-Interned strings are stored with a **16-byte baked header** (64-bit wyhash + 32-bit length):
+Interned strings are stored with a **16-byte baked header** (low 32 bits of the wyhash + 32-bit length):
 
-- 8 bytes: baked wyhash (64-bit)
-- 4 bytes: length
+- 4 bytes: baked hash (low 32 bits of wyhash), at `ptr[-16..-13]`
+- 4 bytes: padding
+- 4 bytes: length, at `ptr[-8..-5]`
 - 4 bytes: padding
 - char data: string content
 - 1 byte: null terminator
 
-The LValue stores a pointer to the char data (skipping the 16-byte header).
-Length is at `ptr[-8..ptr[-1]` and hash is at `ptr[-16..ptr[-9]]`, so the hash read is a
-single 8-byte load. String storage is backed by a block-based `StringArena` (64 KB blocks, bump
+The LValue stores a pointer to the char data (skipping the 16-byte header). Length and hash
+are each a single 4-byte load (`clx_memcpy(&len, ptr - 8, 4)` / `clx_memcpy(&h_low, ptr - 16, 4)`).
+String storage is backed by a block-based `StringArena` (64 KB blocks, bump
 allocated).
 
 ## Performance Characteristics
@@ -375,7 +394,7 @@ allocated).
 | Table access (InlineCache hit) | O(1) with single key payload check |
 | Table iteration | O(n) |
 | String concatenation | O(n) per operation |
-| Numeric for loop | O(n) with SIMD |
+| Numeric for loop | O(n) plain C++ counter (int64_t or double) |
 | Function call | O(1) setup + body |
 | GC pause | Generational minors (young-only), full mark-and-sweep majors, SIMD array scan |
 | String interning | O(1) average, one probe |
@@ -408,7 +427,7 @@ The `collectgarbage()` function accepts these options:
 
 | Option | Description |
 |--------|-------------|
-| `"collect"` | Performs a full garbage-collection cycle (default) |
+| `"collect"` | Performs a full garbage-collection cycle. A no-argument `collectgarbage()` returns `0.0` and does **not** collect (unlike stock Lua, where no-arg == `"collect"`) |
 | `"stop"` | Stops automatic GC — the collector runs only on explicit `collectgarbage("collect")` or `"step"` until `"restart"` |
 | `"restart"` | Restarts automatic GC |
 | `"count"` | Returns total memory in use by Lua in Kbytes (fractional part gives exact bytes when multiplied by 1024) |
@@ -417,5 +436,5 @@ The `collectgarbage()` function accepts these options:
 | `"incremental"` | Switches to incremental mode (opt-out from the generational default). Returns `"incremental"` |
 | `"generational"` | Switches to generational mode (the default). Returns `"generational"` |
 | `"mode"` | Returns the current mode: `"generational"` or `"incremental"` |
-| `"stats"` | Returns a table with GC stats: `mode`, `collects`, `minors`, `minor_freed_kb`, `major_freed_kb`, `old_kb`, `remembered_high` |
-| `"param"` | Gets/sets GC parameters. Requires a parameter name (`"pause"`, `"stepmul"`, `"stepsize"`) and an optional new integer value (0–100000). Returns the previous value |
+| `"stats"` | Returns a table with GC stats: `mode`, `collects`, `minors`, `minor_freed_kb`, `major_freed_kb`, `old_kb`, `minor_kb`, `remembered_high` |
+| `"param"` | Gets/sets GC parameters. Requires a parameter name (`"pause"`, `"stepmul"`, `"stepsize"`, `"minormul"`, `"majorminor"`, `"minormajor"`) and an optional new integer value (0–100000). Returns the previous value |
