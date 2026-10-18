@@ -3,7 +3,7 @@
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="www/img/clx-logo-dark.png">
   <source media="(prefers-color-scheme: light)" srcset="www/img/clx-logo-light.png">
-  <img alt="CLX Logo" src="doc/img/clx-logo-light.png" width="300">
+  <img alt="CLX Logo" src="www/img/clx-logo-light.png" width="300">
 </picture>
 <br /><br />
 
@@ -29,7 +29,7 @@ cd clx
 clx examples/hello/hello.lua
 ./hello
 
-Hello clx !
+Hello clx!
 ```
 
 ## What makes clx useful
@@ -91,7 +91,7 @@ clx --help                 # see all options
 ```
 
 - **`load()` / `loadfile()` / `dofile()`** run on an embedded Lua engine and are only available when you compile with `--dynamic`. See [Dynamic Lua](./doc/dynamic-lua.md).
-- To write native modules, clx supports both its own **clx C++ API** and the **standard Lua 5.5 C API** (`lua.h`, `lauxlib.h`, `lualib.h`) — existing C modules compile and run unchanged. See [Modules](./doc/modules.md) and the [Lua C API](./doc/luacapi.md).
+- To write native modules, clx supports both its own **clx C++ API** and the **standard Lua 5.5 C API** (`lua.h`, `lauxlib.h`, `lualib.h`) — existing C modules compile and run unchanged and are linked into the executable with `--modules`. See [Modules](./doc/modules.md) and the [Lua C API](./doc/luacapi.md).
 
 ## Benchmarks
 
@@ -99,13 +99,13 @@ clx compares well against the reference Lua 5.5 interpreter:
 
 | Script | lua 5.5 | LuaJIT | clx `--fast` |
 |--------|---------|--------|--------------------------|
-| fib.lua | 0.327s (1.00x) | 0.055s (5.95x) | **0.007s (46.71x)** |
-| arraysum.lua | 0.311s (1.00x) | **0.105s (2.96x)** | 0.117s (2.66x) |
-| spectralnorm.lua | 0.370s (1.00x) | **0.022s (16.82x)** | 0.034s (10.88x) |
-| canada.lua | 0.392s (1.00x) | **0.150s (2.61x)** | 0.258s (1.52x) |
-| warmup.lua | 0.007s (1.00x) | 0.006s (1.17x) | **0.003s (2.33x)** |
+| fib.lua | 0.319s (1.00x) | 0.051s (6.25x) | **0.007s (45.57x)** |
+| arraysum.lua | 0.300s (1.00x) | 0.095s (3.16x) | **0.093s (3.23x)** |
+| spectralnorm.lua | 0.339s (1.00x) | **0.020s (16.95x)** | 0.021s (16.14x) |
+| canada.lua | 0.398s (1.00x) | **0.132s (3.02x)** | 0.219s (1.82x) |
+| warmup.lua | 0.006s (1.00x) | 0.005s (1.20x) | **0.002s (3.00x)** |
 
-> Measured on an Intel® Core™ i5 Ultra 125U CPU @ 4.30GHz · Linux · GCC 13.3.0 · Average of 10 runs · clx `--fast` built with AVX2
+> Measured on an Intel® Core™ Ultra 5 125U CPU @ 4.30GHz · Linux · GCC 15.2.0 · Average of 10 runs · clx `--fast` built with AVX2 (`CLX_ARCH=avx2` — the default x86 build is SSE2)
 
 > Full benchmarks are available in **[clx benchmarks](./doc/benchmarks.md)**
 
