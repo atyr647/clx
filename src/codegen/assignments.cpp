@@ -727,7 +727,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                     }
 
                     if (is_sb_concat) {
-
+                        note_global_ref(name);
                         out << "{ clx::LValue _gval = clx::get_env_var_key(L, _ENV, cstr_[" << state.string_pool_index.at(name)
                             << "]);\n";
                         out << "  if (sb_" << name << ".empty()) sb_" << name << ".append(L, _gval);\n";
