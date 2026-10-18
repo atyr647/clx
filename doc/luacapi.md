@@ -71,8 +71,10 @@ directory on your C compiler's include path and do **not** link `-llua` — the
 
 ## The state
 
-There is exactly one `lua_State` per program, created by `clx::open()` and
-destroyed by `clx::close()`.
+There is exactly one clx runtime (`clx::LState`, created by `clx::open()` and destroyed by
+`clx::close()`). The main `lua_State*` bundle is created lazily on first C-API use and torn
+down with the runtime; every coroutine gets its own `lua_State*` on top of the same runtime
+(see [Coroutines](#coroutines)).
 
 | Stock Lua | clx |
 |---|---|
@@ -96,7 +98,7 @@ code uses:
 ## What is implemented
 
 Every function in `lua.h`, `lauxlib.h` and `lualib.h` is declared and has a
-definition (147 API names in total). The list below is by area; the
+definition (every declared name resolves in the bridge). The list below is by area; the
 [Not implemented](#not-implemented) section names every stub explicitly.
 
 | Area | Status |
@@ -111,11 +113,11 @@ definition (147 API names in total). The list below is by area; the
 | Calls: `lua_callk` / `lua_call`, `lua_pcallk` / `lua_pcall` | ✅ — the continuation runs when the call yields, see [Differences](#what-differs-from-stock-lua) |
 | Coroutines: `lua_newthread`, `lua_closethread`, `lua_xmove`, `lua_tothread`, `lua_pushthread`, `lua_resume`, `lua_yieldk` / `lua_yield`, `lua_status`, `lua_isyieldable` | ✅ — see [Coroutines](#coroutines) |
 | Registry and references: `luaL_ref`, `luaL_unref`, `luaL_getsubtable`, `luaL_requiref` | ✅ |
-| Auxiliary library: `luaL_check*/opt*`, `luaL_argerror`, `luaL_typeerror`, `luaL_error`, `luaL_where`, `luaL_tolstring`, `luaL_newmetatable`, `luaL_testudata`, `luaL_checkudata`, `luaL_setfuncs`, `luaL_setmetatable`, `luaL_callmeta`, `luaL_getmetafield`, `luaL_traceback` (header only), `luaL_fileresult`, `luaL_execresult` | ✅ |
+| Auxiliary library: `luaL_check*/opt*`, `luaL_argerror`, `luaL_typeerror`, `luaL_error`, `luaL_where`, `luaL_tolstring`, `luaL_newmetatable`, `luaL_testudata`, `luaL_checkudata`, `luaL_setfuncs`, `luaL_setmetatable`, `luaL_callmeta`, `luaL_getmetafield`, `luaL_traceback` (degraded — no frames), `luaL_fileresult`, `luaL_execresult` | ✅ |
 | Strings and buffers: `luaL_buffinit`, `luaL_prepbuffsize`, `luaL_buffinitsize`, `luaL_addstring`, `luaL_addlstring`, `luaL_addvalue`, `luaL_addgsub`, `luaL_pushresult`, `luaL_pushresultsize`, `luaL_gsub`, `lua_numbertocstring`, `lua_stringtonumber`, `lua_pushvfstring` | ✅ |
 | GC: `lua_gc` with `LUA_GCSTOP`, `LUA_GCRESTART`, `LUA_GCCOLLECT`, `LUA_GCCOUNT{,B}`, `LUA_GCSTEP`, `LUA_GCISRUNNING`, `LUA_GCGEN`, `LUA_GCINC`, `LUA_GCPARAM` | ✅ |
 | Warnings: `lua_setwarnf`, `lua_warning` | ✅ (only reachable from C code — see [Differences](#what-differs-from-stock-lua)) |
-| Standard library openers: `luaopen_base`, `luaopen_package`, `luaopen_coroutine`, `luaopen_debug`, `luaopen_io`, `luaopen_math`, `luaopen_os`, `luaopen_string`, `luaopen_table`, `luaopen_utf8` | ✅ — they push the table clx already loaded |
+| Standard library openers: `luaopen_base`, `luaopen_package`, `luaopen_coroutine`, `luaopen_debug`, `luaopen_io`, `luaopen_math`, `luaopen_os`, `luaopen_string`, `luaopen_table`, `luaopen_utf8` | ✅ — they push the table clx already loaded (or an empty new one when clx never loaded that lib, e.g. `debug`) |
 | Upvalues: `lua_upvalueindex`, `lua_getupvalue`, `lua_setupvalue`, `lua_upvalueid`, `lua_upvaluejoin` | ✅ |
 
 ## Not implemented
@@ -179,14 +181,16 @@ as a compiled-code global either (see
 | Function | Behaviour |
 |---|---|
 | `lua_checkstack` | always returns `1`; there is no fixed stack limit, so runaway recursion can exhaust memory instead of raising `"stack overflow"` |
-| `luaL_openselectedlibs` | no-op, which makes the `luaL_openlibs(L)` macro a no-op. Standard libraries are already open (with `--minimal`, only the string library is open) |
+| `luaL_openselectedlibs` | no-op, which makes the `luaL_openlibs(L)` macro a no-op. Libraries are opened by the runtime at startup; `--minimal` opens only base + package, and the C API cannot bring the rest back |
 | `luaL_register` | not present — removed from Lua in 5.2 |
 
 ## Coroutines
 
-The coroutine API works: `lua_newthread`, `lua_resume`, `lua_yieldk`,
-`lua_status`, `lua_xmove` and friends are covered by clx's test suite. A
-minimal round trip:
+The coroutine API works. `lua_yield` (a macro over `lua_yieldk`), `lua_isyieldable` and the
+`lua_pcallk`/`lua_callk` continuation paths are covered by clx's C-API conformance test
+module; the rest of the coroutine surface (`lua_newthread`, `lua_resume`, `lua_status`,
+`lua_xmove`) is exercised by the worked example below and by the module round-trip but is
+not separately asserted in the suite. A minimal round trip:
 
 ```c
 static int l_work(lua_State *L)
@@ -303,9 +307,10 @@ C frames, not `longjmp`:
 
 ### You must rebuild against clx's headers
 
-`lua.h` renames every `lua_*` and `luaL_*` symbol to `clx_lua_*` through
-`#define`s placed above the declarations. That keeps the bridge from colliding
-with a real Lua library that some other dependency might link.
+`lua.h` renames every `lua_*` symbol to `clx_lua_*`, `lauxlib.h` renames every `luaL_*`
+symbol, and `lualib.h` renames `luaopen_*` — all through `#define`s placed above the
+declarations. That keeps the bridge from colliding with a real Lua library that some other
+dependency might link.
 
 The consequence: an object file compiled against stock Lua's headers **cannot**
 be linked into a clx program. Rebuild every C module from source with
@@ -336,10 +341,10 @@ while the value stays on the stack" guarantee holds.
 | yield through `lua_callk` | stock allows it only when `k != NULL`; clx always allows it |
 | yield through `lua_pcallk` | like stock: allowed when `k != NULL` (the continuation runs on resume), refused with `k == NULL` — you get `"attempt to yield across a C-call boundary"` |
 | `luaL_pushfail` | a header macro, so identical to stock: pushes `nil`, or `false` if you define `LUA_FAILISFALSE` |
-| `lua_newuserdatauv(L, sz, nuvalue)` | `nuvalue` is ignored — you can store any number of user values, and out-of-range `lua_getiuservalue`/`lua_setiuservalue` indices return `LUA_TNONE` / `0` instead of failing |
+| `lua_newuserdatauv(L, sz, nuvalue)` | `nuvalue` is ignored — there is no upper bound on user values. `n <= 0` (or a non-userdata index) makes `lua_getiuservalue` return `LUA_TNONE` / `lua_setiuservalue` return `0`; any `n > 0` succeeds with the stored (or nil) value |
 | `lua_pushexternalstring(L, s, len, falloc, ud)` | clx copies the bytes into its own arena and calls `falloc(ud, s, len+1, 0)` **immediately**, so your buffer must be freeable right away and must not be reused |
 | `luaL_testudata(L, idx, "FILE*")` | returns a pointer to a **single shared scratch slot** in the state, overwritten by the next such call. Copy the `FILE*` out before calling it again |
-| `luaL_openlibs` | no-op; libraries are opened by the runtime. With `--minimal` they are absent and the C API cannot bring them back |
+| `luaL_openlibs` | no-op; libraries are opened by the runtime. With `--minimal` only base + package are open (string/table/math/io/os/utf8/coroutine are absent), and the C API cannot bring them back |
 | Warnings | `lua_setwarnf`/`lua_warning` work for C-to-C calls, but clx's own runtime warnings do not route through them |
 | Module initialisation | openers run at program startup, before the entry chunk, and all of them run regardless of whether anything calls `require` |
 | `lua_getextraspace` | backed by real reserved bytes in front of every `lua_State`, so the macro behaves as in stock |
