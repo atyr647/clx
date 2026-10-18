@@ -400,5 +400,5 @@ install(FILES include/clx.h include/clx_runtime.h include/clx_simd.h
               OPTIONAL DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(FILES include/lua.h include/lauxlib.h include/lualib.h
               OPTIONAL DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-install(FILES doc/dyamic-lua.md
+install(FILES doc/dynamic-lua.md
         OPTIONAL DESTINATION ${CMAKE_INSTALL_DOCDIR})
