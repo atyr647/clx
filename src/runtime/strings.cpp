@@ -432,7 +432,12 @@ MultiValue str_format(LState *L, const LValue *args, size_t count) {
             break;
         }
         case 's': {
-            std::string sv = args[arg - 1].to_string(L);
+            const LValue &sv_arg = args[arg - 1];
+            if (sv_arg.type == String && form[2] == '\0') {
+                result.append(sv_arg.as_string(), sv_arg.string_len());
+                break;
+            }
+            std::string sv = sv_arg.to_string(L);
             size_t l = sv.size();
             if (form[2] == '\0') {
                 result.append_owned(sv.data(), static_cast<uint32_t>(l));
@@ -1191,7 +1196,7 @@ MultiValue str_gsub(LState *L, const LValue *args, size_t count) {
 
     size_t tail = ms.src_end - src_pos;
     if (tail > 0)
-        result.append(L->intern_string(src_pos, tail), static_cast<uint32_t>(tail));
+        result.append(src_pos, static_cast<uint32_t>(tail));
 
     return MultiValue({ result.to_lvalue(L), LValue(static_cast<int64_t>(n)) });
 }
