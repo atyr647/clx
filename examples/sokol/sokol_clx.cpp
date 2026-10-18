@@ -386,8 +386,28 @@ static clx::MultiValue pixels(clx::LState* L, const clx::LValue* args, size_t n)
 
     size_t count = static_cast<size_t>(w) * h * 4;
     std::vector<uint8_t> buf(count);
-    for (size_t i = 0; i < count; i++)
-        buf[i] = static_cast<uint8_t>(clx::check_number(L, clx::raw_get_i(L, data, static_cast<int64_t>(i + 1))));
+    //---------- fast path: dense numeric arrays copy straight from table storage
+    bool fast = false;
+    if (clx::LTable* t = clx::check_table(L, data); t->array_size >= count) {
+        fast = true;
+        for (size_t i = 0; i < count; i++) {
+            clx::ValueType ty = t->array_types[i];
+            double d;
+            if (ty == clx::ValueType::Double)
+                d = t->array[i].payload.f64;
+            else if (ty == clx::ValueType::Int64)
+                d = static_cast<double>(t->array[i].payload.i64);
+            else {
+                fast = false;
+                break;
+            }
+            buf[i] = static_cast<uint8_t>(d);
+        }
+    }
+    if (!fast) {
+        for (size_t i = 0; i < count; i++)
+            buf[i] = static_cast<uint8_t>(clx::check_number(L, clx::raw_get_i(L, data, static_cast<int64_t>(i + 1))));
+    }
 
     if (g_pixels_image.id == 0) {
         sg_image_desc img_desc;
