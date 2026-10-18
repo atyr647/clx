@@ -40,8 +40,10 @@ into a single native binary, so there's nothing to copy alongside your program.
 ## Runtime-loaded Lua modules (`package.path`)
 
 With `--dynamic`, `require()` can also load Lua files **at runtime** through
-`package.path`, using the same searcher chain as stock Lua
-(`package.searchers` = preload → Lua file → C). The file is compiled and
+`package.path`, using a three-entry searcher chain
+(`package.searchers` = preload → Lua file → C). The C searcher is a stub that always fails
+with "no C loader ... see --modules" — there is no `cpath` loading — and, unlike stock Lua,
+there is no fourth Croot searcher. The file is compiled and
 executed on the embedded Lua 5.5 VM — it is *not* AOT-compiled:
 
 ```bash
@@ -247,7 +249,7 @@ You can also compile a `.lua` file into a static library or object file that
 other programs can link:
 
 ```bash
-clx mylib.lua --static --output mylib   # libmylib.a / mylib.lib
+clx mylib.lua --static --output mylib   # mylib.a (POSIX) / mylib.lib (Windows)
 clx mylib.lua --object --output mylib   # mylib.o / mylib.obj
 ```
 
@@ -272,8 +274,8 @@ local proc = require("native_processor")  -- native C++ module
 | Option | What it does |
 |--------|--------------|
 | `--modules <list>` | Link std modules (string, table, math, io, os, utf8, coroutine) or prebuilt C++/C modules (comma-separated) |
-| `--fast` | Link `libclx.a` + `libclx_capi.a` (optimize for speed) |
-| `--size` | Link `libclx_size.a` + `libclx_capi_size.a` (default) |
+| `--fast` | Link `libclx.a` (optimize for speed); adds `libclx_capi.a` only if a C module is linked |
+| `--size` | Link `libclx_size.a` (default); adds `libclx_capi_size.a` only if a C module is linked |
 | `--minimal` | Link base + package only; add std modules back with `--modules` |
 | `--static` | Build a static library that exports `luaopen_*` |
 | `--object` | Build an object file that exports `luaopen_*` |
