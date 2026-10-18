@@ -62,7 +62,8 @@ clx/
 ├── include/
 │   ├── clx.h                   # Public C++ API (value ctors, type queries, helpers)
 │   ├── clx_runtime.h           # Internal runtime (types, GC, tables, inline ops)
-│   └── clx_simd.h              # Cross-platform SIMD helpers for type-array scans
+│   ├── clx_simd.h              # Cross-platform SIMD helpers for type-array scans
+│   ├── lua.h / lauxlib.h / lualib.h  # Lua 5.5 C API headers (for --modules C modules)
 ├── src/
 │   ├── clx.cpp                  # Compiler driver / CLI
 │   ├── syntax/
@@ -70,13 +71,29 @@ clx/
 │   │   ├── parser.h/cpp         # Recursive descent parser
 │   │   └── nodes.h              # AST node definitions
 │   ├── optimizer/
-│   │   ├── optimizer.h           # Optimization passes
-│   │   └── optimizer.cpp         # Optimization implementation
+│   │   ├── optimizer.h/cpp      # Optimizer driver (thin orchestrator over the passes)
+│   │   ├── passes.h             # PassScratch + pass declarations, traverse_node
+│   │   ├── analysis_state.h     # AnalysisState shared across passes
+│   │   ├── owners.cpp           # Ownership, goto/labels, name scans, hygiene
+│   │   ├── numbers.cpp          # Constants/bounds, numeric params, int returns, nogc locals
+│   │   ├── functions.cpp        # Callables, multi-native tuples
+│   │   ├── tables.cpp           # Pure arrays, array safety, table fields, arenas
+│   │   └── structs.cpp          # Struct-local optimization
 │   ├── codegen/
-│   │   ├── codegen.h             # Code generator interface
-│   │   └── codegen.cpp           # C++ code emission (calls optimizer internally)
+│   │   ├── codegen.h/cpp        # Code generator driver (calls optimizer internally)
+│   │   ├── helpers.h/cpp        # Shared free helpers for emission
+│   │   ├── expressions.cpp      # Native ops, calls, literals, table access
+│   │   ├── statements.cpp       # Blocks, functions, returns, control flow
+│   │   ├── loops.cpp            # for/generic-for, loop-table hoists
+│   │   └── assignments.cpp      # Assignments, table constructors, snapshots
 │   └── runtime/                  # Runtime library (libclx.a)
-│       ├── runtime.cpp           # VM core (GC, types, state, metamethods)
+│       ├── state.cpp             # LState lifecycle, globals, open/close
+│       ├── values.cpp            # LValue conversions, comparisons, metamethods
+│       ├── tables.cpp            # LTable core (array/hash, get/set, inline cache)
+│       ├── threads.cpp           # LThread fibers, root_stash/root_load, coro switching
+│       ├── gc.cpp                # Generational GC (mark/sweep, barriers, finalizers)
+│       ├── calls.cpp             # call_function / pcall / call_direct, lazy registry
+│       ├── internal.h            # Shared internal declarations
 │       ├── base.cpp              # Base module (print, error, type, pcall, etc.)
 │       ├── table.cpp             # Table module (insert, remove, concat, sort, etc.)
 │       ├── math.cpp              # Math module
@@ -86,7 +103,11 @@ clx/
 │       ├── os.cpp                # OS module
 │       ├── utf8.cpp              # UTF-8 module
 │       ├── package.cpp           # AOT package/module system
-│       ├── openlibs.cpp          # AOT standard modules loader
+│       ├── fulllibs.cpp          # openlibs() — opens the std modules
+│       ├── openlibs.cpp          # AOT standard modules loader helpers
+│       ├── luaapi.cpp            # Lua C API compatibility shim (libclx_capi*.a)
+│       ├── coro_switch_aarch64.S # ARM64 fiber switch (Apple + Linux)
+│       ├── coro_switch_x86_64.s  # x86_64 fiber switch (Linux)
 │       └── vm/                   # Optional embedded Lua VM and bridge
 │           ├── dynamic_vm.cpp    # VM lifetime, environment, and proxy roots
 │           ├── load_builtin.cpp  # load/loadfile/dofile registration
@@ -96,18 +117,24 @@ clx/
 │           └── lua/              # Vendored Lua VM sources
 ├── tests/                       # End-to-end test suite
 ├── examples/                    # Example clx projects using the C++ embedding API
+│   ├── hello/                   # Minimal hello-world
 │   ├── mandelbrot/              # Mandelbrot viewer
 │   ├── pong/                    # Pong game
-│   └── sokol/                   # Sokol graphics module for clx
+│   ├── sokol/                   # Sokol graphics module for clx
+│   └── weather/                 # Weather app using a Lua C module
 ├── benchmarks/                  # Performance benchmarks with comparisons (lua / luajit / clx)
 └── doc/                         # Comprehensive documentation
     ├── index.md
     ├── api.md
     ├── cli.md
     ├── modules.md
+    ├── luacapi.md
     ├── benchmarks.md
     ├── getting-started.md
-    └── migration-guide.md
+    ├── install.md
+    ├── compatibility.md
+    ├── dynamic-lua.md
+    ├── migration-guide.md
     └── internals/               # Internal design docs
         ├── architecture.md
         ├── optimizations.md
@@ -119,14 +146,14 @@ clx/
 ### 1. CLI (src/clx.cpp)
 
 The command-line interface handles:
-- Argument parsing (`--executable`, `--object`, `--static`, `--debug`, `--size`, `--fast`, `--cpp`, `--modules`, `--dynamic`, `--output`)
+- Argument parsing (`--executable`, `--object`, `--static`, `--debug`, `--size`, `--fast`, `--cpp`, `--modules`, `--dynamic`, `--output`/`-o`, `--minimal`, `--version`, `--cxx`, `--help`)
 - File I/O and multiple lua files compilation
 - Invoking the C++ compiler (fixed at build time via CMake)
 - Locating its own runtime libraries, headers, and native modules via a unified search: the in-tree `build/` dir and executable-relative `lib`/`lib64` dirs first, then the install prefix/libdir embedded from CMake/GNUInstallDirs (`CLX_INSTALL_PREFIX`/`CLX_INSTALL_LIBDIR`/`CLX_INSTALL_INCLUDEDIR`). Default install prefix: `/usr/local` on POSIX, `%ProgramFiles%\clx` on Windows.
 - Selecting the optional dynamic link path: `--dynamic` links `libclx_lua.a` on POSIX or `clx_lua.lib` on Windows and emits registration for `load`, `loadfile`, and `dofile`
 - Output file management and temp file cleanup
-- Dead code elimination by default via `-ffunction-sections -Wl,--gc-sections` (gcc/clang) or `/Gy /link /OPT:REF /OPT:ICF` (MSVC)
-- Default optimization flags if none provided : `-O3 -flto=auto -fno-rtti -fvisibility=hidden` (gcc/clang) or `/O2 /Ot /GL /GR- /MD /EHsc /GS- /fp:fast /Gw /Gy` (MSVC)
+- Dead code elimination by default via `-ffunction-sections` + `-Wl,--gc-sections` (Linux gcc/clang), `-Wl,-dead_strip` (macOS), or `/Gy /link /OPT:REF /OPT:ICF` (MSVC)
+- Default optimization profile is `--size`: `-O1 -foptimize-sibling-calls -fno-inline-functions -fvisibility=hidden` (gcc/clang) or `/O1 /Ob0 /GL /GR- /MD /EHsc /GS- /fp:fast /Gw /Gy /utf-8` (MSVC); `--fast` switches to `-O3 -flto=auto` / `/O2 /Ot /GL`
 
 ### 2. Lexer (src/syntax/lexer.cpp)
 
@@ -143,7 +170,7 @@ The recursive descent parser builds an Abstract Syntax Tree (AST):
 - `parse_statement()` - parses statements
 - `parse_expression()` - parses expressions
 - `parse_block()` - parses statement blocks
-- `parse_function()` - parses function definitions
+- `parse_funcbody()` - parses function definitions
 
 ### 4. AST Nodes (src/syntax/nodes.h)
 
@@ -157,17 +184,22 @@ Core AST node types:
 - `IfStatement` - conditional
 - `CallExpression` - function calls
 
-### 5. Optimizer (src/optimizer/optimizer.cpp)
+### 5. Optimizer (src/optimizer/)
 
-Optimization passes analyze the AST and annotate nodes with optimization hints:
+`Optimizer::run()` is a thin orchestrator over 15 pass functions (declared in `passes.h`,
+implemented across `owners.cpp`, `numbers.cpp`, `functions.cpp`, `tables.cpp`,
+`structs.cpp`), sharing run-scoped state via `PassScratch`/`AnalysisState`. Passes analyze
+the AST and annotate nodes with optimization hints:
 - Numeric expression detection (Integer and Number fast paths)
 - Variable scope resolution
 - Table access purity analysis
 - Constant folding preparation
-- Table version tracking (`hash_version`) for inline cache invalidation
 - `yields_number` analysis for numeric for loops
 - Non-fast function parameter numeric detection (marks params used in arithmetic as native doubles)
 - Function parameter numeric-record array inference (traces `local bi = bodies[i]` + field accesses to prove numeric fields)
+
+(Inline-cache invalidation uses `hash_version`, which is *runtime* table state, not an
+optimizer pass.)
 
 ### 6. Code Generator (src/codegen/codegen.cpp)
 
@@ -183,16 +215,22 @@ The code generator produces C++ code:
 ### 7. Runtime Library (src/runtime/)
 
 The runtime library implements Lua semantics:
- - `runtime.cpp` - Core runtime (GC, tables, metamethods, arithmetic, bitwise ops, lazy function registration via `set_lazy_funcs`)
+ - `state.cpp` - LState lifecycle, slab allocation, globals, open/close
+ - `values.cpp` - LValue conversions/comparisons, metamethod dispatch, arithmetic
+ - `tables.cpp` - LTable core (array/hash storage, get/set, inline cache)
+ - `threads.cpp` - LThread fibers, root_stash/root_load, coro switching
+ - `gc.cpp` - Generational GC (mark/sweep, barriers, finalizers, GCStack)
+ - `calls.cpp` - call_function/pcall/call_direct, lazy function registry, `set_lazy_funcs`
  - `base.cpp` - Base library (print, error, type, rawequal, rawget, rawset, rawlen, warn, _VERSION)
  - `table.cpp` - Table library (insert, remove, concat, sort, unpack, pack, move)
  - `math.cpp` - Math library
  - `strings.cpp` - String library (len, sub, reverse, lower, upper, rep, byte, char, format, find, match, gmatch, gsub)
- - `coroutine.cpp` - Coroutine support (OS-level fibers; hand-written ARM64 assembly on macOS Apple Silicon replacing buggy ucontext)
+ - `coroutine.cpp` - Coroutine support (OS-level fibers; hand-written assembly on ARM64 for Apple+Linux and x86_64 Linux, ucontext fallback elsewhere)
  - `io.cpp` - I/O library
  - `os.cpp` - OS library (clock, time, date, difftime, execute, tmpname, getenv)
  - `utf8.cpp` - UTF-8 library
  - `package.cpp` - AOT package/module system
+ - `luaapi.cpp` - Lua C API compatibility shim (built as `libclx_capi*.a`)
 
 The optional dynamic path is kept separate from these AOT modules:
 
@@ -214,16 +252,17 @@ The optional dynamic path is kept separate from these AOT modules:
 
 Open-addressed hash map for string interning, backed by a block-based `StringArena` (64 KB
 blocks, bump-allocated). Each slot owns a baked allocation with a **16-byte header**
-`[uint64 hash][uint32 len][padding][char data...\0]`. LValue stores a pointer to the char data
-(16 bytes past alloc start). One probe on hit, no `std::string`, no side map, no double lookup.
-Supports `intern_preallocated()` for zero-allocation string concatenation.
+`[uint32 hash_low @0][pad @4][uint32 len @8][pad @12][char data...\0 @16]`. LValue stores a
+pointer to the char data (16 bytes past alloc start). One probe on hit, no `std::string`, no
+side map, no double lookup. Supports `intern_preallocated()` for zero-allocation string
+concatenation.
 
 #### wyhash
 
 Fast, high-quality 64-bit hash function used for table keys and string interning. Uses
 compile-time constant secrets with 128-bit multiply (`clx_umul128`) for excellent avalanche.
-For interned strings, the hash is baked into the 16-byte allocation header, making
-`lvalue_hash()` a single 8-byte load.
+For interned strings, the low 32 bits of the hash are baked into the 16-byte allocation
+header, making `lvalue_hash()` a single 4-byte load.
 
 For strings ≤8 bytes, `swar_hash_8()` replaces `wyhash_str` — loads all bytes into one register
 with a single `memcpy` and mixes via `wyhash64`. Used consistently for both TAG_ISTR inline
@@ -233,11 +272,13 @@ strings and short interned strings so cross-type hash compatibility is maintaine
 
 Each `LTable`'s lazily-allocated `LTableExt` holds an 8-entry inline cache that accelerates
 repeated string-keyed reads. Each entry caches the key payload, entry index, and the table's
-`hash_version` at the time of the last successful probe. On the next read, the cache is checked
-first — if key and version match, the cached entry index is used directly, skipping the full
-hash-probe path. Cache invalidation is structural: `hash_version` increments only on inserts,
-deletes, or rehashes, not on value updates, so read-then-write patterns still hit the cache.
-Only non-GC value types are cached to avoid dangling pointers after collection.
+`hash_version` at the time of the last successful probe — no values are stored, so there is
+nothing to dangle after collection. On the next read, the cache is checked first — if key and
+version match, the cached entry index is used directly, skipping the full hash-probe path.
+Cache invalidation is structural: `hash_version` bumps only on hash **rehash** (the sole
+invalidator that relocates entries), plus metatable set and table recycle — plain inserts and
+deletes never move entries and intentionally leave the version alone, and value updates never
+bump it, so read-then-write patterns still hit the cache.
 
 The cache lives in `LTableExt` (lazily allocated), so pure array-part tables never pay for it.
 The hot `table_get` fast path (array indexing + inline cache) stays inline; misses fall through
@@ -251,10 +292,10 @@ a single interned string with baked hash on `to_string()`.
 
 #### Table Version Tracking
 
-Tables track `hash_version` that increments on structural changes (inserts, deletes,
-rehashes). The per-LTable inline cache checks `hash_version` to detect
-stale entries after table mutations. Value updates do not bump the version, allowing efficient
-read-then-write patterns.
+Tables track `hash_version`, which bumps on hash **rehash** (relocating entries), metatable
+set, and table recycle. The per-LTable inline cache checks `hash_version` to detect stale
+entries after those structural changes. Plain inserts/deletes and value updates do not bump
+the version, allowing efficient read-then-write patterns.
 
 ## Data Flow
 
