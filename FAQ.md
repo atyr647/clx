@@ -66,7 +66,7 @@ Some workloads may perform better under LuaJIT, while others will benefit from c
 
 Yes, Lua 5.5 compatibility is the project's target.
 
-See `docs/compatibility.md` for detailed support status.
+See [`doc/compatibility.md`](doc/compatibility.md) for detailed support status.
 
 ---
 
@@ -80,13 +80,13 @@ clx script.lua --dynamic --output script
 
 The generated program then links the embedded Lua VM. Source passed to `load`, `loadfile`, or `dofile` executes in that VM and crosses the clx/VM bridge when it calls AOT functions or returns values. Without `--dynamic`—and in `--minimal` builds—the loader functions are not registered.
 
-The clx AOT runtime does not provide `string.dump()` or the `debug` module directly. Dynamic code runs in the embedded VM and uses its own standard libraries; see `doc/dynamic-lua.md` for the environment and bridge boundaries.
+The clx AOT runtime registers `string.dump()` but it always throws `string.dump not supported`, and it does not register the `debug` module at all. Dynamic code runs in the embedded VM and uses its own standard libraries; see [`doc/dynamic-lua.md`](doc/dynamic-lua.md) for the environment and bridge boundaries.
 
 ---
 
 ## Does dynamic Lua provide string.dump() and debug?
 
-The clx AOT runtime does not expose `string.dump()` or a `debug` global. When compiled with `--dynamic`, however, loaded code executes in the embedded Lua VM, which contains Lua’s own standard libraries. The default bridge environment copies selected VM globals and does not copy `debug` as a global; consult [Dynamic Lua](doc/dynamic-lua.md) for the boundary details.
+The clx AOT runtime does not expose a working `string.dump()` (it exists but always throws) or a `debug` global. When compiled with `--dynamic`, however, loaded code executes in the embedded Lua VM, which contains Lua’s own standard libraries: the default bridge environment copies selected VM globals (including `string`, which has a real `string.dump` that works on VM closures) but does not copy `debug`. Consult [Dynamic Lua](doc/dynamic-lua.md) for the boundary details.
 
 ---
 
@@ -118,7 +118,7 @@ Yes.
 
 clx provides a C++ API for creating native modules that can be linked statically.
 
-See `docs/modules.md`.
+See [`doc/modules.md`](doc/modules.md).
 
 ---
 
@@ -140,12 +140,12 @@ Executable size depends on:
 * Linked runtime modules
 * Target platform
 
-Typical examples:
+Typical examples (measured on macOS ARM64 with Apple clang; other platforms vary):
 
 | Program                        | Size    |
 | ------------------------------ | ------- |
-| Minimal runtime (`--minimal`)  | ~80 KB  |
-| Default runtime                | ~170 KB |
+| Minimal runtime (`--minimal`)  | ~110 KB |
+| Default runtime (`--size`)     | ~250 KB |
 | Pong + Sokol (`--size`)        | ~500 KB |
 | Pong + Sokol (`--fast`)        | ~700 KB |
 
