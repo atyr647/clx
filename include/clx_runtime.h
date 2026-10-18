@@ -1891,9 +1891,16 @@ class StringBuilder {
     size_t total_len;
     mutable const char *cached;
 
-    std::vector<std::unique_ptr<char[]>> arena_blocks;
+    //------------------ OwnedBlock: arena chunk with its capacity (clear() rewinds to blocks[0], so sizes stay known)
+    struct OwnedBlock {
+        std::unique_ptr<char[]> mem;
+        size_t cap = 0;
+    };
+    std::vector<OwnedBlock> arena_blocks;
     char *arena_cur = nullptr;
     char *arena_end = nullptr;
+    //------------------ ARENA_FIRST: small first block so number/short-string appends never cost a 4KB chunk
+    static constexpr size_t ARENA_FIRST = 256;
 
     void grow() {
         size_t new_cap = cap * 2;
@@ -1914,10 +1921,17 @@ class StringBuilder {
 
     char *arena_alloc(size_t n) {
         if (static_cast<size_t>(arena_end - arena_cur) < n) {
-            size_t blk = n > ARENA_BLOCK ? n : ARENA_BLOCK;
-            arena_blocks.push_back(std::make_unique<char[]>(blk));
-            arena_cur = arena_blocks.back().get();
+            size_t blk;
+            if (arena_blocks.empty())
+                blk = n > ARENA_FIRST ? n : ARENA_FIRST;
+            else
+                blk = n > ARENA_BLOCK ? n : ARENA_BLOCK;
+            OwnedBlock ob;
+            ob.mem = std::make_unique<char[]>(blk);
+            ob.cap = blk;
+            arena_cur = ob.mem.get();
             arena_end = arena_cur + blk;
+            arena_blocks.push_back(std::move(ob));
         }
         char *p = arena_cur;
         arena_cur += n;
@@ -2033,8 +2047,13 @@ public:
         cached = nullptr;
         count = 0;
         total_len = 0;
-        arena_cur = nullptr;
-        arena_end = nullptr;
+        if (!arena_blocks.empty()) {
+            arena_cur = arena_blocks[0].mem.get();
+            arena_end = arena_cur + arena_blocks[0].cap;
+        } else {
+            arena_cur = nullptr;
+            arena_end = nullptr;
+        }
     }
 
     void reserve(size_t n) {
@@ -2080,11 +2099,10 @@ public:
     }
 
     CLX_INLINE StringBuilder &append(LState *L, const LValue &v) {
+        (void)L;
         if (v.type == ValueType::String) {
-            if (v.val.payload.u64 >> 56) {
-                const char *s = L->intern_string(v.as_string(), v.string_len());
-                return append(s, v.string_len());
-            }
+            if (v.val.payload.u64 >> 56)
+                return append_owned(v.as_string(), v.string_len());
             return append(v.as_string(), v.string_len());
         }
         if (v.type == ValueType::Int64) {
@@ -2112,18 +2130,25 @@ public:
             cached = L->intern_string("", 0);
             return cached;
         }
-        uint32_t len32 = static_cast<uint32_t>(total_len);
-        char *mem = new char[16 + total_len + 1]();
-        clx_memcpy(mem + 8, &len32, 4);
-        char *p = mem + 16;
+        if (total_len <= 256) {
+            char tmp[256];
+            char *p = tmp;
+            for (size_t i = 0; i < count; ++i) {
+                clx_memcpy(p, parts[i], lens[i]);
+                p += lens[i];
+            }
+            cached = L->intern_string(tmp, total_len);
+            return cached;
+        }
+        char *mem = new char[total_len + 1];
+        char *p = mem;
         for (size_t i = 0; i < count; ++i) {
             clx_memcpy(p, parts[i], lens[i]);
             p += lens[i];
         }
         *p = '\0';
-        uint64_t h = total_len <= 8 ? swar_hash_8(mem + 16, total_len) : wyhash_str(mem + 16, total_len);
-        clx_memcpy(mem, &h, 8);
-        cached = L->string_pool.intern_preallocated(mem + 16, h, total_len);
+        cached = L->intern_string(mem, total_len);
+        delete[] mem;
         return cached;
     }
 
@@ -2974,11 +2999,15 @@ CLX_INLINE LValue logical_not(const LValue &a) {
     return LValue(!a.as_bool());
 }
 
+//------------------ make_string_pooled: forward declaration for concat_multi below
+CLX_INLINE LValue make_string_pooled(LState *L, const char *s, size_t len);
+
 //------------------ Multi-value concat (string builder fast path)
 CLX_INLINE_COLD LValue concat_multi(LState *L, const LValue *args, size_t count) {
     if (count <= 8) [[likely]] {
         const char *ptrs[8];
         size_t lens[8];
+        char nbuf[8][32];
         size_t total_len = 0;
         for (size_t i = 0; i < count; ++i) {
             if (args[i].type != ValueType::String && args[i].type != ValueType::Int64
@@ -2988,17 +3017,14 @@ CLX_INLINE_COLD LValue concat_multi(LState *L, const LValue *args, size_t count)
             if (args[i].type == ValueType::String) {
                 ptrs[i] = args[i].as_string();
                 lens[i] = args[i].string_len();
+            } else if (args[i].type == ValueType::Int64) {
+                lens[i] = static_cast<size_t>(std::snprintf(
+                    nbuf[i], sizeof(nbuf[i]), "%lld", static_cast<long long>(args[i].val.payload.i64)));
+                ptrs[i] = nbuf[i];
             } else {
-                char buf[32];
-                if (args[i].type == ValueType::Int64) {
-                    lens[i] = static_cast<size_t>(
-                        std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(args[i].val.payload.i64)));
-                } else {
-                    lens[i] = static_cast<size_t>(clx_format_double(buf, sizeof(buf), args[i].val.payload.f64));
-                }
-                char *s = new char[lens[i]];
-                clx_memcpy(s, buf, lens[i]);
-                ptrs[i] = s;
+                lens[i]
+                    = static_cast<size_t>(clx_format_double(nbuf[i], sizeof(nbuf[i]), args[i].val.payload.f64));
+                ptrs[i] = nbuf[i];
             }
             total_len += lens[i];
         }
@@ -3008,27 +3034,27 @@ CLX_INLINE_COLD LValue concat_multi(LState *L, const LValue *args, size_t count)
             for (size_t i = 0; i < count; ++i) {
                 clx_memcpy(bp, ptrs[i], lens[i]);
                 bp += lens[i];
-                if (args[i].type != ValueType::String)
-                    delete[] ptrs[i];
             }
             return LValue::istr(buf, static_cast<uint32_t>(total_len));
         }
-        uint32_t len32 = static_cast<uint32_t>(total_len);
-        char *mem = new char[16 + total_len + 1]();
-        clx_memcpy(mem, &len32, 4);
-        clx_memcpy(mem + 8, &len32, 4);
-        char *p = mem + 16;
+        if (total_len <= 256) {
+            char tmp[256];
+            char *p = tmp;
+            for (size_t i = 0; i < count; ++i) {
+                clx_memcpy(p, ptrs[i], lens[i]);
+                p += lens[i];
+            }
+            return make_string_pooled(L, tmp, total_len);
+        }
+        char *mem = new char[total_len + 1];
+        char *p = mem;
         for (size_t i = 0; i < count; ++i) {
             clx_memcpy(p, ptrs[i], lens[i]);
             p += lens[i];
-            if (args[i].type != ValueType::String)
-                delete[] ptrs[i];
         }
-        *p = '\0';
-        uint64_t h = total_len <= 8 ? swar_hash_8(mem + 16, total_len) : wyhash_str(mem + 16, total_len);
-        clx_memcpy(mem, &h, 8);
-        const char *result = L->string_pool.intern_preallocated(mem + 16, h, total_len);
-        return LValue(result);
+        LValue r = make_string_pooled(L, mem, total_len);
+        delete[] mem;
+        return r;
     }
 
     size_t total_len = 0;
