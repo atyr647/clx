@@ -99,7 +99,7 @@ static MultiValue utf8_char(LState *L, const LValue *args, size_t count) {
             throw_runtime_error(bad_arg_msg(L, (int)(i + 1), "utf8.char", "value out of range"));
         char buf[8];
         int n = utf8_encode(cp, buf);
-        sb.append(L, LValue(L->intern_string(buf, static_cast<size_t>(n))));
+        sb.append_owned(buf, static_cast<uint32_t>(n));
     }
     return MultiValue(sb.to_lvalue(L));
 }
