@@ -67,7 +67,7 @@ Here's a quick mapping of the API you're used to to its clx equivalent.
 |---|---|
 | `lua_getmetatable(L, i)` | `clx::getmetatable(L, obj)` |
 | `lua_setmetatable(L, i)` | `clx::setmetatable(L, obj, mt)` |
-| `luaL_getmetafield(L, i, "__index")` | `clx::getmetafield(L, obj, "__index")` |
+| `luaL_getmetafield(L, i, "__index")` | `clx::getmetatable(L, obj)` then `clx::raw_get(L, mt, "__index")` (there is no direct `getmetafield` helper) |
 
 ### Calls and errors
 
@@ -78,7 +78,7 @@ Here's a quick mapping of the API you're used to to its clx equivalent.
 
 ## The same function, both ways
 
-Here's a simple doubling function in each style.
+Here's a simple addition function in each style.
 
 **Lua C API:**
 
@@ -132,7 +132,7 @@ static constexpr clx::LazyReg my_funcs[] = {
     {"sub", my_sub},
 };
 
-clx_API clx::LValue luaopen_mylib(clx::LState* L) {
+CLX_API clx::LValue luaopen_mylib(clx::LState* L) {
     clx::LValue t = clx::table(L);
     clx::set_lazy_funcs(L, t, my_funcs, 2);
     return t;
@@ -148,7 +148,7 @@ static const clx::LReg mylib[] = {
     {nullptr, nullptr}
 };
 
-clx_API clx::LValue luaopen_mylib(clx::LState* L) {
+CLX_API clx::LValue luaopen_mylib(clx::LState* L) {
     return clx::new_lib(L, mylib);
 }
 ```
@@ -214,7 +214,7 @@ static constexpr clx::LazyReg vec_funcs[] = {
     {"len", vec_len},
 };
 
-clx_API clx::LValue luaopen_vector(clx::LState* L) {
+CLX_API clx::LValue luaopen_vector(clx::LState* L) {
     clx::LValue t = clx::table(L);
     clx::set_lazy_funcs(L, t, vec_funcs, 2);
     return t;
@@ -250,7 +250,7 @@ to native code (there's no bytecode and no VM stack):
 |---|---|
 | `lua_load` / `luaL_loadfile` | Runtime loading via the optional `--dynamic` engine — see [Dynamic Lua](./dynamic-lua.md) |
 | `lua_dump` / `luac` | No bytecode format exists |
-| `lua_pushcclosure` | `clx::cfunction(L, func)` |
+| `lua_pushcclosure` | `clx::cfunction(L, func)` for plain functions; clx has no C-closure upvalues — capture state in a C++ lambda instead (see `lua_upvalueindex` row) |
 | `lua_upvalueindex` / get/setupvalue | Lambda captures |
 | `lua_newstate` / `luaL_newstate` | `clx::open()` |
 | `lua_gc` / `lua_setallocf` | GC is automatic |
