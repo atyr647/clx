@@ -75,6 +75,10 @@ private:
     std::string gc_cells_arg(const std::string &exclude = "");
     bool is_local(std::string_view name, bool &out_is_boxed, std::string_view &out_cpp_name);
 
+    //------------------ note_global_ref: records a global read for filtered std registration.
+    //------------------ _G/_ENV reads set the dynamic-env fallback (full registration) instead.
+    void note_global_ref(std::string_view name);
+
     //------------------ int_flag_expr: C++ bool expression for the runtime integer subtype of an expression
     std::string int_flag_expr(uint32_t expr_idx, int depth);
     //------------------ int_value_expr: C++ int64 expression for an expression proven integral by int_flag_expr
