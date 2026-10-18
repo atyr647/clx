@@ -56,6 +56,23 @@ Examples include:
 
 Minimal reproductions are preferred.
 
+## Building
+
+```bash
+./build.sh          # release (default)
+./build.sh debug    # debug build
+```
+
+On Windows use `build.bat`, or configure CMake directly:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+```
+
+The compiler lands in `build/clx` (or `build/clx.exe`) next to `build/libclx.a`
+and `build/libclx_size.a`.
+
 ## Pull requests
 
 Before submitting a pull request:
@@ -71,6 +88,16 @@ Before submitting a pull request:
 
 General guidelines:
 
+* Format C++ with `clang-format --style=file` (the `.clang-format` config in the
+  repository root, WebKit-based). Before committing, run:
+
+  ```bash
+  find src/ include/ -name '*.cpp' -o -name '*.h' | xargs clang-format -i --style=file
+  ```
+
+* Comments: no block comments or trailing comments. Write a single-line comment
+  on its own line directly above a declaration or definition, prefixed with
+  `//----------` and a short explanation.
 * Prefer clear code over clever code.
 * Keep runtime code portable.
 * Avoid compiler-specific extensions unless necessary.
@@ -81,7 +108,8 @@ General guidelines:
 Run the test suite before submitting changes:
 
 ```bash
-./tests/run.sh
+./tests/run.sh        # POSIX
+tests\run.bat         # Windows
 ```
 
 Please add new tests whenever fixing a bug.
