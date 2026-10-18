@@ -215,13 +215,12 @@ static LValue read_line(LState *L, FILE *fp, bool keep_eol = false) {
         return LValue(L->intern_string(buf, n));
     }
     StringBuilder sb;
-    sb.append(L->intern_string(buf, n), static_cast<uint32_t>(n));
+    sb.append_owned(buf, static_cast<uint32_t>(n));
     while (std::fgets(buf, sizeof(buf), fp)) {
         n = std::strlen(buf);
         bool eol = (n > 0 && buf[n - 1] == '\n');
         bool done = (n < sizeof(buf) - 1 || eol);
-        sb.append(L->intern_string(buf, keep_eol ? n : (eol ? n - 1 : n)),
-            static_cast<uint32_t>(keep_eol ? n : (eol ? n - 1 : n)));
+        sb.append_owned(buf, static_cast<uint32_t>(keep_eol ? n : (eol ? n - 1 : n)));
         if (done)
             break;
     }
