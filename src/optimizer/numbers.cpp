@@ -328,7 +328,6 @@ void pass_constants_and_bounds(const ASTContext &ctx, AnalysisState &state, Pass
             std::string s(nm);
             if (!state.native_integers.count(s))
                 state.native_integers.insert(s);
-            state.for_counter_int.insert(s);
         }
     }
 }
