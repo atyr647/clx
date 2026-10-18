@@ -877,9 +877,15 @@ void CodeEmitter::emitFunctionDef(const ASTNode &node, uint32_t node_idx) {
     } else {
         state.current_arena_func = 0xFFFFFFFF;
     }
-    out << "size_t _va_count = (arg_count > " << node.as.func_def.param_count << ") ? (arg_count - "
-        << node.as.func_def.param_count << ") : 0;\n";
-    out << "const clx::LValue* _va_args = _va_count > 0 ? (args + " << node.as.func_def.param_count << ") : nullptr;\n";
+    //------------------ _va_count/_va_args are consumed only by `...` (emitVararg) and the named-vararg
+    //------------------ binding below, both of which exist solely in vararg functions: skip the
+    //------------------ declarations otherwise to shrink generated output.
+    if (node.as.func_def.is_vararg) {
+        out << "size_t _va_count = (arg_count > " << node.as.func_def.param_count << ") ? (arg_count - "
+            << node.as.func_def.param_count << ") : 0;\n";
+        out << "const clx::LValue* _va_args = _va_count > 0 ? (args + " << node.as.func_def.param_count
+            << ") : nullptr;\n";
+    }
 
     uint32_t prev_func_idx = state.current_func_idx;
     state.current_func_idx = node_idx;
