@@ -1679,17 +1679,16 @@ template <typename F> static void gc_walk_roots(RootRange *head, F &&mark) {
 }
 
 //------------------ Rooted call wrappers: alias func + args into a RootRange around a call; RAII unlinks it
+//------------------ call_function_rooted/call_direct_rooted forward without their own RootRange:
+//------------------ call_function/call_direct root func+args themselves on entry, so a wrapper
+//------------------ range would double-root the same values on every call.
 CLX_INLINE_HOT MultiValue call_function_rooted(
     LState *L, const LValue &func, const LValue *args, size_t count, const char *file, int line) {
-    LValue *ind[1] = { const_cast<LValue *>(&func) };
-    RootRange rr(L, const_cast<LValue *>(args), args ? count : 0, ind, 1);
     return call_function(L, func, args, count, file, line);
 }
 
 CLX_INLINE_HOT MultiValue call_direct_rooted(
     LState *L, const LValue &func, const LValue *args, size_t count, const char *file, int line) {
-    LValue *ind[1] = { const_cast<LValue *>(&func) };
-    RootRange rr(L, const_cast<LValue *>(args), args ? count : 0, ind, 1);
     return call_direct(L, func, args, count, file, line);
 }
 
@@ -1750,8 +1749,11 @@ CLX_INLINE void call_ctx_pop(LState *L) {
 }
 
 //------------------ Rooted call wrapper for direct C function pointers (hoisted builtins, direct impls)
-CLX_INLINE_HOT MultiValue call_cfunc_rooted(
-    LState *L, CFunctionType f, const LValue *args, size_t count, const char *file, int line) {
+//------------------ call_cfunc_rooted_impl: shared body for the overloads below. Templated so the
+//------------------ raw-pointer overload still skips std::function construction on hot builtin calls.
+template <typename CFunc>
+CLX_INLINE_HOT MultiValue call_cfunc_rooted_impl(
+    LState *L, CFunc f, const LValue *args, size_t count, const char *file, int line) {
     RootRange rr(L, const_cast<LValue *>(args), args ? count : 0);
     CallCtxGuard cg(L);
     if (line > 0) {
@@ -1761,16 +1763,15 @@ CLX_INLINE_HOT MultiValue call_cfunc_rooted(
     return f(L, args, count);
 }
 
+CLX_INLINE_HOT MultiValue call_cfunc_rooted(
+    LState *L, CFunctionType f, const LValue *args, size_t count, const char *file, int line) {
+    return call_cfunc_rooted_impl(L, f, args, count, file, line);
+}
+
 //------------------ Raw pointer overload: skips std::function construction on hot builtin calls
 CLX_INLINE_HOT MultiValue call_cfunc_rooted(
     LState *L, RawCFunction f, const LValue *args, size_t count, const char *file, int line) {
-    RootRange rr(L, const_cast<LValue *>(args), args ? count : 0);
-    CallCtxGuard cg(L);
-    if (line > 0) {
-        L->current_file = file;
-        L->current_line = line;
-    }
-    return f(L, args, count);
+    return call_cfunc_rooted_impl(L, f, args, count, file, line);
 }
 
 //------------------ Roots args[] across the direct-call fast path; else collections inside the callee miss survivor-aged args.
@@ -2436,20 +2437,6 @@ CLX_INLINE_HOT LValue int_mul_lv(int64_t a, int64_t b) {
     return LValue(static_cast<int64_t>(static_cast<uint64_t>(a) * static_cast<uint64_t>(b)));
 }
 
-//------------------ int64_in_double_range: a magnitude double can represent this int64 exactly.
-CLX_INLINE_HOT bool int64_in_double_range(int64_t v) {
-    return v >= -(1LL << 53) && v <= (1LL << 53);
-}
-
-//------------------ exact_flag_shadow: recover an exact int64 shadow from a double
-CLX_INLINE_HOT bool exact_flag_shadow(double d, int64_t &shadow) {
-    if (d >= -9007199254740992.0 && d <= 9007199254740992.0 && d == static_cast<double>(static_cast<int64_t>(d))) {
-        shadow = static_cast<int64_t>(d);
-        return true;
-    }
-    return false;
-}
-
 //------------------ add_exact/sub_exact/mul_exact: exact Lua int arithmetic
 CLX_INLINE_HOT LValue add_exact(bool lf, double da, int64_t sa, bool rf, double db, int64_t sb) {
     if (lf && rf)
@@ -2490,15 +2477,6 @@ CLX_INLINE_HOT int clx_format_num(char *buf, size_t cap, double v, bool is_int) 
         && v == static_cast<double>(static_cast<int64_t>(v)))
         return std::snprintf(buf, cap, "%lld", static_cast<long long>(static_cast<int64_t>(v)));
     return clx_format_double(buf, cap, v);
-}
-
-//------------------ int_neg_lv: unary minus preserving the runtime integer subtype flag
-CLX_INLINE_HOT LValue int_neg_lv(double v, bool is_int) {
-    if (!is_int)
-        return LValue(-v);
-    if (v == static_cast<double>(INT64_MIN))
-        return LValue(INT64_MIN);
-    return LValue(-static_cast<int64_t>(v));
 }
 
 //------------------ to_integer_coerced: exact integer coercion (stock l_str2int). Int64 passes
@@ -3421,6 +3399,29 @@ MultiValue table_unpack(LState *, const LValue *, size_t);
 MultiValue table_move(LState *, const LValue *, size_t);
 
 void luastd_base(LState *L);
+//------------------ Per-function base registrars (base.cpp): each registers exactly one global so the
+//------------------ linker strips unused base functions. Declared here for driver-emitted open sequences.
+void luastd_base_print(LState *L);
+void luastd_base_require(LState *L);
+void luastd_base_error(LState *L);
+void luastd_base_assert(LState *L);
+void luastd_base_tostring(LState *L);
+void luastd_base_tonumber(LState *L);
+void luastd_base_rawequal(LState *L);
+void luastd_base_rawget(LState *L);
+void luastd_base_rawset(LState *L);
+void luastd_base_rawlen(LState *L);
+void luastd_base_setmetatable(LState *L);
+void luastd_base_getmetatable(LState *L);
+void luastd_base_collectgarbage(LState *L);
+void luastd_base_type(LState *L);
+void luastd_base_pcall(LState *L);
+void luastd_base_xpcall(LState *L);
+void luastd_base_warn(LState *L);
+void luastd_base_next(LState *L);
+void luastd_base_pairs(LState *L);
+void luastd_base_ipairs(LState *L);
+void luastd_base_select(LState *L);
 void luastd_package(LState *L);
 void luastd_math(LState *L);
 void luastd_coroutine(LState *L);
@@ -3448,6 +3449,9 @@ MultiValue close_thread(LState *L, const LValue &thread);
 
 //------------------ Opens CLX state
 LState *open(int argc = 0, char *argv[] = nullptr);
+//------------------ Opens CLX state without registering any std library (driver-emitted filtered open
+//------------------ sequences register only the referenced base functions afterwards)
+LState *open_bare(int argc = 0, char *argv[] = nullptr);
 //------------------ Opens all standard libraries
 void openlibs(LState *L);
 //------------------ Opens only the string library (--minimal)
