@@ -1702,13 +1702,17 @@ void CodeEmitter::emitIdentifier(const ASTNode &node, uint32_t node_idx) {
 
     if (node.as.ident.is_global) {
         if (name == "_ENV") {
+            //------------------ Explicit _ENV use: dynamic global access, force full registration.
+            state.uses_dynamic_env = true;
             out << "_ENV";
         } else if (state.global_constants.count(name)) {
             out << "clx::LValue(static_cast<double>(" << state.global_constants[name] << "))";
         } else if (state.string_builders.count(name)) {
+            note_global_ref(name);
             out << "(sb_" << emit_name << ".empty() ? clx::get_env_var_key(L, _ENV, cstr_["
                 << state.string_pool_index.at(name) << "]) : clx::LValue(sb_" << emit_name << ".to_string(L)))";
         } else {
+            note_global_ref(name);
             out << "clx::get_env_var_key(L, _ENV, cstr_[" << state.string_pool_index.at(name) << "])";
         }
     } else if (is_native && !is_boxed && !node.as.ident.is_captured) {
