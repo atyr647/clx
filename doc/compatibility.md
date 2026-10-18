@@ -53,7 +53,8 @@ testing is still ongoing.
 | `__len`, `__concat` | ✅ |
 | `__eq`, `__lt`, `__le` | ✅ |
 | `__call`, `__tostring` | ✅ |
-| `__ipairs`, `__pairs` | ✅ |
+| `__pairs` | ✅ |
+| `__ipairs` | ✅ (legacy Lua 5.1 extension — not part of Lua 5.5; clx keeps it for compatibility) |
 
 ## Coroutines
 
@@ -86,7 +87,7 @@ testing is still ongoing.
 | os | ✅ |
 | utf8 | ✅ |
 | package | ✅ |
-| debug | Compiled code: ❌ · Dynamic code: ✅ with `--dynamic` |
+| debug | Not exposed as a global in either mode; dynamic code's default bridge environment does not copy `debug` (see below) |
 
 ## Things that need `--dynamic`
 
@@ -105,8 +106,10 @@ compiled runtime. See [Dynamic Lua](./dynamic-lua.md).
 
 | Feature | What's the story |
 | --- | --- |
-| `string.dump()` | Not available in compiled code; works inside the embedded engine with `--dynamic` |
-| `debug` library | Not exposed as a compiled-code global; behavior in dynamic code is documented separately |
+| `string.dump()` | Registered but always throws `string.dump not supported` in compiled code; the embedded engine has a real implementation when loaded code calls it under `--dynamic` |
+| `debug` library | Not exposed as a compiled-code global; the `--dynamic` bridge environment also does not copy `debug`. Loaded chunks can only reach it if you put it in the environment yourself |
 
 > clx is under active development. Additional Lua 5.5 compatibility work,
-> regression testing, and edge-case handling are still needed.
+> regression testing, and edge-case handling are still needed. A precise list of
+> remaining behavioral differences is kept in `deviations.md` at the repository
+> root — a maintainer working note that is intentionally not committed.
