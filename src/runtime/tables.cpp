@@ -182,6 +182,10 @@ void LTable::resize_hash(size_t new_size) {
     ex->hash_size = new_size;
     ex->hash_tombs = 0;
     ex->hash_bitmap = new_bitmap;
+    //------------------ Sole structural invalidator of the inline cache: rehashing relocates entries.
+    //------------------ Plain inserts/deletes never move entries, and key-payload + ktype checks reject
+    //------------------ stale slots, so they intentionally leave the version alone (hot reads survive
+    //------------------ interleaved cold writes).
     ex->hash_version++;
     if (clx_current_L)
         clx_current_L->account_delta(hb_before, table_heap_bytes(this));
@@ -317,7 +321,6 @@ void LTable::settable(const LValue &key, const LValue &val) {
                     ext->entries[i].vtype = Nil;
                     ext->hash_count--;
                     ext->hash_tombs++;
-                    ext->hash_version++;
                     if (ext->hash_bitmap)
                         ext->hash_bitmap[i / 64] &= ~(1ULL << (i % 64));
                 }
@@ -390,7 +393,6 @@ void LTable::settable(const LValue &key, const LValue &val) {
                         ext->entries[i].vtype = Nil;
                         ext->hash_count--;
                         ext->hash_tombs++;
-                        ext->hash_version++;
                         if (ext->hash_bitmap)
                             ext->hash_bitmap[i / 64] &= ~(1ULL << (i % 64));
                     }
@@ -418,7 +420,6 @@ void LTable::settable(const LValue &key, const LValue &val) {
                 e.vtype = Nil;
                 ex->hash_count--;
                 ex->hash_tombs++;
-                ex->hash_version++;
                 return;
             }
             h = (h + 1) & mask;
@@ -464,7 +465,6 @@ void LTable::settable(const LValue &key, const LValue &val) {
             if (tomb != -1)
                 ex->hash_tombs--;
             ex->hash_count++;
-            ex->hash_version++;
             if (ex->hash_bitmap) {
                 size_t bit_idx = (tomb != -1) ? static_cast<size_t>(tomb) : h;
                 ex->hash_bitmap[bit_idx / 64] |= (1ULL << (bit_idx % 64));
@@ -584,7 +584,6 @@ void LTable::op_direct(LState *L, const LValue &obj, const LValue &key, double a
                 if (tomb != -1)
                     ex->hash_tombs--;
                 ex->hash_count++;
-                ex->hash_version++;
                 if (ex->hash_bitmap) {
                     size_t bit_idx = (tomb != -1) ? static_cast<size_t>(tomb) : h;
                     ex->hash_bitmap[bit_idx / 64] |= (1ULL << (bit_idx % 64));
