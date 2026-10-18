@@ -13,8 +13,9 @@ clx-compiled binary, so the three can be compared directly.
 | `clx` | Built from source — see [Getting Started](getting-started.md) |
 | `hyperfine` (POSIX only) | Optional, for the manual timing workflow |
 
-> Windows users: create a `lua\` folder in the clx root containing `lua55.exe` /
-> `luajit.exe` plus their `lua55.dll` / `lua51.dll` libraries.
+> Windows users: create a `lua\` folder in the clx root containing `lua.exe` /
+> `luajit.exe` plus their DLLs (`lua55.dll` / `lua51.dll`). The runner invokes
+> the commands `lua` and `luajit`, so the binaries must be named accordingly.
 
 ## Running the suite
 
@@ -30,10 +31,12 @@ The script compiles each benchmark with clx, times all three engines over 10
 runs (plus 3 warmup), pins to a single CPU core when possible, and prints a
 formatted speedup table.
 
-To tweak the C++ compiler flags (for example, a different optimization level):
+To tweak the C++ compiler flags (for example, a different optimization level),
+set `CPPFLAGS` — note it **replaces** the default `--fast`, so keep that in the
+value if you still want the speed-linked runtime:
 
 ```sh
-CPPFLAGS="-O2" ./benchmarks/run.sh
+CPPFLAGS="--fast -O2" ./benchmarks/run.sh
 ```
 
 A `hyperfine`-based variant is also provided:
@@ -83,7 +86,7 @@ Speedups vs. Lua 5.5 (10-run average, single CPU, `hyperfine`):
 | spectralnorm.lua | 0.339s (1.00x) | **0.020s (16.95x)** | 0.021s (16.14x) |
 | warmup.lua | 0.006s (1.00x) | 0.005s (1.20x) | **0.002s (3.00x)** |
 
-> Measured on an Intel® Core™ Ultra 5 125U CPU @ 4.30GHz · Linux · GCC 15.2.0 · Average of 10 runs · clx `--fast` built with AVX2
+> Measured on an Intel® Core™ Ultra 5 125U CPU @ 4.30GHz · Linux · GCC 15.2.0 · Average of 10 runs · clx `--fast` built with AVX2 (`CLX_ARCH=avx2` — the default x86 build is SSE2)
 
 ### macOS ARM64
 
@@ -145,7 +148,10 @@ Speedups vs. Lua 5.5 (10-run average, `benchmarks\run.bat`):
 | spectralnorm.lua | 0.323s (1.00x) | **0.052s (6.17x)** | 0.057s (5.70x) |
 | warmup.lua | 0.040s (1.00x) | **0.040s (0.98x)** | 0.041s (0.95x) |
 
-> Measured on an Intel® Core™ Ultra 5 125U CPU @ 4.30GHz · Windows 11 · MSVC 19.50.35724 · Average of 10 runs · clx `--fast` built with AVX2
+> Measured on an Intel® Core™ Ultra 5 125U CPU @ 4.30GHz · Windows 11 · MSVC 19.50.35724 · Average of 10 runs · clx `--fast` built with AVX2 (`CLX_ARCH=avx2` — the default x86 build is SSE2)
+
+> The timing tables above predate the addition of `ray.lua` and `realworld.lua`
+> to the suite; those two run with the scripts but are not yet timed here.
 
 ## What each benchmark tests
 
@@ -167,11 +173,13 @@ Speedups vs. Lua 5.5 (10-run average, `benchmarks\run.bat`):
 | **3ddist** | Distance math — `math` library dispatch and float math |
 | **life** | Conway's Game of Life — 2D array traversal |
 | **sieve** | Prime sieve — array writes and branching |
-| **json** | JSON encoder (dkjson) — strings, recursion, mixed data |
+| **json** | Hand-rolled JSON encoder — strings, recursion, mixed data (no third-party dependency) |
 | **coro** | Coroutine yield cycles — coroutine overhead |
-| **canada** | Parsing a real 2.2 MB GeoJSON file — the most realistic workload |
+| **canada** | Parsing a real 2.2 MB GeoJSON file with dkjson — the most realistic workload |
 | **skynet** | Actor-model coroutine stress test — millions of coroutine create/resume/yield cycles |
-| **warmup** | A trivial script — startup latency only |
+| **ray** | Ray tracer — float math, table-heavy scene traversal (added Oct 2026; not yet in the timing tables) |
+| **realworld** | Mixed real-world workload (added Oct 2026; not yet in the timing tables) |
+| **warmup** | A one-line script — startup latency only |
 
 ### About `canada.lua`
 
@@ -198,6 +206,5 @@ bbox y:       [41.675552, 83.113876]
 
 ### About `warmup.lua`
 
-A minimal script that just allocates a tiny bit and exits. It measures how long
-the runtime takes to start up and reach the first statement, rather than
-execution speed.
+A one-line script (`local x = 5`). It measures how long the runtime takes to start
+up and reach the first statement, rather than execution speed.
