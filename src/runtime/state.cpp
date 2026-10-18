@@ -493,7 +493,10 @@ void set_global(LState *L, const char *name, const LValue &val) {
 extern thread_local LState *clx_current_L;
 thread_local LState *clx_current_L = nullptr;
 
-LState *open(int argc, char *argv[]) {
+//------------------ open_bare — create Lua state without registering any std library. Generated
+//------------------ executables use this plus a filtered registration sequence so the linker strips
+//------------------ unreferenced base functions; open() below preserves the legacy all-registered behavior.
+LState *open_bare(int argc, char *argv[]) {
     LState *L = new LState();
     clx_current_L = L;
 
@@ -520,9 +523,14 @@ LState *open(int argc, char *argv[]) {
         L->_G->settable(LValue(L->intern_string("arg")), arg_table);
     }
 
+    return L;
+}
+
+//------------------ open — create Lua state with the full minimal std set (legacy behavior)
+LState *open(int argc, char *argv[]) {
+    LState *L = open_bare(argc, argv);
     luastd_base(L);
     luastd_package(L);
-
     return L;
 }
 
