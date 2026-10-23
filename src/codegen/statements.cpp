@@ -181,7 +181,9 @@ void CodeEmitter::emit_swap_idiom(const SwapIdiomMatch &m, uint32_t tag) {
         << " _sw" << s << "->array_types[_sa" << s << " - 1] = _y2" << s << ";"
         << " _sw" << s << "->array[_sb" << s << " - 1] = _v1" << s << ";"
         << " _sw" << s << "->array_types[_sb" << s << " - 1] = _y1" << s << ";"
-        << " } else {"
+        << " clx::table_hint_on_array_write(_sw" << s << ", static_cast<size_t>(_sa" << s << " - 1), _y2" << s
+        << "); clx::table_hint_on_array_write(_sw" << s << ", static_cast<size_t>(_sb" << s << " - 1), _y1"
+        << s << "); } else {"
         << " clx::LValue _f1" << s << " = ";
     emit_node(m.read_a);
     out << "; clx::LValue _f2" << s << " = ";
@@ -584,6 +586,10 @@ void CodeEmitter::emit_native_impl_def(std::string_view name, uint32_t v_idx) {
 void CodeEmitter::emit_dbl_impl_def(std::string_view name, uint32_t v_idx) {
     const auto &fn = ctx.nodes[v_idx];
     if (fn.type != NodeType::FunctionDef || fn.as.func_def.is_vararg)
+        return;
+    //------------------ void functions return stock zero values; the boxed impl plus the comma-operator
+    //------------------ wrapper at multi-value sites already model that exactly, so no triple form is needed.
+    if (state.void_funcs.count(name) > 0)
         return;
     uint32_t nparams = fn.as.func_def.param_count;
     std::vector<std::string_view> seen(state.native_numbers.begin(), state.native_numbers.end());
@@ -1145,6 +1151,7 @@ void CodeEmitter::emitReturnStatement(const ASTNode &node, uint32_t node_idx) {
         //------------------ unboxed tailcall: triple overload with double-ready args, same
         //------------------ shapes as the native tailcall below; falls through to it when ineligible.
         if (!fname.empty() && state.in_function_def && !dbl_self_ref(tgt)
+            && state.void_funcs.count(fname) == 0
             && dbl_call_eligible(tgt, call_node.as.call_expr.first_arg, call_node.as.call_expr.arg_count)) {
             if (state.current_arena_func != 0xFFFFFFFF)
                 out << "clx::arena_reset(&_arena);\n";
@@ -1164,7 +1171,9 @@ void CodeEmitter::emitReturnStatement(const ASTNode &node, uint32_t node_idx) {
 
         //------------------ native-direct tailcall: exact-1 callee, exact
 
-        if (!fname.empty() && state.in_function_def
+        //------------------ void callees fall through to generic forwarding below: they yield zero
+        //------------------ values, not one nil (see try_emit_native_call for the multi-value case).
+        if (!fname.empty() && state.in_function_def && state.void_funcs.count(fname) == 0
             && native_call_eligible(tgt, call_node.as.call_expr.first_arg, call_node.as.call_expr.arg_count)) {
             if (state.current_arena_func != 0xFFFFFFFF)
                 out << "clx::arena_reset(&_arena);\n";
