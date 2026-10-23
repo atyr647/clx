@@ -24,7 +24,7 @@ static size_t get_array_len(LState *L, LTable *t) {
             return 0;
         }
     }
-    size_t n = clx_find_first_nil(reinterpret_cast<const uint8_t *>(t->array_types), t->array_size);
+    size_t n = table_array_prefix_len(t);
     if (n < t->array_size)
         return n;
     int64_t lo = static_cast<int64_t>(t->array_size);
@@ -135,6 +135,7 @@ MultiValue table_insert(LState *L, const LValue *args, size_t count) {
             gc_barrier_table(L, list, val);
             list->array[pos - 1] = val.val;
             list->array_types[pos - 1] = val.type;
+            table_hint_on_array_write(list, pos - 1, val.type);
             if (list->array_size <= len)
                 list->array_size = len + 1;
         } else {
@@ -170,6 +171,9 @@ MultiValue table_remove(LState *L, const LValue *args, size_t count) {
         std::memmove(&list->array_types[pos - 1], &list->array_types[pos], move_n * sizeof(ValueType));
         list->array[len - 1] = TValue();
         list->array_types[len - 1] = Nil;
+        //------------------ left-shift may pull an unknown slot under the hint; lowering is always sound
+        if (pos - 1 < list->array_lim)
+            list->array_lim = pos - 1;
     } else {
         res = get_elem(list, pos);
         for (size_t k = pos; k < len; ++k)
@@ -304,6 +308,10 @@ MultiValue table_move(LState *L, const LValue *args, size_t count) {
         size_t dst_off = static_cast<size_t>(t - 1);
         std::memmove(&dst->array[dst_off], &src->array[src_off], n * sizeof(TValue));
         std::memmove(&dst->array_types[dst_off], &src->array_types[src_off], n * sizeof(ValueType));
+        //------------------ slots below min(src, dst) are untouched, so the hint survives up to there
+        size_t keep = src_off < dst_off ? src_off : dst_off;
+        if (keep < dst->array_lim)
+            dst->array_lim = keep;
         return MultiValue(LValue(dst));
     }
 
@@ -323,7 +331,7 @@ MultiValue table_move(LState *L, const LValue *args, size_t count) {
     return MultiValue(LValue(dst));
 }
 
-static MultiValue table_create(LState *L, const LValue *args, size_t count) {
+MultiValue table_create(LState *L, const LValue *args, size_t count) {
     int64_t narray = count >= 1 ? check_integer(L, args[0]) : 0;
     int64_t nhash = count >= 2 ? check_integer(L, args[1]) : 0;
     if (narray < 0 || nhash < 0 || narray > INT_MAX || nhash > INT_MAX)
