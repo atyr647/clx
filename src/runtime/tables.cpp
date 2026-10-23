@@ -125,6 +125,7 @@ LTable::LTable()
     , array_types(nullptr)
     , array_size(0)
     , array_cap(0)
+    , array_lim(0)
     , ext(nullptr) {
     type = static_cast<uint8_t>(Table);
     marked = 0;
@@ -265,6 +266,7 @@ void LTable::settable(const LValue &key, const LValue &val) {
             array_types[idx - 1] = val.type;
             if (static_cast<size_t>(idx) > array_size)
                 array_size = static_cast<size_t>(idx);
+            table_hint_on_array_write(this, static_cast<size_t>(idx) - 1, val.type);
             return;
         }
         if (idx == static_cast<int64_t>(array_size + 1)) {
@@ -286,6 +288,7 @@ void LTable::settable(const LValue &key, const LValue &val) {
             array[array_size] = val.val;
             array_types[array_size] = val.type;
             array_size++;
+            table_hint_on_array_write(this, array_size - 1, val.type);
             array_cap = new_cap;
             if (clx_current_L)
                 clx_current_L->account_delta(hb_grow, table_heap_bytes(this));
@@ -331,16 +334,17 @@ void LTable::settable(const LValue &key, const LValue &val) {
         double d = key.as_number();
         int64_t idx = static_cast<int64_t>(d);
         if (d == static_cast<double>(idx)) {
-            if (static_cast<uint64_t>(idx - 1) < array_cap) {
-                if (static_cast<uint64_t>(idx - 1) > array_size)
-                    table_fill_gap(this, array_size, static_cast<size_t>(idx) - 1);
-                array[idx - 1] = val.val;
-                array_types[idx - 1] = val.type;
-                if (static_cast<size_t>(idx) > array_size)
-                    array_size = static_cast<size_t>(idx);
-                return;
-            }
-            if (idx == static_cast<int64_t>(array_size + 1)) {
+        if (static_cast<uint64_t>(idx - 1) < array_cap) {
+            if (static_cast<uint64_t>(idx - 1) > array_size)
+                table_fill_gap(this, array_size, static_cast<size_t>(idx) - 1);
+            array[idx - 1] = val.val;
+            array_types[idx - 1] = val.type;
+            if (static_cast<size_t>(idx) > array_size)
+                array_size = static_cast<size_t>(idx);
+            table_hint_on_array_write(this, static_cast<size_t>(idx) - 1, val.type);
+            return;
+        }
+        if (idx == static_cast<int64_t>(array_size + 1)) {
                 size_t new_cap = (array_cap == 0) ? 8 : array_cap * 2;
                 const size_t hb_grow = table_heap_bytes(this);
                 TValue *new_arr = nullptr;
@@ -358,6 +362,7 @@ void LTable::settable(const LValue &key, const LValue &val) {
                 array[array_size] = val.val;
                 array_types[array_size] = val.type;
                 array_size++;
+                table_hint_on_array_write(this, array_size - 1, val.type);
                 array_cap = new_cap;
                 if (clx_current_L)
                     clx_current_L->account_delta(hb_grow, table_heap_bytes(this));
@@ -537,6 +542,7 @@ void LTable::op_direct(LState *L, const LValue &obj, const LValue &key, double a
         gc_barrier_table(L, this, nv);
         array[idx - 1] = nv.val;
         array_types[idx - 1] = nv.type;
+        table_hint_on_array_write(this, static_cast<size_t>(idx) - 1, nv.type);
         return;
     }
 
