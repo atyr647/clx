@@ -100,6 +100,31 @@ local result = dofile("scripts/config.lua")
 `dofile` is just `loadfile` followed by a call. The values your file returns
 come back to the caller.
 
+### `string.dump`
+
+Dumping a function created by `load()` returns real Lua 5.5 bytecode as a
+string, exactly as stock Lua produces it — `load()` reads it back, with or
+without `strip`, and text-mode loads reject it like stock:
+
+```lua
+local fn = load("return function(x) return x * 2 + 1 end")()
+local bytes = string.dump(fn)      -- a binary string
+assert(load(bytes)(20) == 41)
+assert(load(string.dump(fn, true))(20) == 41)
+assert(load(bytes, nil, "t") == nil)
+```
+
+Compiled (AOT) and C functions have no bytecode, so dumping one returns a
+callable snapshot instead: calling it runs the original, with upvalues
+intact. This works in every build mode, not just `--dynamic` (bare builds
+return the function itself). Anything else raises stock's error:
+
+```lua
+local function add(a, b) return a + b end
+assert(string.dump(add)(3, 4) == 7)
+assert(pcall(string.dump, {}) == false)  -- bad argument #1 to 'string.dump'
+```
+
 For careful error handling, prefer `loadfile` and call the function with `pcall`:
 
 ```lua
@@ -180,8 +205,8 @@ environment — either the compiled one or the loaded one.
   `--minimal` builds.
 - `load` accepts a string of source only (the reader-function form isn't
   implemented).
-- `string.dump` and loading dumped bytecode aren't provided by the compiled
-  runtime; under `--dynamic` they belong to the embedded engine.
+- `string.dump` of a compiled or C function returns a callable snapshot,
+  not bytecode (see above); only VM-loaded functions dump to real bytecode.
 - Tables, metatables, userdata, and coroutines don't share identity across the
   two environments.
 
