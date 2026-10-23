@@ -36,26 +36,10 @@ bool is_zero_number_literal(const ASTContext &ctx, uint32_t n_idx) {
         || (n.type == NodeType::Integer && n.as.integer.val == 0);
 }
 
-//------------------ lookup_builtin: maps "module.func" to C++ function name
+//------------------ lookup_builtin: maps "module.func" to its clx:: CFunc symbol name, else nullptr
 const char *lookup_builtin(std::string_view module, std::string_view func) {
-    static const std::unordered_map<std::string_view, std::unordered_map<std::string_view, const char *>> _sfm
-        = { { "string",
-                { { "byte", "str_byte" }, { "sub", "str_sub" }, { "match", "str_match" }, { "find", "str_find" },
-                    { "gsub", "str_gsub" }, { "len", "str_len" }, { "format", "str_format" }, { "char", "str_char" },
-                    { "rep", "str_rep" }, { "reverse", "str_reverse" }, { "lower", "str_lower" },
-                    { "upper", "str_upper" }, { "dump", "str_dump" } } },
-              { "table",
-                  { { "concat", "table_concat" }, { "insert", "table_insert" }, { "remove", "table_remove" },
-                      { "sort", "table_sort" }, { "pack", "table_pack" }, { "unpack", "table_unpack" },
-                      { "move", "table_move" } } },
-              { "_G", { { "type", "__clx_type" }, { "tostring", "__clx_tostring" } } } };
-    auto _smit = _sfm.find(module);
-    if (_smit != _sfm.end()) {
-        auto _sfit = _smit->second.find(func);
-        if (_sfit != _smit->second.end())
-            return _sfit->second;
-    }
-    return nullptr;
+    const BuiltinEntry *e = builtin_lookup(module, func);
+    return e ? e->cfunc : nullptr;
 }
 
 //------------------ collect_string_builder_refs: walk an argument subtree and
