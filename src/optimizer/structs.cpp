@@ -377,11 +377,6 @@ void pass_struct_locals(const ASTContext &ctx, AnalysisState &state, PassScratch
             continue;
 
         //------------------ member-name validity and has_f prefix collisions
-        if (!valid_member_name(c.name)) {
-            c.name += "_";
-            if (!valid_member_name(c.name))
-                continue;
-        }
         bool members_ok = true;
         std::set<std::string> members;
         for (size_t i = 0; i < all.size(); ++i) {
