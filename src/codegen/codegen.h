@@ -186,6 +186,10 @@ private:
     //------------------ emit_multi_impl_def: tuple-struct native overload for a multi-double function
     void emit_multi_impl_def(std::string_view name, uint32_t v_idx, uint32_t tuple_n);
     //------------------ native call helpers: native_call_eligible is the pure
+    //------------------ args_need_sb_decl: an argument references a string-builder local with no
+    //------------------ enclosing builder in scope — only the generic call path can declare it on
+    //------------------ demand, so native/dbl emission must decline these calls.
+    bool args_need_sb_decl(uint32_t first_arg, uint32_t arg_count);
 
     bool native_call_eligible(
         uint32_t target_idx, uint32_t first_arg, uint32_t arg_count, bool allow_trailing_single = false, int depth = 0);
