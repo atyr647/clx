@@ -28,11 +28,21 @@
 #define SOKOL_LOG_IMPL
 #define SOKOL_GLUE_IMPL
 
+//---------- Apple SDK deprecation (enum|enum in CGImageCreate) is upstream sokol code we don't patch
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-enum-enum-conversion"
+#endif
+
 #include "sokol_log.h"
 #include "sokol_app.h"
 #include "sokol_gfx.h"
 #include "sokol_glue.h"
 #include "util/sokol_gl.h"
+
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
 // Undefine macOS's nil macro (from MacTypes.h via AppKit) which conflicts with clx::nil()
 #ifdef nil
