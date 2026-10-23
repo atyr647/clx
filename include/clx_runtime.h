@@ -723,20 +723,22 @@ struct AllocCensus {
     uint64_t gc_minors = 0;
     uint64_t gc_old_skipped = 0;
 };
+
 inline AllocCensus g_alloc_census;
+
 inline void dump_alloc_census() {
     const AllocCensus &c = g_alloc_census;
     std::fprintf(stderr,
-        "[alloc] table_new=%llu table_recycled=%llu table_arena=%llu array_new=%llu array_grow=%llu ext_new=%llu hash_resize=%llu "
-        "closure_new=%llu closure_recycled=%llu str_new=%llu str_hit=%llu gc_minor_us=%llu gc_major_us=%llu mark_us=%llu sweep_us=%llu minors=%llu oldskip=%llu\n",
+        "[alloc] table_new=%llu table_recycled=%llu table_arena=%llu array_new=%llu array_grow=%llu ext_new=%llu "
+        "hash_resize=%llu "
+        "closure_new=%llu closure_recycled=%llu str_new=%llu str_hit=%llu gc_minor_us=%llu gc_major_us=%llu "
+        "mark_us=%llu sweep_us=%llu minors=%llu oldskip=%llu\n",
         (unsigned long long)c.table_new, (unsigned long long)c.table_recycled, (unsigned long long)c.table_arena,
         (unsigned long long)c.array_new, (unsigned long long)c.array_grow, (unsigned long long)c.ext_new,
-        (unsigned long long)c.hash_resize,        (unsigned long long)c.closure_new, (unsigned long long)c.closure_recycled,
-        (unsigned long long)c.str_intern_new, (unsigned long long)c.str_intern_hit,
-        (unsigned long long)c.gc_minor_us, (unsigned long long)c.gc_major_us,
-        (unsigned long long)c.gc_minor_mark_us, (unsigned long long)c.gc_minor_sweep_us,
-        (unsigned long long)c.gc_minors, (unsigned long long)c.gc_old_skipped);
-
+        (unsigned long long)c.hash_resize, (unsigned long long)c.closure_new, (unsigned long long)c.closure_recycled,
+        (unsigned long long)c.str_intern_new, (unsigned long long)c.str_intern_hit, (unsigned long long)c.gc_minor_us,
+        (unsigned long long)c.gc_major_us, (unsigned long long)c.gc_minor_mark_us,
+        (unsigned long long)c.gc_minor_sweep_us, (unsigned long long)c.gc_minors, (unsigned long long)c.gc_old_skipped);
 }
 
 //------------------ Tag-based table barrier for sites that already hold a raw TValue/ValueType pair
@@ -780,6 +782,7 @@ CLX_INLINE void tbl_set_metatable(LTable *t, LTable *m) {
 CLX_INLINE size_t table_array_block_bytes(size_t cap) {
     return cap * sizeof(TValue) + cap * sizeof(ValueType);
 }
+
 CLX_INLINE_HOT void table_alloc_array(TValue *&arr, ValueType *&types, size_t cap) {
     if (cap == 0) {
         arr = nullptr;
@@ -793,12 +796,14 @@ CLX_INLINE_HOT void table_alloc_array(TValue *&arr, ValueType *&types, size_t ca
     arr = reinterpret_cast<TValue *>(mem);
     types = reinterpret_cast<ValueType *>(mem + cap * sizeof(TValue));
 }
+
 CLX_INLINE_HOT void table_free_array(TValue *&arr, ValueType *&types, const TValue *small) {
     if (arr && arr != small)
         std::free(arr);
     arr = nullptr;
     types = nullptr;
 }
+
 //------------------ Fused hash block: one calloc holding entries[cap] followed by bitmap words.
 //------------------ entries sits at offset 0, so freeing entries frees the whole block; hash_bitmap
 //------------------ points inside and is never freed separately. cap*24 is always 8-byte aligned
@@ -807,6 +812,7 @@ CLX_INLINE_HOT void table_free_array(TValue *&arr, ValueType *&types, const TVal
 CLX_INLINE size_t table_hash_block_bytes(size_t cap) {
     return cap * sizeof(HashEntry) + ((cap + 63) / 64) * sizeof(uint64_t);
 }
+
 CLX_INLINE_HOT void table_alloc_hash(HashEntry *&entries, uint64_t *&bitmap, size_t cap) {
     if (cap == 0) {
         entries = nullptr;
@@ -819,12 +825,14 @@ CLX_INLINE_HOT void table_alloc_hash(HashEntry *&entries, uint64_t *&bitmap, siz
     entries = reinterpret_cast<HashEntry *>(mem);
     bitmap = reinterpret_cast<uint64_t *>(mem + cap * sizeof(HashEntry));
 }
+
 CLX_INLINE_HOT void table_free_hash(HashEntry *&entries, uint64_t *&bitmap) {
     if (entries)
         std::free(entries);
     entries = nullptr;
     bitmap = nullptr;
 }
+
 //------------------ table_heap_bytes: heap bytes owned by a table's side buffers (mirrors the free paths); arena tables own none
 CLX_INLINE size_t table_heap_bytes(const LTable *t) {
     if (t->flags & LFLAG_ARENA)
@@ -948,7 +956,6 @@ static CLX_INLINE_HOT bool lvalue_eq_fast(const LValue &a, const LValue &b) {
     }
     return false;
 }
-
 
 //------------------ Bump arena for interned strings
 struct StringArena {
@@ -1639,8 +1646,7 @@ struct FrameBase : RootRange {
 //------------------ argument array element, an upvalue cell, or a runtime temporary), so a reassigned local is
 //------------------ always seen by the collector. N inline slots cover every realistic function; a heap spill
 //------------------ (transparent to the collector, which only ever reads `ind[0..ind_n)`) covers the rest.
-template <size_t N>
-struct Frame : FrameBase {
+template<size_t N> struct Frame : FrameBase {
     LValue *_inline_buf[N];
 
     CLX_INLINE_HOT explicit Frame(LState *L)
@@ -1669,7 +1675,7 @@ struct FrameGuard {
 };
 
 //------------------ gc_walk_roots — mark every root in one thread's frame chain
-template <typename F> static void gc_walk_roots(RootRange *head, F &&mark) {
+template<typename F> static void gc_walk_roots(RootRange *head, F &&mark) {
     for (RootRange *r = head; r; r = r->prev) {
         for (size_t i = 0; i < r->n; ++i)
             mark(r->base[i]);
@@ -1751,7 +1757,7 @@ CLX_INLINE void call_ctx_pop(LState *L) {
 //------------------ Rooted call wrapper for direct C function pointers (hoisted builtins, direct impls)
 //------------------ call_cfunc_rooted_impl: shared body for the overloads below. Templated so the
 //------------------ raw-pointer overload still skips std::function construction on hot builtin calls.
-template <typename CFunc>
+template<typename CFunc>
 CLX_INLINE_HOT MultiValue call_cfunc_rooted_impl(
     LState *L, CFunc f, const LValue *args, size_t count, const char *file, int line) {
     RootRange rr(L, const_cast<LValue *>(args), args ? count : 0);
@@ -1896,6 +1902,7 @@ class StringBuilder {
         std::unique_ptr<char[]> mem;
         size_t cap = 0;
     };
+
     std::vector<OwnedBlock> arena_blocks;
     char *arena_cur = nullptr;
     char *arena_end = nullptr;
@@ -2632,8 +2639,7 @@ CLX_INLINE_HOT double coerce_number(LState *L, const LValue &v) {
     double out;
     if (v.to_number(out))
         return out;
-    size_t idx = (v.type == ValueType::Int64) ? static_cast<size_t>(ValueType::Double)
-                                              : static_cast<size_t>(v.type);
+    size_t idx = (v.type == ValueType::Int64) ? static_cast<size_t>(ValueType::Double) : static_cast<size_t>(v.type);
     throw LRuntimeException(LValue(L->intern_string(
         file_line_prefix(L) + "attempt to perform arithmetic on a " + VALUE_TYPE_NAMES[idx] + " value")));
 }
@@ -2748,6 +2754,58 @@ CLX_INLINE bool to_integer(const LValue &v, int64_t &out) {
             return flt_to_integer(d, out);
     }
     return false;
+}
+
+//------------------ forerror: stock luaG_forerror message shape
+CLX_INLINE_COLD void forerror(LState *L, const LValue &v, const char *what) {
+    throw_runtime_error(file_line_prefix(L) + "bad 'for' " + what + " (number expected, got "
+        + stock_type_name(v) + ")");
+}
+
+//------------------ forlimit_tointeger: stock luaV_tointeger with F2Ifloor/F2Iceil for 'for' limits
+CLX_INLINE bool forlimit_tointeger(const LValue &v, int step_sign, int64_t &out) {
+    if (v.type == ValueType::Int64) {
+        out = v.val.payload.i64;
+        return true;
+    }
+    double d;
+    if (v.type == ValueType::Double) {
+        d = v.val.payload.f64;
+    } else if (v.type == ValueType::String) {
+        int64_t iv;
+        if (to_integer_coerced(v, iv)) {
+            out = iv;
+            return true;
+        }
+        if (!parse_num_string(v.as_string(), d))
+            return false;
+    } else {
+        return false;
+    }
+    double f = (step_sign < 0) ? std::ceil(d) : std::floor(d);
+    if (!(f >= -9223372036854775808.0) || !(f < 9223372036854775808.0))
+        return false;
+    out = static_cast<int64_t>(f);
+    return true;
+}
+
+//------------------ forlimit: stock forlimit — integer limit with clipping; returns true to skip loop
+CLX_INLINE bool forlimit(LState *L, int64_t init, const LValue &lim, int64_t step, int64_t &p) {
+    if (forlimit_tointeger(lim, step < 0 ? -1 : 1, p))
+        return (step > 0 ? init > p : init < p);
+    double flim;
+    if (!lim.to_number(flim))
+        forerror(L, lim, "limit");
+    if (flim > 0) {
+        if (step < 0)
+            return true;
+        p = INT64_MAX;
+    } else {
+        if (step > 0)
+            return true;
+        p = INT64_MIN;
+    }
+    return (step > 0 ? init > p : init < p);
 }
 
 //------------------ to_integer_bitwise: stock trygetinteger — Int64 and exact doubles only (F2Ieq).
@@ -3018,12 +3076,11 @@ CLX_INLINE_COLD LValue concat_multi(LState *L, const LValue *args, size_t count)
                 ptrs[i] = args[i].as_string();
                 lens[i] = args[i].string_len();
             } else if (args[i].type == ValueType::Int64) {
-                lens[i] = static_cast<size_t>(std::snprintf(
-                    nbuf[i], sizeof(nbuf[i]), "%lld", static_cast<long long>(args[i].val.payload.i64)));
+                lens[i] = static_cast<size_t>(
+                    std::snprintf(nbuf[i], sizeof(nbuf[i]), "%lld", static_cast<long long>(args[i].val.payload.i64)));
                 ptrs[i] = nbuf[i];
             } else {
-                lens[i]
-                    = static_cast<size_t>(clx_format_double(nbuf[i], sizeof(nbuf[i]), args[i].val.payload.f64));
+                lens[i] = static_cast<size_t>(clx_format_double(nbuf[i], sizeof(nbuf[i]), args[i].val.payload.f64));
                 ptrs[i] = nbuf[i];
             }
             total_len += lens[i];
@@ -3423,6 +3480,33 @@ MultiValue table_sort(LState *, const LValue *, size_t);
 MultiValue table_pack(LState *, const LValue *, size_t);
 MultiValue table_unpack(LState *, const LValue *, size_t);
 MultiValue table_move(LState *, const LValue *, size_t);
+
+//------------------ math module (math.cpp); extern for direct-call lowering via the builtin registry
+MultiValue math_abs(LState *, const LValue *, size_t);
+MultiValue math_acos(LState *, const LValue *, size_t);
+MultiValue math_asin(LState *, const LValue *, size_t);
+MultiValue math_atan(LState *, const LValue *, size_t);
+MultiValue math_ceil(LState *, const LValue *, size_t);
+MultiValue math_cos(LState *, const LValue *, size_t);
+MultiValue math_deg(LState *, const LValue *, size_t);
+MultiValue math_exp(LState *, const LValue *, size_t);
+MultiValue math_floor(LState *, const LValue *, size_t);
+MultiValue math_fmod(LState *, const LValue *, size_t);
+MultiValue math_frexp(LState *, const LValue *, size_t);
+MultiValue math_ldexp(LState *, const LValue *, size_t);
+MultiValue math_log(LState *, const LValue *, size_t);
+MultiValue math_max(LState *, const LValue *, size_t);
+MultiValue math_min(LState *, const LValue *, size_t);
+MultiValue math_modf(LState *, const LValue *, size_t);
+MultiValue math_rad(LState *, const LValue *, size_t);
+MultiValue math_random(LState *, const LValue *, size_t);
+MultiValue math_randomseed(LState *, const LValue *, size_t);
+MultiValue math_sin(LState *, const LValue *, size_t);
+MultiValue math_sqrt(LState *, const LValue *, size_t);
+MultiValue math_tan(LState *, const LValue *, size_t);
+MultiValue math_tointeger(LState *, const LValue *, size_t);
+MultiValue math_type(LState *, const LValue *, size_t);
+MultiValue math_ult(LState *, const LValue *, size_t);
 
 void luastd_base(LState *L);
 //------------------ Per-function base registrars (base.cpp): each registers exactly one global so the
