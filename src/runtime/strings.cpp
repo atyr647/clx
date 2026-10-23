@@ -22,11 +22,28 @@ namespace clx {
 static const char *get_string(LState *L, const LValue *args, size_t count, size_t &len, int idx, const char *fname) {
     if (idx < 1 || idx > (int)count)
         throw_runtime_error(bad_arg_msg(L, idx, fname, "string expected, got no value"));
-    if (args[idx - 1].type != String)
-        throw_runtime_error(
-            bad_arg_msg(L, idx, fname, std::string("string expected, got ") + stock_type_name(args[idx - 1])));
-    len = args[idx - 1].string_len();
-    return args[idx - 1].as_string();
+    const LValue &v = args[idx - 1];
+    if (v.type == String) {
+        len = v.string_len();
+        return v.as_string();
+    }
+    if (v.type == Int64) {
+        char buf[32];
+        int n = std::snprintf(buf, sizeof(buf), "%lld", (long long)v.as_integer());
+        const char *s = L->intern_string(buf, (size_t)n);
+        len = (size_t)n;
+        return s;
+    }
+    if (v.type == Double) {
+        char buf[64];
+        int n = clx_format_double(buf, sizeof(buf), v.as_number());
+        const char *s = L->intern_string(buf, (size_t)n);
+        len = (size_t)n;
+        return s;
+    }
+    throw_runtime_error(
+        bad_arg_msg(L, idx, fname, std::string("string expected, got ") + stock_type_name(v)));
+    return nullptr;
 }
 
 //------------------ get_integer — extract integer arg; errors like stock luaL_checkinteger on lossy floats
