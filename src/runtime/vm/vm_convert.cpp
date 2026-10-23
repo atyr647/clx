@@ -257,14 +257,18 @@ LValue vm_to_clx_value_(LState* clx_L, lua_State* L, int idx)
             table_alloc_array(tbl->array, tbl->array_types, cap);
             tbl->array_cap = cap;
             clx_L->account_delta(hb_vm, table_heap_bytes(tbl));
+            size_t run = 0;
             for (size_t i = 0; i < len; ++i) {
                 lua_rawgeti(L, abs_idx, static_cast<int>(i + 1));
                 LValue val = vm_to_clx_value_(clx_L, L, -1);
                 lua_pop(L, 1);
                 tbl->array[i] = val.val;
                 tbl->array_types[i] = val.type;
+                if (i == run && val.type != Nil)
+                    ++run;
             }
             tbl->array_size = len;
+            tbl->array_lim = run;
         }
 
         lua_pushnil(L);
