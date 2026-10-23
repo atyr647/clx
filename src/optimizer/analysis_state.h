@@ -84,6 +84,10 @@ struct AnalysisState {
     std::set<std::string_view> direct_callables;
     std::set<std::string_view> fast_callables;
     std::set<std::string_view> native_direct_funcs;
+    //------------------ void_funcs: native-direct callees with no ReturnStatement at all. Their impl
+    //------------------ falls through to the trailing nil return (stock: zero values). Single-value call
+    //------------------ sites use the impl directly; multi-value sites discard it via the comma operator.
+    std::set<std::string_view> void_funcs;
     std::map<std::string, uint32_t, std::less<>> multi_native_return_counts;
     std::set<std::string, std::less<>> numeric_builtin_aliases;
     std::map<std::string_view, uint32_t> func_param_counts;
