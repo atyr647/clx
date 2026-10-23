@@ -74,19 +74,16 @@ void CodeEmitter::emitForStatement(const ASTNode &node, uint32_t node_idx) {
     bool step_is_default = (node.as.for_stmt.step_expr == 0xFFFFFFFF);
     bool step_known_positive = step_is_default;
     bool step_known_negative = false;
-    int64_t step_int_val = 1;
     if (!step_is_default) {
         auto &step_node = ctx.nodes[node.as.for_stmt.step_expr];
         if (step_node.type == NodeType::Number) {
             double step_val = step_node.as.number.val;
             step_known_positive = (step_val > 0);
             step_known_negative = (step_val < 0);
-            step_int_val = static_cast<int64_t>(step_val);
         } else if (step_node.type == NodeType::Integer) {
             int64_t step_val = step_node.as.integer.val;
             step_known_positive = (step_val > 0);
             step_known_negative = (step_val < 0);
-            step_int_val = step_val;
         }
     }
 
@@ -100,14 +97,29 @@ void CodeEmitter::emitForStatement(const ASTNode &node, uint32_t node_idx) {
                     && yields_number(ctx, state, bin.left, nullptr, state.current_fast_func));
         }
     }
-    bool counter_is_int = native_for && !is_cap && start_is_int_literal
-        && (step_is_default || (ctx.nodes[node.as.for_stmt.step_expr].type == NodeType::Integer && step_int_val == 1));
+    bool step_is_int_lit = !step_is_default && ctx.nodes[node.as.for_stmt.step_expr].type == NodeType::Integer;
+    bool step_is_zero_lit = !step_is_default
+        && ((ctx.nodes[node.as.for_stmt.step_expr].type == NodeType::Integer
+                && ctx.nodes[node.as.for_stmt.step_expr].as.integer.val == 0)
+            || (ctx.nodes[node.as.for_stmt.step_expr].type == NodeType::Number
+                && ctx.nodes[node.as.for_stmt.step_expr].as.number.val == 0.0));
+    bool step_is_nonzero_lit = !step_is_default
+        && ((ctx.nodes[node.as.for_stmt.step_expr].type == NodeType::Integer
+                && ctx.nodes[node.as.for_stmt.step_expr].as.integer.val != 0)
+            || (ctx.nodes[node.as.for_stmt.step_expr].type == NodeType::Number
+                && ctx.nodes[node.as.for_stmt.step_expr].as.number.val != 0.0));
+    bool counter_is_int = native_for && !is_cap && start_is_int_literal && (step_is_default || step_is_int_lit);
 
     out << "{\n";
     if (!native_for)
         out << "clx::FrameGuard _fg_for_" << node_idx << "(_fr);\n";
 
-    if (native_for) {
+    if (step_is_zero_lit) {
+        out << "{\n";
+        out << "throw clx::LRuntimeException(clx::LValue(L->intern_string(std::string(\"" << ctx.filename << ":"
+            << node.line << ": 'for' step is zero\"))));\n";
+        out << "}\n";
+    } else if (native_for) {
         if (counter_is_int) {
             auto &start_node = ctx.nodes[node.as.for_stmt.start_expr];
             if (start_node.type == NodeType::BinaryOp) {
@@ -122,9 +134,19 @@ void CodeEmitter::emitForStatement(const ASTNode &node, uint32_t node_idx) {
                 emit_native(node.as.for_stmt.start_expr);
                 out << ";\n";
             }
-            out << "int64_t l_" << node_idx << " = ";
-            emit_native(node.as.for_stmt.limit_expr);
-            out << ";\n";
+            if (ctx.nodes[node.as.for_stmt.limit_expr].type == NodeType::Integer) {
+                out << "int64_t l_" << node_idx << " = ";
+                emit_native(node.as.for_stmt.limit_expr);
+                out << ";\n";
+            } else if (step_known_negative) {
+                out << "int64_t l_" << node_idx << " = static_cast<int64_t>(std::ceil(";
+                emit_native(node.as.for_stmt.limit_expr);
+                out << "));\n";
+            } else {
+                out << "int64_t l_" << node_idx << " = static_cast<int64_t>(std::floor(";
+                emit_native(node.as.for_stmt.limit_expr);
+                out << "));\n";
+            }
             if (node.as.for_stmt.step_expr != 0xFFFFFFFF) {
                 out << "int64_t st_" << node_idx << " = ";
                 emit_native(node.as.for_stmt.step_expr);
@@ -146,64 +168,55 @@ void CodeEmitter::emitForStatement(const ASTNode &node, uint32_t node_idx) {
             } else {
                 out << "double st_" << node_idx << " = 1.0;\n";
             }
+            if (!step_is_default && !step_is_nonzero_lit) {
+                out << "if (st_" << node_idx << " == 0.0)\n";
+                out << "throw clx::LRuntimeException(clx::LValue(L->intern_string(std::string(\"" << ctx.filename
+                    << ":" << node.line << ": 'for' step is zero\"))));\n";
+            }
         }
     } else {
-        bool start_is_literal = (ctx.nodes[node.as.for_stmt.start_expr].type == NodeType::Integer
-            || ctx.nodes[node.as.for_stmt.start_expr].type == NodeType::Number);
-        bool step_can_skip = step_is_default || (ctx.nodes[node.as.for_stmt.step_expr].type == NodeType::Integer)
-            || (ctx.nodes[node.as.for_stmt.step_expr].type == NodeType::Number);
-        if (start_is_literal && step_can_skip) {
-            out << "double s_" << node_idx << " = ";
-            if (ctx.nodes[node.as.for_stmt.start_expr].type == NodeType::Integer)
-                out << "static_cast<double>(" << ctx.nodes[node.as.for_stmt.start_expr].as.integer.val << ")";
-            else
-                out << ctx.nodes[node.as.for_stmt.start_expr].as.number.val;
+        out << "clx::LValue start_" << node_idx << " = ";
+        emit_node(node.as.for_stmt.start_expr);
+        out << ";\n";
+        out << "_fr.push(start_" << node_idx << ");\n";
+        out << "clx::LValue limit_" << node_idx << " = ";
+        emit_node(node.as.for_stmt.limit_expr);
+        out << ";\n";
+        out << "_fr.push(limit_" << node_idx << ");\n";
+        if (node.as.for_stmt.step_expr != 0xFFFFFFFF) {
+            out << "clx::LValue step_" << node_idx << " = ";
+            emit_node(node.as.for_stmt.step_expr);
             out << ";\n";
-            out << "clx::LValue limit_" << node_idx << " = ";
-            emit_node(node.as.for_stmt.limit_expr);
-            out << ";\n";
-            out << "_fr.push(limit_" << node_idx << ");\n";
-            if (node.as.for_stmt.step_expr != 0xFFFFFFFF) {
-                out << "double st_" << node_idx << " = ";
-                if (ctx.nodes[node.as.for_stmt.step_expr].type == NodeType::Integer)
-                    out << "static_cast<double>(" << ctx.nodes[node.as.for_stmt.step_expr].as.integer.val << ")";
-                else
-                    out << ctx.nodes[node.as.for_stmt.step_expr].as.number.val;
-                out << ";\n";
-            } else {
-                out << "double st_" << node_idx << " = 1.0;\n";
-            }
-            out << "double l_" << node_idx << ";\n";
-            out << "if (!limit_" << node_idx << ".to_number(l_" << node_idx << ")) {\n";
-            out << "std::string _for_err_" << node_idx << " = std::string(\"" << ctx.filename << ":" << node.line
-                << ": 'for' initial values must be numeric\");\n"
-                << "throw clx::LRuntimeException(clx::LValue(L->intern_string(_for_err_" << node_idx << ")));\n}\n";
         } else {
-            out << "clx::LValue start_" << node_idx << " = ";
-            emit_node(node.as.for_stmt.start_expr);
-            out << ";\n";
-            out << "_fr.push(start_" << node_idx << ");\n";
-            out << "clx::LValue limit_" << node_idx << " = ";
-            emit_node(node.as.for_stmt.limit_expr);
-            out << ";\n";
-            out << "_fr.push(limit_" << node_idx << ");\n";
-
-            if (node.as.for_stmt.step_expr != 0xFFFFFFFF) {
-                out << "clx::LValue step_" << node_idx << " = ";
-                emit_node(node.as.for_stmt.step_expr);
-                out << ";\n";
-            } else {
-                out << "clx::LValue step_" << node_idx << " = clx::LValue(static_cast<double>(1.0));\n";
-            }
-            out << "_fr.push(step_" << node_idx << ");\n";
-
-            out << "double s_" << node_idx << ", l_" << node_idx << ", st_" << node_idx << ";\n";
-            out << "if (!start_" << node_idx << ".to_number(s_" << node_idx << ") || !limit_" << node_idx
-                << ".to_number(l_" << node_idx << ") || !step_" << node_idx << ".to_number(st_" << node_idx << ")) {\n";
-            out << "std::string _for_err_" << node_idx << " = std::string(\"" << ctx.filename << ":" << node.line
-                << ": 'for' initial values must be numeric\");\n"
-                << "throw clx::LRuntimeException(clx::LValue(L->intern_string(_for_err_" << node_idx << ")));\n}\n";
+            out << "clx::LValue step_" << node_idx << " = clx::LValue(static_cast<int64_t>(1));\n";
         }
+        out << "_fr.push(step_" << node_idx << ");\n";
+        out << "bool _isint_" << node_idx << " = (start_" << node_idx
+            << ".type == clx::ValueType::Int64 && step_" << node_idx << ".type == clx::ValueType::Int64);\n";
+        out << "bool _skip_" << node_idx << " = false;\n";
+        out << "int64_t is_" << node_idx << " = 0, il_" << node_idx << " = 0, ist_" << node_idx << " = 0;\n";
+        out << "double fs_" << node_idx << " = 0, fl_" << node_idx << " = 0, fst_" << node_idx << " = 0;\n";
+        out << "if (_isint_" << node_idx << ") {\n";
+        out << "is_" << node_idx << " = start_" << node_idx << ".as_integer(); ist_" << node_idx
+            << " = step_" << node_idx << ".as_integer();\n";
+        out << "if (ist_" << node_idx << " == 0)\n";
+        out << "throw clx::LRuntimeException(clx::LValue(L->intern_string(std::string(\"" << ctx.filename << ":"
+            << node.line << ": 'for' step is zero\"))));\n";
+        out << "_skip_" << node_idx << " = clx::forlimit(L, is_" << node_idx << ", limit_" << node_idx << ", ist_"
+            << node_idx << ", il_" << node_idx << ");\n";
+        out << "} else {\n";
+        out << "if (!limit_" << node_idx << ".to_number(fl_" << node_idx << ")) clx::forerror(L, limit_" << node_idx
+            << ", \"limit\");\n";
+        out << "if (!step_" << node_idx << ".to_number(fst_" << node_idx << ")) clx::forerror(L, step_" << node_idx
+            << ", \"step\");\n";
+        out << "if (!start_" << node_idx << ".to_number(fs_" << node_idx << ")) clx::forerror(L, start_" << node_idx
+            << ", \"initial value\");\n";
+        out << "if (fst_" << node_idx << " == 0)\n";
+        out << "throw clx::LRuntimeException(clx::LValue(L->intern_string(std::string(\"" << ctx.filename << ":"
+            << node.line << ": 'for' step is zero\"))));\n";
+        out << "_skip_" << node_idx << " = (fst_" << node_idx << " > 0) ? (fl_" << node_idx << " < fs_" << node_idx
+            << ") : (fs_" << node_idx << " < fl_" << node_idx << ");\n";
+        out << "}\n";
     }
 
     auto _saved_hoisted = std::move(state.hoisted_lookups);
@@ -292,19 +305,25 @@ void CodeEmitter::emitForStatement(const ASTNode &node, uint32_t node_idx) {
         uint32_t _ht = ctx.nodes[_h_node].as.table_access.table;
         uint32_t _hk = ctx.nodes[_h_node].as.table_access.key;
         if (_ht < ctx.nodes.size() && _hk < ctx.nodes.size() && ctx.nodes[_ht].type == NodeType::Identifier
-            && ctx.nodes[_hk].type == NodeType::String) {
+            && ctx.nodes[_ht].as.ident.is_global && ctx.nodes[_hk].type == NodeType::String) {
             std::string_view _hm(ctx.nodes[_ht].as.ident.name, ctx.nodes[_ht].as.ident.length);
             std::string_view _hf(ctx.nodes[_hk].as.string.text, ctx.nodes[_hk].as.string.length);
-            const char *_cf = lookup_builtin(_hm, _hf);
-            if (_cf)
-                state.hoisted_cfuncs[_h_name] = _cf;
+            //------------------ hoisted cfunc bypasses the captured value, so a written builtin
+            //------------------ field or reassigned module must stay on generic dispatch
+            if (builtin_field_ok(state, _hm, _hf)) {
+                const char *_cf = lookup_builtin(_hm, _hf);
+                if (_cf)
+                    state.hoisted_cfuncs[_h_name] = _cf;
+            }
         }
     }
 
     std::vector<std::string_view> _added_ht;
     emit_loop_table_hoists(node.as.for_stmt.body_block, _added_ht);
 
-    auto emit_for_body = [&]() {
+    auto emit_for_body = [&](bool body_is_int) {
+        size_t _nn_sz = state.native_numbers.size();
+        bool _had_ni = state.native_integers.count(std::string(var_name)) > 0;
         if (is_cap || !is_n) {
             out << "clx::FrameGuard _fg_iter(_fr);\n";
         }
@@ -316,12 +335,13 @@ void CodeEmitter::emitForStatement(const ASTNode &node, uint32_t node_idx) {
                    "clx::LValue(static_cast<int64_t>(i_val)) : clx::LValue(i_val));\n";
             out << "_fr.push(*l_" << var_name << ");\n";
         } else if (is_n) {
-            if (counter_is_int) {
+            if (body_is_int) {
                 out << "const int64_t l_" << var_name << " = i_val;\n";
                 state.native_integers.insert(std::string(var_name));
                 state.native_numbers.push_back(var_name);
             } else {
                 out << "const double l_" << var_name << " = i_val;\n";
+                state.native_integers.erase(std::string(var_name));
                 state.native_numbers.push_back(var_name);
             }
         } else {
@@ -332,7 +352,7 @@ void CodeEmitter::emitForStatement(const ASTNode &node, uint32_t node_idx) {
 
         size_t prev_locals = locals.size();
         locals.push_back({ var_name, is_cap });
-        locals.back().is_int_counter = counter_is_int;
+        locals.back().is_int_counter = body_is_int;
         if (node.as.for_stmt.body_block != 0xFFFFFFFF) {
             bool prev_skip = state.skip_block_braces;
             state.skip_block_braces = true;
@@ -371,51 +391,90 @@ void CodeEmitter::emitForStatement(const ASTNode &node, uint32_t node_idx) {
             state.skip_block_braces = prev_skip;
         }
         locals.resize(prev_locals);
+        state.native_numbers.resize(_nn_sz);
+        if (!_had_ni)
+            state.native_integers.erase(std::string(var_name));
     };
 
-    if (counter_is_int) {
-        auto &start_node = ctx.nodes[node.as.for_stmt.start_expr];
-        bool start_needs_runtime = (start_node.type == NodeType::BinaryOp);
-        if (step_known_positive) {
-            if (start_needs_runtime) {
-                out << "for (int64_t i_val = s_" << node_idx << "; i_val <= l_" << node_idx << "; i_val++) {\n";
+    if (step_is_zero_lit) {
+        //------------------ step-zero throw already emitted above; no loop to emit
+    } else if (native_for) {
+        if (counter_is_int) {
+            auto &start_node = ctx.nodes[node.as.for_stmt.start_expr];
+            bool start_needs_runtime = (start_node.type == NodeType::BinaryOp);
+            if (step_known_positive) {
+                if (start_needs_runtime) {
+                    out << "for (int64_t i_val = s_" << node_idx << "; i_val <= l_" << node_idx << "; i_val += st_"
+                        << node_idx << ") {\n";
+                } else {
+                    int64_t start_int = start_node.as.integer.val;
+                    out << "for (int64_t i_val = " << start_int << "; i_val <= l_" << node_idx << "; i_val += st_"
+                        << node_idx << ") {\n";
+                }
+                emit_for_body(true);
+                out << "}\n";
             } else {
-                int64_t start_int = start_node.as.integer.val;
-                out << "for (int64_t i_val = " << start_int << "; i_val <= l_" << node_idx << "; i_val++) {\n";
+                if (start_needs_runtime) {
+                    out << "for (int64_t i_val = s_" << node_idx << "; i_val >= l_" << node_idx << "; i_val += st_"
+                        << node_idx << ") {\n";
+                } else {
+                    int64_t start_int = start_node.as.integer.val;
+                    out << "for (int64_t i_val = " << start_int << "; i_val >= l_" << node_idx << "; i_val += st_"
+                        << node_idx << ") {\n";
+                }
+                emit_for_body(true);
+                out << "}\n";
             }
-            emit_for_body();
+        } else if (step_known_positive) {
+            out << "for (double i_val = s_" << node_idx << "; i_val <= l_" << node_idx << "; i_val += st_" << node_idx
+                << ") {\n";
+            emit_for_body(false);
+            out << "}\n";
+        } else if (step_known_negative) {
+            out << "for (double i_val = s_" << node_idx << "; i_val >= l_" << node_idx << "; i_val += st_" << node_idx
+                << ") {\n";
+            emit_for_body(false);
             out << "}\n";
         } else {
-            if (start_needs_runtime) {
-                out << "for (int64_t i_val = s_" << node_idx << "; i_val >= l_" << node_idx << "; i_val--) {\n";
-            } else {
-                int64_t start_int = start_node.as.integer.val;
-                out << "for (int64_t i_val = " << start_int << "; i_val >= l_" << node_idx << "; i_val--) {\n";
-            }
-            emit_for_body();
+            out << "if (st_" << node_idx << " > 0) {\n";
+            out << "    for (double i_val = s_" << node_idx << "; i_val <= l_" << node_idx << "; i_val += st_"
+                << node_idx << ") {\n";
+            emit_for_body(false);
+            out << "    }\n";
+            out << "} else {\n";
+            out << "    for (double i_val = s_" << node_idx << "; i_val >= l_" << node_idx << "; i_val += st_"
+                << node_idx << ") {\n";
+            emit_for_body(false);
+            out << "    }\n";
             out << "}\n";
         }
-    } else if (step_known_positive) {
-        out << "for (double i_val = s_" << node_idx << "; i_val <= l_" << node_idx << "; i_val += st_" << node_idx
-            << ") {\n";
-        emit_for_body();
-        out << "}\n";
-    } else if (step_known_negative) {
-        out << "for (double i_val = s_" << node_idx << "; i_val >= l_" << node_idx << "; i_val += st_" << node_idx
-            << ") {\n";
-        emit_for_body();
-        out << "}\n";
     } else {
-        out << "if (st_" << node_idx << " > 0) {\n";
-        out << "    for (double i_val = s_" << node_idx << "; i_val <= l_" << node_idx << "; i_val += st_" << node_idx
+        out << "if (!_skip_" << node_idx << ") {\n";
+        out << "if (_isint_" << node_idx << ") {\n";
+        out << "if (ist_" << node_idx << " > 0) {\n";
+        out << "for (int64_t i_val = is_" << node_idx << "; i_val <= il_" << node_idx << "; i_val += ist_" << node_idx
             << ") {\n";
-        emit_for_body();
-        out << "    }\n";
+        emit_for_body(true);
+        out << "}\n";
         out << "} else {\n";
-        out << "    for (double i_val = s_" << node_idx << "; i_val >= l_" << node_idx << "; i_val += st_" << node_idx
+        out << "for (int64_t i_val = is_" << node_idx << "; i_val >= il_" << node_idx << "; i_val += ist_" << node_idx
             << ") {\n";
-        emit_for_body();
-        out << "    }\n";
+        emit_for_body(true);
+        out << "}\n";
+        out << "}\n";
+        out << "} else {\n";
+        out << "if (fst_" << node_idx << " > 0) {\n";
+        out << "for (double i_val = fs_" << node_idx << "; i_val <= fl_" << node_idx << "; i_val += fst_" << node_idx
+            << ") {\n";
+        emit_for_body(false);
+        out << "}\n";
+        out << "} else {\n";
+        out << "for (double i_val = fs_" << node_idx << "; i_val >= fl_" << node_idx << "; i_val += fst_" << node_idx
+            << ") {\n";
+        emit_for_body(false);
+        out << "}\n";
+        out << "}\n";
+        out << "}\n";
         out << "}\n";
     }
 
