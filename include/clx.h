@@ -387,6 +387,7 @@ CLX_INLINE void raw_set_i(LState* L, const LValue& table, int64_t idx, const LVa
         t->array_types[idx - 1] = val.type;
         if (static_cast<size_t>(idx) > t->array_size)
             t->array_size = static_cast<size_t>(idx);
+        table_hint_on_array_write(t, static_cast<size_t>(idx) - 1, val.type);
     } else {
         t->settable(LValue(static_cast<int64_t>(idx)), val);
     }
@@ -607,7 +608,7 @@ CLX_INLINE_HOT int64_t rawlen(const LValue& v)
     }
     if (v.type == ValueType::Table) {
         LTable* t = static_cast<LTable*>(v.as_pointer());
-        size_t n = clx_find_first_nil(reinterpret_cast<const uint8_t*>(t->array_types), t->array_size);
+        size_t n = table_array_prefix_len(t);
         if (n < t->array_size)
             return static_cast<int64_t>(n);
         int64_t len = static_cast<int64_t>(t->array_size);
