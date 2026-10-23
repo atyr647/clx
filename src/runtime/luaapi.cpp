@@ -2062,7 +2062,7 @@ void lua_upvaluejoin(lua_State *L, int fidx1, int n1, int fidx2, int n2) {
     clx::LUpValue *cell2 = luaapi_upvalue_cell(fn2, n2);
     if (!cell1 || !cell2)
         return;
-    CFuncAdapter *ad1 = fn1->func.target<CFuncAdapter>();
+    const CFuncAdapter *ad1 = fn1->func.target<CFuncAdapter>();
     if (ad1 && ad1->ups && static_cast<size_t>(n1) <= ad1->ups->size())
         (*ad1->ups)[static_cast<size_t>(n1) - 1] = *cell2;
     *cell1 = *cell2;
