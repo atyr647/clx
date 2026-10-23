@@ -50,7 +50,7 @@ struct LocalVar {
         , is_boxed(boxed) { }
 };
 
-//------------------ lookup_builtin: maps "module.func" to C++ function name
+//------------------ lookup_builtin: maps "module.func" to its clx:: CFunc symbol name, else nullptr
 const char *lookup_builtin(std::string_view module, std::string_view func);
 
 //------------------ CodeEmitter: generates C++ source from the AST.
@@ -103,6 +103,9 @@ private:
 
     //------------------ emitXxx: emission logic for one AST NodeType, called from emit_node's dispatcher
     void emitIntrinsicCall(const ASTNode &node, uint32_t node_idx);
+    //------------------ emit_intrinsic_native_body: raw double-context emission of an IntrinsicCall
+    //------------------ (alias call sites synthesize a temp node, so alias lowering shares one path)
+    void emit_intrinsic_native_body(const ASTNode &node);
     void emitCallExpression(const ASTNode &node, uint32_t node_idx);
 
     //------------------ impl_call: call expression for a direct-callable's impl, deref-ing heap holder cells
@@ -184,8 +187,8 @@ private:
     void emit_multi_impl_def(std::string_view name, uint32_t v_idx, uint32_t tuple_n);
     //------------------ native call helpers: native_call_eligible is the pure
 
-    bool native_call_eligible(uint32_t target_idx, uint32_t first_arg, uint32_t arg_count,
-        bool allow_trailing_single = false, int depth = 0);
+    bool native_call_eligible(
+        uint32_t target_idx, uint32_t first_arg, uint32_t arg_count, bool allow_trailing_single = false, int depth = 0);
     //------------------ trailing_single_call: trailing call arg provably yielding exactly 1 value
     //------------------ (native-direct callee, exact arity) — needs no multi-value expansion.
     uint32_t trailing_single_call(uint32_t first_arg, uint32_t arg_count, int depth = 0);
