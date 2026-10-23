@@ -592,6 +592,8 @@ void CodeEmitter::emit(uint32_t root_node, std::string_view module_name) {
             out << "\n";
     }
 
+    if (!state.struct_shapes.empty())
+        out << "namespace {\n";
     for (const auto &_sskv : state.struct_shapes) {
         const StructShape &_ss = _sskv.second;
         out << "struct " << _ss.name << " {";
@@ -608,7 +610,7 @@ void CodeEmitter::emit(uint32_t root_node, std::string_view module_name) {
         out << " };\n";
     }
     if (!state.struct_shapes.empty())
-        out << "\n";
+        out << "} // namespace\n\n";
 
     out << "CLX_API clx::LValue luaopen_" << module_name << "(clx::LState* L) {\n";
     out << "    clx::Frame<16> _fr(L);\n";
