@@ -11,6 +11,7 @@ The format is loosely based on Keep a Changelog and the project follows Semantic
 ### Added
 
 * Centralized std builtin registry (`src/builtins.h`): the single source of truth for parser intrinsic rewrites, alias registration, direct-call lowering and hoisted cfunc selection, with per-entry intrinsic names, runtime symbols, arity floors and numeric-result flags
+* `string.dump()` now works: under `--dynamic`, VM-loaded functions dump to stock-identical bytecode that `load()` reads back (byte-for-byte parity with Lua 5.5, including strip mode, text-mode rejection and upvalue behavior); compiled or C functions dump to a callable snapshot in every build mode instead of throwing
 * Allocation and GC stat counters in the runtime, with a one-line summary report covering table closures, interning, GC and mark/sweep phases
 * New Speed Tips guide (`doc/speedtips.md`, linked from README and docs index) listing the patterns that unlock native fast paths, plus a FAQ entry explaining why the backend is C++20 and not C
 
@@ -30,6 +31,7 @@ The format is loosely based on Keep a Changelog and the project follows Semantic
 * `utf8` now matches stock byte-for-byte: `len`/`codepoint`/`offset`/`codes` errors carry the `file:line:` prefix, `codes` uses the `bad argument #1` shape for leading continuations and errors with zero yields on stray continuations, and `offset(s, 0, i)` returns the correct end position
 * `get_string` coerces numbers like `luaL_checklstring`, with stock `string expected, got <type>` errors otherwise; `%q` escaping and `find`/`match` edge semantics fixed
 * Float-typed locals shadowed by an earlier integer of the same name are no longer misdeclared `int64_t`, so `a // 0` yields `inf` via the float path like stock
+* `load()` without a chunkname now defaults to the source string like stock (was `"[chunk]"`); loading a chunk with no upvalues no longer refs the environment table instead of the function (was `attempt to call a table value` on dumped zero-upvalue functions)
 * Promoted structs are emitted in an anonymous namespace (internal linkage), so same-named shapes in different translation units cannot violate ODR
 * `table.insert`/`table.remove` aliases count as length-changing in table analysis
 * Silenced the Apple Clang deprecated-enum warning coming from upstream sokol headers
@@ -37,6 +39,7 @@ The format is loosely based on Keep a Changelog and the project follows Semantic
 ### Tests
 
 * New cross-TU struct-collision regression test (`struct_odr_main` + `struct_odr_a`/`struct_odr_b`, wired into `run.sh` and `run.bat`): two modules emitting the same struct name with different layouts must link and run correctly
+* New `string_dump` conformance test (bare + `--dynamic` AOT, wired into `run.sh` and `test-load.sh`/`test-load.bat`): snapshot calls, upvalue sharing, multi-returns, strip mode, C-function snapshots, stock error text, and the full bytecode round trip
 
 ---
 
