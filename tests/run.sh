@@ -28,7 +28,7 @@ for dir in conformance regression stress edge_cases; do
         name=$(basename "$file" .lua)
         # Skip files handled by dedicated tests below
         case "$file" in
-            conformance/package.lua|conformance/mymod.lua|conformance/test_native_mod.lua|conformance/test_capi_mod.lua) continue ;;
+            conformance/package.lua|conformance/mymod.lua|conformance/test_native_mod.lua|conformance/test_capi_mod.lua|conformance/struct_odr_main.lua|conformance/struct_odr_a.lua|conformance/struct_odr_b.lua) continue ;;
         esac
         if [ "$(basename "$file")" = "load.lua" ]; then
             echo "SKIP: $file (run tests/test-load.sh to exercise --dynamic)"
@@ -207,6 +207,33 @@ else
     FAIL=$((FAIL + 1))
 fi
 rm -f "$SCRIPT_DIR/package_compile.log" "$SCRIPT_DIR/package_output.log"
+
+# Cross-TU struct shape-name collision (struct_odr_main + struct_odr_a + struct_odr_b)
+echo ""
+echo "--- struct_odr (cross-TU struct name collision) ---"
+ODR_BIN="$SCRIPT_DIR/struct_odr_test"
+"$COMPILER" "$SCRIPT_DIR/conformance/struct_odr_main.lua" "$SCRIPT_DIR/conformance/struct_odr_a.lua" "$SCRIPT_DIR/conformance/struct_odr_b.lua" --output "$ODR_BIN" 2>"$SCRIPT_DIR/struct_odr_compile.log"
+if [ -f "$ODR_BIN" ]; then
+    "$ODR_BIN" > "$SCRIPT_DIR/struct_odr_output.log" 2>&1
+    odr_exit=$?
+    cat "$SCRIPT_DIR/struct_odr_output.log"
+    if [ "$odr_exit" -ne 0 ]; then
+        echo "[FAIL] struct_odr -- runtime exit code $odr_exit"
+        FAIL=$((FAIL + 1))
+    elif grep -q "\[FAIL\]" "$SCRIPT_DIR/struct_odr_output.log"; then
+        echo "[FAIL] struct_odr"
+        FAIL=$((FAIL + 1))
+    else
+        echo "[PASS] struct_odr"
+        PASS=$((PASS + 1))
+    fi
+    rm -f "$ODR_BIN"
+else
+    echo "[FAIL] struct_odr -- compilation failed"
+    cat "$SCRIPT_DIR/struct_odr_compile.log"
+    FAIL=$((FAIL + 1))
+fi
+rm -f "$SCRIPT_DIR/struct_odr_compile.log" "$SCRIPT_DIR/struct_odr_output.log"
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed."
