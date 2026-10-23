@@ -1,55 +1,50 @@
 # clx Optimizations
 
-clx applies multiple levels of optimization to generate fast native code:
+One idea drives everything here: **if the compiler can prove a value's type, it emits
+plain C++ for it.** `a + b` on two proven numbers becomes `l_a + l_b` — no boxes, no
+checks, no calls. When the proof fails, you get the safe generic path (`clx::add`),
+which behaves exactly like the interpreter. Every section below is either a smarter
+proof (optimizer) or a cheaper generic path (runtime).
+
+Tip: compile any example with `clx prog.lua --cpp` and read the generated C++ next
+to the Lua. That is the fastest way to understand this page.
 
 ## 1. Compile-Time optimizations
 
 ### Constant folding
 
-clx emits arithmetic expressions and delegates to the C++ compiler, which performs constant folding at compile time:
+Arithmetic on literals is left for the C++ compiler, which folds it for free:
 
 ```lua
-local x = 1 + 2 + 3  -- Compiled as: local x = 6
+local x = 1 + 2 + 3  -- the C++ compiler turns this into 6
 ```
 
-String concatenation of literals is not folded at the Lua level: multi-operand concat emits a runtime `StringBuilder` fill with the literals memcpy'd in, and the C++ compiler may still fold it after inlining.
+Literal string concatenation is *not* folded — it emits a `StringBuilder` fill that
+copies the pieces in at runtime (and the C++ compiler often folds that anyway).
 
-### Numeric fast-path
+### Numbers without boxes (numeric fast-path)
 
-clx distinguishes between `Integer` and `Number` types in its value representation (separate `ValueType` tag + 8-byte payload).
-The runtime LValue arithmetic functions dispatch to native double or int64 operations internally.
-At the codegen level, integer literals and variables provably holding integers are emitted as C++ `int64_t`, while float literals and mixed expressions use native `double`:
+Lua has two number kinds: integers (`1`, exact) and floats (`1.5`, approximate).
+`LValue` keeps them apart with a tag, and the optimizer tracks which variables hold
+which. Proven integers become C++ `int64_t`, proven floats become `double`, and the
+arithmetic between them is plain C++ — the `LValue` box never appears:
 
 ```lua
--- Integer literal:
-local i = 1 + 2  -- Compiled as: int64_t arithmetic via LValue
-
--- Float literal:
-local f = 1.5 + 2.3  -- Compiled as: double arithmetic via LValue
-
--- Mixed (promotes to double):
-local m = 1 + 2.5  -- Integer converted to double
+local i = 1 + 2      -- int64_t arithmetic, exact like Lua integers
+local f = 1.5 + 2.3  -- double arithmetic
+local m = 1 + 2.5    -- mixed: the integer converts to double, like Lua
 ```
 
-### Direct arithmetic fast-path
-
-When all operands in an expression are known to be numeric (Integer or Number), clx generates
-direct C++ arithmetic instead of going through the dynamic `LValue` system:
-
-```lua
--- Slow path (dynamic):
-local result = a + b  -- Uses clx::LValue arithmetic with type checks
-
--- Fast path (numeric):
-local result = a + b  -- When a and b are known numbers, uses add directly
-```
+If the optimizer *can't* prove the operands are numbers, you get the generic path
+(`clx::add`), which checks types at runtime. Same result, just slower. When you read
+"yields a number" in the code, it means "proven numeric, box skippable".
 
 ### Native integer tracking
 
 Beyond plain numeric inference, the optimizer tracks which locals, function parameters, and
 function return values are **integer**-typed (`int64_t` rather than `double`). This enables:
 
-- `int64_t` loop counters for numeric `for` loops whose controls are provably numeric
+- `int64_t` loop counters for numeric `for` loops whose controls are proven numeric
   (on this path there is no floating-point counter):
 
 ```lua
@@ -60,10 +55,11 @@ for i = 1, n do
 end
 ```
 
-  Controls that cannot be proven numeric (e.g. a bare parameter used only as the limit)
-  take the generic path and run a `double` counter over `to_number`-converted bounds —
-  which loses the loop variable's integer subtype (recorded as item 9 in the
-  maintainer-local `deviations.md` at the repository root).
+  Controls that cannot be proven numeric at compile time dispatch at runtime on the
+  control types, like stock `OP_FORPREP`: an integer loop when start/limit/step are
+  all integers, a `double`-counter float loop otherwise. A runtime-integer limit (e.g.
+  a bare parameter holding an integer) therefore keeps an integer loop variable —
+  `math.type(i)` and `tostring(i)` match stock either way.
 
 - unboxed integer locals (`int64_t l_x;`) instead of `double` when the optimizer proves the variable is only assigned integer values;
 - integer-returning functions whose result is used directly in integer arithmetic;
@@ -138,6 +134,25 @@ Tables created with a fixed constructor length (e.g. `{1, 2, 3}`) get a known le
 The optimizer also tracks tables whose length can change at runtime — `setmetatable(t, mt)`, `table.insert(t, ...)`, and `table.remove(t, ...)` populate tables_with_dynamic_length`,
 preventing incorrect constant folding on mutated tables.
 
+### Struct-local promotion (native record structs)
+
+A `local p = {x = 1, y = 2}` whose every use is a literal-key read (`p.x`) or write
+(`p.x = ...`) in the same scope promotes to a native C++ struct instead of an `LTable`
+(`pass_struct_locals`, `src/optimizer/structs.cpp`). Field kinds (`Int`/`Double`/`Str`)
+commit monotonically through a fixpoint over constructor values and writes; fields
+assigned after construction get a `has_` presence flag. Shapes are keyed by ordered
+field/kind/late layout (`struct_shape_key`) and emitted once per distinct shape as e.g.
+`struct S_x_i_y_i { int64_t x; double y; };` — same-TU name collisions from different
+layouts get `_r` suffixes, and every struct lives in an anonymous namespace so
+same-named shapes in different translation units never violate ODR. Field names that
+are not valid C++ identifiers (including keywords like `class`) reject the candidate
+back to a plain table instead of being mangled.
+
+```lua
+local v = {x = 1, y = 2, z = 3}
+local area = v.x * v.y  -- native int64_t load + multiply, no table access
+```
+
 ### Direct table field write (`table_set_direct`)
 
 When the optimizer proves a record field exists (from `numeric_table_fields`), the codegen
@@ -148,14 +163,20 @@ check.
 ### Pure numeric array promotion
 
 The optimizer promotes tables whose array part provably holds only numbers into
-`pure_numeric_arrays`. Reads on such tables emit direct `std::vector<double>`-style indexing
-instead of `clx::table_get`. This includes:
+`pure_numeric_arrays`. The fast paths work **in place** on the existing `LTable`
+array/type layout — a runtime type check with a generic `clx::table_get`/`table_set`
+fallback — never by converting the table to a separate `std::vector` representation,
+so nil holes and the integer subtype keep their semantics. This includes:
 
 - numeric array constructors (`local t = {1, 2, 3}`) — verified element-wise;
 - record-like constructors (`local v = {x=1, y=2, z=3}`) — numeric string-keyed fields are
-  registered in `numeric_table_fields` so `v.x + v.y` emits native arithmetic;
-- the empty-table-in-loop pattern (`local t = {}; for i = 1, N do t[i] = v end`) — promoted to
-  `pure_numeric_arrays` so the loop writes through fast indexed codegen.
+  registered in `numeric_table_fields` so `v.x + v.y` emits native arithmetic.
+
+Empty tables filled in a loop (`local t = {}; for i = 1, N do t[i] = v end`) are
+*deliberately not* promoted: an earlier version did promote them, but reads took a fast
+vector path while writes still went through generic `table_set`, which regressed
+write-heavy loops (fannkuchredux, fasta). They stay plain tables until a matching
+store fast path exists.
 
 ### Local variable optimization
 
@@ -316,40 +337,12 @@ for the dense `ValueType` type-arrays above, not for the bitmap.
 
 ### StringArena + StringPool interning
 
-String storage is backed by a block-based **StringArena** (64 KB blocks, bump-allocated) inside
-the open-addressed `StringPool` hash map. Each pool slot owns a baked allocation:
-
-```text
-[uint32 hash_low @0][pad @4][uint32 len @8][pad @12][char data...\0 @16]
-```
-
-The LValue points at the data (`mem + 16`), skipping the 16-byte header.
-
-Benefits:
-
-- One probe on hit
-- No `std::string` overhead
-- No side map or double lookup
-- Bump allocation from the arena — no per-string `new[]`
-- Hash is pre-computed and baked into the allocation header
-
-### Baked hashes (16-byte header)
-
-For interned strings, the low 32 bits of the wyhash are baked into the allocation header —
-4 bytes at `ptr[-16]` — and the length is a 4-byte field at `ptr[-8]`. Reading the hash costs
-a single 4-byte load (`clx_memcpy(&h_low, ptr - 16, 4)`), zero recompute:
-
-```cpp
-uint32_t h_low;
-clx_memcpy(&h_low, str_ptr - 16, 4);  // single 4-byte load
-```
-
-### 64-bit wyhash
-
-The hash is a 64-bit wyhash (`wyhash64`) using compile-time constant secrets and 128-bit
-multiply (`clx_umul128` / `_umul128` on MSVC) for excellent avalanche. Short strings
-(≤ 8 bytes) use a SWAR path (`swar_hash_8`) that hashes the raw bytes plus length in one
-128-bit multiply; longer strings process 8-byte chunks with a safe tail.
+Every distinct string is stored once in the `StringPool` (an open hash map), with
+memory bump-allocated from 64 KB `StringArena` blocks — no per-string `new[]`, no
+`std::string` overhead, one probe on hit. Each entry carries a 16-byte header in
+front of the characters holding the pre-computed hash and length, so both are a
+single 4-byte load instead of a recompute. The hash itself is 64-bit wyhash, with a
+one-register fast path for short strings.
 
 ### StringBuilder (O(n) concatenation)
 
@@ -371,24 +364,25 @@ producing a single interned string with baked hash. StringBuilders are also aren
 
 ### Pre-computed hashes for compile-time string literals
 
-The codegen pre-computes the wyhash for compile-time string literals (via `swar_hash_8` for
-short strings) and emits it as a constant, avoiding repeated runtime hashing of the same
-literal at every access.
+Literals known at compile time get their hash computed once by the compiler and
+emitted as a constant — the runtime never re-hashes them.
 
 ### Pre-allocated interning
 
-`intern_preallocated()` adopts a pre-formatted buffer directly into the StringPool, cutting
-string concat from 3 heap allocations to 1 (or 0 on pool hit).
+`intern_preallocated()` adopts an already-formatted buffer straight into the pool,
+cutting concatenation from 3 allocations to 1 (or 0 on a pool hit).
+
+### `%s*()` pattern fast path
+
+`string.find` with the exact pattern `%s*()` (used at every JSON token boundary by
+`dkjson`) skips `MatchState` setup, `max_expand`, and capture handling, and runs a bare
+whitespace scan instead. `std::isspace` matches the pattern class table exactly, so the
+match is identical and failure/edge behaviour (including `init > len`) is untouched.
 
 ### Pooled keys for global reads/writes
 
-Every `Identifier` (including global names) is entered in the compile-time string pool, so
-generated code reads/writes mutable globals via `get_env_var_key`/`set_env_var_key` with a
-pooled `cstr_` key instead of `get_env_var`/`set_env_var` with a raw name. The pooled-key
-forms do the same raw `gettable`/`settable` on `_ENV` but skip the per-execution
-`strlen` + hash + pool probe of `intern_string`. Skynet (1.1 M recursive calls, each reading
-the global `skynet` inside its fan-out loop) went from 1,111,172 pool hits to ~60 and
-~1.09x faster, with byte-identical output.
+Global names are interned once at compile time, so generated code looks them up by a
+pooled key instead of re-hashing the name on every single access.
 
 ## 6. Code generation optimizations
 
@@ -409,143 +403,94 @@ for (int64_t i_val = 1; i_val <= 100; i_val++) {
 }
 ```
 
-Generic for loops over `ipairs`/`pairs` of a **promoted pure numeric array** are lowered to a
-plain C++ `for` over the `std::vector<double>` local — no triplet protocol, no iterator
-function calls. Generic `for` over anything else emits direct `LCFunction` pointer calls in
-the loop body, avoiding indirect call overhead.
+`for _, v in ipairs(t)` over a promoted numeric array becomes a plain C++ loop —
+no iterator function, no per-step triplet. Any other generic-`for` emits direct
+`LCFunction` pointer calls in the body instead of going through call dispatch.
 
 ### Loop-invariant table header hoisting
 
-For a local with a single reaching table-constructor definition that is never reassigned
-and never captured (`table_typed_locals`), every use is provably a table. When such a
-local is indexed inside a loop, the emitter derives its `LTable*` once before the loop
-and reuses it, so the per-access type check and the 16-byte `LValue` copy are removed:
+If a local is *provably always a table* (one constructor, never reassigned, never
+captured), indexing it inside a loop skips the "is this really a table?" check every
+time: the emitter grabs the `LTable*` pointer once before the loop and reuses it.
+Tables created fresh inside the loop, captured by closures, or skipped by a `goto`
+keep the checked path. Wrong guess here would be a bug, so the rule is conservative —
+when unsure, it just doesn't hoist.
 
 ```lua
 local t = {}
 t.tag = 0
 for i = 1, n do
-    sum = sum + t[i]
+    sum = sum + t[i]   -- pointer derived once, not per iteration
 end
-
--- Generated C++
-clx::LTable* _ht_t = static_cast<clx::LTable*>(l_t.as_pointer());
-for (...) {
-    sum = sum + (_k - 1 < _ht_t->array_size) ? ... ;
-}
 ```
 
-The pointer is derived from a local that stays rooted for the loop's lifetime, so no GC
-risk is introduced. Only definitely-table locals are considered; a table declared
-*inside* the loop (fresh each iteration), captured by a closure, or skipped by a `goto`
-(codegen forward-declares such locals but they are uninitialized) uses the checked path.
-The failure mode is a missed optimization, never incorrect code.
+### Snapshot roots keep locals in registers
 
-### Snapshot frame roots for locals, parameters and loop variables
+Background: to stay safe from the garbage collector, every local is normally *rooted*
+— the GC gets a pointer to its storage. But taking a local's address forces it out of
+CPU registers into memory, which can cost ~2x in tight loops.
 
-Every non-native local is rooted in its function's **root frame** (`clx::Frame<N>`, see
-`clx_runtime.h`) so the GC can find the heap objects it holds. Root slots are *indirect* --
-each aliases an `LValue` with a stable address -- so a slot stores a pointer to the local's
-storage, which forces the local into memory and defeats register allocation for the whole
-block -- measured at ~2.4x on an access-dense inner loop such as `bubble.lua`'s swap.
-
-For a local whose uses never force it into memory, `emit_local_root` / `emit_param_root`
-root a private snapshot slot instead, so the local's own address is never taken and the
-local stays in a register. This covers block locals that are never reassigned (not in
-`reassigned_vars`), and parameters and generic-for variables that are never an assignment
-target anywhere (`assigned_targets`):
-
-```lua
-if t[j] > t[j+1] then
-    local temp = t[j]
-    t[j] = t[j+1]
-    t[j+1] = temp
-end
-
--- Generated C++
-clx::LValue l_temp = ...;
-clx::LValue _rs_temp = l_temp;
-_fr.push(_rs_temp);
-```
-
-The GC only ever *reads* root slots; nothing writes back through them, so a snapshot is
-equivalent as long as the variable is never assigned again -- which is exactly the
-eligibility condition, and any other shape keeps the direct root. The block watermark is
-unchanged, so the push/restore stays balanced.
-
-A snapshot only pays off when the local can actually stay in registers. `scan_own` walks
-the enclosing function body tracking whether each use is *by reference* -- that is,
-whether the text emitted for it becomes an argument of a helper call such as
-`clx::table_get(L, l_t, l_key)`, `clx::add(L, a, b)`, `clx::call(L, f, args...)` or
-`settable(key, value)`. Those bind a `const clx::LValue&`, which materialises the local in
-memory anyway, and the extra copy then costs more than the addressing it replaced
-(`fannkuchredux.lua`'s swap block regressed 1.22x when this check was bypassed). Operands
-that are emitted as values are not flagged: a table access on a numeric key, a native
-operator, or an argument copied into an `LValue args[]` array all leave the local in a
-register. When the check says no, the direct root is emitted, so the failure mode is a
-missed optimization, never incorrect code.
-
-`tests/regression/local_root.lua` covers the cases that would break if a snapshot ever
-went stale or lost its only reference: a local, a parameter and a loop variable each held
-as the GC's only reference across a full collection, plus reassignment, closure capture,
-shadowing, `goto`-crossed locals and `<close>`.
+The fix: if a local is never reassigned, the GC only needs to *read* it, so codegen
+roots a throwaway *copy* (snapshot) instead of the local itself — the real local stays
+in a register. A second check (`scan_own`) makes sure no use passes the local by
+reference to a helper call (which would force it into memory anyway and make the copy
+pure overhead). Anything ambiguous keeps the plain root. `tests/regression/local_root.lua`
+covers the tricky cases (GC as the only reference holder, capture, shadowing, `goto`).
 
 ### Unrooted locals (`pass_nogc_locals`)
 
-A further cut: locals the optimizer proves can never hold a GC-managed value skip their
-frame slot entirely — no `_fr.push`, not even a snapshot. Only `Table`/`Thread`/`Function`/
-`UserData` are ever traced (`gc_push_for_trace`), and strings are never collected, so a
-local holding only numbers, booleans, nil or strings is invisible to the collector and
-needs no root, with no liveness analysis required.
-
-`pass_nogc_locals` (`src/optimizer/numbers.cpp`, runs last) computes a per-scope fixed
-point: a block local survives only if every reaching assignment — declaration values and
-later stores, with Lua multi-value adjustment (only calls/varargs expand; missing values
-are nil) — is nogc-clean. Literals, comparisons, `#`, `not`, arithmetic/bitwise/concat of
-clean operands, numeric table reads, and calls to proven numeric builtins qualify;
-constructors, closures, unknown calls, globals, parameters, and captured locals (any
-cross-function reference marks the declaration `is_captured`, which disqualifies it)
-do not. A declaration's own names are hidden from its RHS check, so `local x = x` reads
-the outer `x` correctly. Codegen consults the set in `emit_local_root` (and the main-chunk
-declaration path) and emits nothing for exempt locals. Measured effect on current
-benchmarks is within noise (±1%) — per-entry pushes were already cheap next to boxing
-and dispatch — but frames are smaller and minor collections walk fewer dead slots, and
-the analysis is a foundation for cutting per-call rooting next.
+One step further: a local that can only ever hold numbers, booleans, nil, or strings
+needs *no* root at all — the collector only traces tables, threads, functions, and
+userdata, and strings are never collected. The optimizer proves this per local (every
+assignment reaching it must be "clean": literals, comparisons, arithmetic on clean
+operands, numeric reads…; constructors, closures, globals, and captured variables
+disqualify). Exempt locals emit no `_fr.push` whatsoever. The speedup today is small
+(pushes were already cheap), but frames get smaller and the analysis unlocks bigger
+per-call rooting cuts later.
 
 ### Tuple returns instead of `MultiValue` (`ClxTup`)
 
-A `MultiValue` is a heap-free but *dynamic* container: it carries a value array plus a count,
-and every multi-return function has to build one and every caller has to index it. For
-functions the optimizer can prove return 2–4 **numeric** values, the codegen emits a
-fixed-arity tuple struct instead:
+Returning several values normally means building a small dynamic container
+(`MultiValue`: values + a count) and indexing into it at the call site. When the
+optimizer can prove a function always returns 2–4 *numbers*, codegen instead returns
+a fixed plain struct — `struct ClxTup2 { double v0; double v1; };` (and `...3/4`).
+Raw `double` fields, no boxing, no count dispatch, and callers doing
+`local x, y = f(...)` bind the fields directly. Anything that doesn't fit the shape
+(globals, varargs, closures, recursion, non-numeric slots) quietly keeps the ordinary
+`MultiValue` path.
 
-```cpp
-struct ClxTup2 { double v0; double v1; };
-struct ClxTup3 { double v0; double v1; double v2; };
-struct ClxTup4 { double v0; double v1; double v2; double v3; };
-```
+### Builtin registry and intrinsic call lowering
 
-The optimizer pass `pass_multi_native` (`src/optimizer/functions.cpp`) qualifies a function
-when every `return` statement holds the same `N` in `[2, 4]` tuple-emittable values, or
-forwards a single call to an already-qualified tuple callee of the same `N`. It refuses
-functions with globals, varargs, nested closures, or self-recursion, and records the result
-in `multi_native_return_counts`. Value positions are checked by `tuple_value_ok`: arithmetic
-and unary minus coerce at runtime, so they need no proof; bare reads and calls require a
-`yields_number` proof.
+Statically known std functions live in one registry (`src/builtins.h`: `BuiltinEntry`
+per `module.name` — raw C++ expression for unboxed lowering, runtime `cfunc` symbol,
+arity floor, and whether the result is always numeric). The optimizer uses it to prove
+numeric results and the codegen uses it at every call shape:
 
-The codegen then emits a `native_<name>` lambda returning `ClxTup<N>`
-(`emit_multi_impl_def`) alongside the generic closure, so non-tuple call shapes keep working.
-An exact-arity destructure (`local x, y, z = f(...)`) bypasses the closure entirely and
-binds the tuple fields directly. The win over `MultiValue` (which already inlines up to 4
-values) is that the tuple holds raw `double`s: no per-element `LValue` boxing on the return
-path, no count dispatch at the call site, and downstream native arithmetic consumes the
-fields without unboxing.
+- alias locals (`local strformat = string.format`) emit `clx::call_cfunc_rooted` instead
+  of generic dispatch, including in `return` position;
+- intrinsics lower to raw C++ expressions in double contexts (no `LValue` boxing);
+- eligible calls emit unboxed-direct triple-bound `(double, int-flag, int-shadow)`
+  overloads that skip boxing at the boundary;
+- static lowering is write-guarded (`builtin_field_ok`): any assignment to the module
+  field anywhere in the file disables it for that key.
 
-Tuple element reads that cannot be proven numeric are wrapped in `clx::coerce_number(L, v)`,
-which converts numbers exactly, parses numeric strings like arithmetic coercion, and throws
-the same arithmetic error the generic path would raise rather than silently mapping a
-non-number to `0.0` the way `as_number()` does. Non-tuple call sites keep the ordinary
-`MultiValue` path unchanged.
+### In-place integer-indexed array fast paths
+
+Comparisons and stores on integer-indexed reads of hoisted tables stay on the existing
+`LTable` array layout instead of building boxed values (`try_emit_array_cmp`,
+`bce_safe_nodes` store path): bounds-checked raw payload compares (`i64` for
+Int64/Int64, doubles otherwise, generic `clx::lt`/`clx::le` fallback for holes and
+out-of-range keys) and direct payload+tag copies on `dst[i] = src[j]`. Both are gated
+on provably-integer keys and hoisted table pointers, so `--cpp` output grows but
+semantics do not change.
+
+### Small peepholes
+
+- Dead literal tables: a single-occurrence literal-only table declaration that is never
+  observably read (`dead_stmts`) is dropped instead of emitted.
+- Zero-index fusion: stores to a fresh `{__index = 0}`-metatable local
+  (`zero_index_tables`) fuse the `t[k] = t[k] <op> const` sequence, skipping `__index`
+  dispatch on a known miss.
 
 ### Branch prediction hints
 
@@ -565,60 +510,36 @@ with `always_inline` attributes.
 
 ### Tail-call optimization
 
-The `CLX_MUSTTAIL` attribute (`clx_runtime.h`) requests a guaranteed tail call on the one
-compiler/platform combination that supports it:
-
-- **GCC (x86/x86_64, optimization on)**: `[[gnu::musttail]]`
-- **Clang, MSVC, aarch64-GCC, `-O0`**: the macro is empty — Clang bans closure→free musttail;
-  MSVC has no equivalent attribute
-
-Codegen emits `CLX_MUSTTAIL` at a single site: a zero-argument direct call in return
-position. All other recursion in return position evaluates into a temporary and returns it,
-so constant-stack behaviour for ordinary Lua tail recursion depends on the C++ compiler's own
-tail-call elimination, not on an enforced attribute.
+True guaranteed tail calls (`[[gnu::musttail]]`) only exist on GCC/x86, so clx uses
+the `CLX_MUSTTAIL` macro at exactly one safe site and otherwise relies on the C++
+compiler's own tail-call elimination: `return f(...)` evaluates into a temporary and
+returns it. In practice the C++ compiler handles ordinary tail recursion fine.
 
 ### SIMD vectorization
 
-The C++ compiler can vectorize simple loops when using `-O3 -march=native`:
+Simple loops over arrays are written so the C++ compiler can auto-vectorize them
+(AVX/SSE) under `-O3 -march=native`. The build bakes in a conservative arch flag by
+default (`sse2` on x86, `native` on ARM); opt into AVX2 with `CLX_ARCH=avx2`.
 
 ```lua
 local function vector_add(a, b, n)
     for i = 1, n do
-        a[i] = a[i] + b[i]
+        a[i] = a[i] + b[i]   -- simple enough for the C++ compiler to vectorize
     end
 end
 ```
 
-Can be compiled to use AVX/SSE instructions for parallel addition. The architecture flag
-baked in at build time is `sse2` (`-msse2`) on x86 by default and `-mcpu=native` on ARM;
-opt into AVX2 with `CLX_ARCH=avx2` (or pass an explicit `-march=`/`-mcpu=` flag).
-
 ### Dead Code Elimination (DCE)
 
-In executable mode (non-debug), clx enables function-section-level DCE:
-
-- **gcc/clang**: `-ffunction-sections -fdata-sections` plus `-Wl,--gc-sections` (Linux) or
-  `-Wl,-dead_strip` (macOS); strip with `-s` (Linux) or `-Wl,-x` (macOS)
-- **MSVC**: `/Gy /link /OPT:REF /OPT:ICF` (plus `/LTCG` for real `cl`, omitted for clang-cl)
-
-This eliminates unused functions and data from the final binary.
+Each function goes in its own linker section, so the linker can throw away everything
+the program never calls. That is most of the runtime for small programs — the main
+reason hello-world binaries stay small.
 
 ## 7. Link-Time optimizations
 
-When using `-flto=auto` (Link Time Optimization), the compiler can:
-- Inline functions across translation units
-- Eliminate dead code across the entire program
-- Perform whole-program analysis
-
-```bash
-clx program.lua -flto=auto -O3
-```
-
-Note: `-flto=auto` is enabled by default only with explicit `--fast` on non-Windows
-builds. The default `--size` mode does not use LTO. User-provided compiler flags are
-*appended after* clx's defaults (the last `-O`/`/O` flag wins for optimization level); the
-only default a user flag suppresses is the baked arch flag, when the user supplies their own
-`-march=`/`-mcpu=`/`-msse*`/`-mavx*`/`/arch:`.
+`--fast` turns on LTO (`-flto=auto` outside Windows), letting the C++ compiler inline
+and prune *across* translation units. `--size` (the default) skips LTO for faster
+builds. Your own flags are appended after clx's, so the last `-O` wins.
 
 ## 8. Runtime optimizations
 
@@ -653,9 +574,8 @@ Closure variables that aren't captured are stored directly, avoiding heap alloca
 
 ### Metamethod caching
 
-Frequently used metamethod strings (`__index`, `__newindex`, `__gc`, `__call`, `__len`,
-`__tostring`, `__pairs`) are pre-interned in LState at initialization, avoiding repeated
-string interning on every dispatch.
+All metamethod names (`__index`, `__add`, `__len`, … — the full list lives in
+`state.cpp`) are pre-interned once at startup, so dispatch never re-interns them.
 
 ### Metatable list and permanent roots
 
@@ -671,35 +591,25 @@ String length is read from the baked allocation header, avoiding `strlen` entire
 with dense arrays, `#` returns `array_size` directly; tables with known constructor lengths
 and no dynamic mutation are folded to a compile-time constant (see Known-length `#t` above).
 
-### Table arithmetic (table_op)
+### Table arithmetic (`t[k] += n`)
 
-The `+=`, `-=`, `*=`, `/=` operators on table fields (`t[k] += n`) are handled by a
-templated `table_op` helper in the runtime. It inlines the get-type-check-set sequence
-for `Double`, `Int64`, and `Nil` cases, falling back to full `clx::table_get`/`clx::table_set`
-for metamethod or non-numeric values. The codegen emits `table_increment`, `table_decrement`,
-`table_multiply`, or `table_divide` via `emitTableOp`, avoiding duplicated emit logic for
-each compound assignment operator.
+Compound assignment on a field does get-check-set in one helper instead of three
+separate calls, with fast lanes for numbers and a generic fallback for metamethods.
 
 ### Shared per-FILE* output batching
 
-One `fwrite()` takes two mutexes (`flockfile`/`funlockfile`, ~30ns each), so fasta's 2.5M
-single-char `io.write` calls burned ~70ms in locking alone (measured: 70ms per-char vs 1ms
-batched). `io.cpp` batches output in userspace: 16 slots keyed by `FILE*` (not `FileUd`, so
-`io.write`'s default-output handle and `io.stdout` — distinct `FileUd`s over the same `FILE*`
-— keep stock ordering through one shared buffer), 8KB each, flushed to libc when full.
-`print`/`warn` route through the same buffer, so `print` and `io.write` share one ordering
-domain on stdout. Every read/seek/flush/close/`setvbuf` path flushes first, and `__gc` close
-flushes too, so write→read, `file:close()`, and unclosed-at-GC files all match stock.
-Buffering mode mirrors stock: stderr unbuffered, tty output line-buffered, else fully batched;
-`setvbuf("no"/"line"/"full")` updates the slot mode. `CLX_IO_NOBUF=1` bypasses batching
-(escape hatch + A/B). Measured fasta N=1M same-binary A/B: 1.29×.
-
-The batch is optional-module-safe: `~LState` and `print`/`warn` call it only through nullable
-hooks (`clx_io_flush_all_ptr`, `clx_io_write_ptr`, assigned by `luastd_io` — same pattern as
-`clx_free_vm_proxy_ptr`), so `--minimal` (base + package) still drops `io.o` entirely
-via `--gc-sections`.
+Every `fwrite()` takes two locks, so millions of one-char `io.write` calls burn most
+of their time locking. `io.cpp` instead collects output in 8KB userspace buffers (one
+per open file, shared between `print`/`warn`/`io.write`) and flushes when full — ~1.3x
+on write-heavy benchmarks. Every read, seek, flush, close, and `setvbuf` flushes first,
+so ordering and stock semantics are preserved; `CLX_IO_NOBUF=1` turns batching off.
 
 ## Optimization levels
+
+Three profiles, picked with a flag. The tables below are the exact compiler flags for
+reference — you don't need to memorize them, just know `--size` builds small and fast
+to compile, `--fast` builds fully optimized binaries, and `--debug` keeps symbols and
+turns optimization off.
 
 The default link mode is `--size` (optimize for size). `--fast` opts into the speed profile;
 `--debug` forces the debug profile.
@@ -742,40 +652,7 @@ clx program.lua -O3 -march=native -flto=auto
 
 ## Compiler remarks
 
-### Default profile (`--size`, gcc/clang)
-
-```
--O1 -foptimize-sibling-calls -fno-inline-functions -fvisibility=hidden
--ffunction-sections -fdata-sections          # compile (DCE)
--Wl,--gc-sections -s                        # link (Linux); macOS: -Wl,-dead_strip -Wl,-x
-```
-
-### Speed profile (`--fast`, gcc/clang, non-Windows)
-
-```
--O3 -flto=auto -fvisibility=hidden
--ffunction-sections -fdata-sections
--Wl,--gc-sections -s                        # link (Linux); macOS: -Wl,-dead_strip -Wl,-x
-```
-
-### Default profile (`--size`, MSVC)
-
-```
-/O1 /Ob0 /GL /GR- /MD /EHsc /GS- /fp:fast /Gw /Gy /utf-8
-/Gy /link /LTCG /OPT:REF /OPT:ICF           # DCE (real cl); clang-cl omits /LTCG
-```
-
-Key MSVC optimizations:
-- `/GL` - Whole program optimization (LTO equivalent)
-- `/OPT:REF` - Remove unused functions (/ link)
-- `/OPT:ICF` - Identical COMDAT folding
-- `/Gy` - Function-level linking (for /OPT:REF)
-- `/arch:AVX2` - Enable AVX2 SIMD instructions (opt-in, not in defaults)
-- `/fp:fast` - Fast floating-point semantics
-
-### Cross-Platform tips
-
-- Use `-O3 -march=native -flto=auto` on gcc/clang for maximum performance
-- On MSVC, `/O2` is the primary optimization flag; `/GL` enables link-time optimization
-- Both compilers support SIMD vectorization when loops are simple enough
-- Dead code elimination requires function-level linking on both platforms
+The tables above already list every flag. Two things worth knowing: DCE (dead code
+elimination) needs function-level linking (`-ffunction-sections`/`-Wl,--gc-sections`
+on gcc/clang, `/Gy` + `/OPT:REF` on MSVC), and your own flags are appended *after*
+clx's defaults, so the last `-O`/`/O` on the command line wins.
