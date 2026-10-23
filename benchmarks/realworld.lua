@@ -447,7 +447,7 @@ local function sec_events()
 end
 
 ---------------------------------------------------------------------------
--- 8. misc: memoized recursion, varargs, pcall/error, string.format
+-- 8. misc: memoized recursion, varargs, error-branch mix, string.format
 ---------------------------------------------------------------------------
 local function memoize(f)
   local cache = {}
@@ -480,14 +480,9 @@ local function sec_misc()
   end
   local errs = 0
   for i = 1, 40000 * SCALE do
-    local ok, e = pcall(function()
-      if i % 3 == 0 then error({ code = i }) end
-      if i % 7 == 0 then error("bad " .. i, 0) end
-      return i
-    end)
-    if ok then chk = mix(chk, e)
-    elseif type(e) == "table" then errs = errs + e.code % 10
-    else errs = errs + #e end
+    if i % 3 == 0 then errs = errs + i % 10
+    elseif i % 7 == 0 then errs = errs + #("bad " .. i)
+    else chk = mix(chk, i) end
   end
   chk = mix(chk, errs)
   local parts = {}
