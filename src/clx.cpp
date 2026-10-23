@@ -721,10 +721,13 @@ int main(int argc, char* argv[])
         fs::path cpp_file;
 
         if (emit_cpp) {
-            fs::path cpp_dir = fs::path(output_name + ".cpp").parent_path();
+            std::string per_name = output_name;
+            if (input_files.size() > 1)
+                per_name = custom_output_name.empty() ? module_name : output_name + "_" + module_name;
+            fs::path cpp_dir = fs::path(per_name + ".cpp").parent_path();
             if (!cpp_dir.empty() && !fs::exists(cpp_dir))
                 fs::create_directories(cpp_dir);
-            cpp_file = output_name + ".cpp";
+            cpp_file = per_name + ".cpp";
         } else {
             cpp_file = fs::temp_directory_path() / (module_name + "_tmp.cpp");
         }
