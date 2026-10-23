@@ -630,12 +630,8 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
     if (!is_method_call && node.as.call_expr.target < ctx.nodes.size()
         && native_call_eligible(
             node.as.call_expr.target, node.as.call_expr.first_arg, node.as.call_expr.arg_count, trailing_single_arg)) {
-        if (want_multi)
-            out << "clx::MultiValue(";
-        try_emit_native_call(node.as.call_expr.target, node.as.call_expr.first_arg, node.as.call_expr.arg_count, false,
+        try_emit_native_call(node.as.call_expr.target, node.as.call_expr.first_arg, node.as.call_expr.arg_count, want_multi,
             trailing_single_arg);
-        if (want_multi)
-            out << ")";
         return;
     }
 
@@ -1018,6 +1014,26 @@ void CodeEmitter::emitParenExpression(const ASTNode &node, uint32_t node_idx) {
 }
 
 //------------------ native call helpers (see codegen.h)
+bool CodeEmitter::args_need_sb_decl(uint32_t first_arg, uint32_t arg_count) {
+    std::set<std::string_view> used_sb;
+    for (uint32_t i = 0; i < arg_count; ++i)
+        collect_string_builder_refs(ctx, ctx.block_statements[first_arg + i], state.string_builders, used_sb);
+    for (const auto &sb_name : used_sb) {
+        bool has_enclosing_builder = false;
+        for (auto _it = locals.rbegin(); _it != locals.rend(); ++_it) {
+            if (_it->name == sb_name) {
+                has_enclosing_builder = _it->has_sb;
+                break;
+            }
+        }
+        if (has_enclosing_builder)
+            continue;
+        if (!state.global_string_builders.count(sb_name) && !state.module_string_builders.count(sb_name))
+            return true;
+    }
+    return false;
+}
+
 bool CodeEmitter::native_call_eligible(
     uint32_t target_idx, uint32_t first_arg, uint32_t arg_count, bool allow_trailing_single, int depth) {
     if (target_idx >= ctx.nodes.size() || ctx.nodes[target_idx].type != NodeType::Identifier
@@ -1026,6 +1042,8 @@ bool CodeEmitter::native_call_eligible(
     std::string_view fname(ctx.nodes[target_idx].as.ident.name, ctx.nodes[target_idx].as.ident.length);
     auto npc = state.func_param_counts.find(fname);
     if (state.native_emitted.count(fname) == 0 || npc == state.func_param_counts.end() || arg_count != npc->second)
+        return false;
+    if (arg_count > 0 && args_need_sb_decl(first_arg, arg_count))
         return false;
     if (arg_count > 0) {
         uint32_t last = ctx.block_statements[first_arg + arg_count - 1];
@@ -1055,6 +1073,10 @@ uint32_t CodeEmitter::trailing_single_call(uint32_t first_arg, uint32_t arg_coun
     if (ce.target >= ctx.nodes.size() || ctx.nodes[ce.target].type != NodeType::Identifier
         || ctx.nodes[ce.target].as.ident.is_global)
         return 0xFFFFFFFF;
+    //------------------ a void call contributes zero values, never a trailing single one
+    std::string_view tnm(ctx.nodes[ce.target].as.ident.name, ctx.nodes[ce.target].as.ident.length);
+    if (state.void_funcs.count(tnm) > 0)
+        return 0xFFFFFFFF;
     if (!native_call_eligible(ce.target, ce.first_arg, ce.arg_count, true, depth + 1))
         return 0xFFFFFFFF;
     return nidx;
@@ -1065,8 +1087,15 @@ bool CodeEmitter::try_emit_native_call(
     if (!native_call_eligible(target_idx, first_arg, arg_count, allow_trailing_single))
         return false;
     std::string_view fname(ctx.nodes[target_idx].as.ident.name, ctx.nodes[target_idx].as.ident.length);
-    if (wrap_multi)
-        out << "clx::MultiValue(";
+    //------------------ void callees yield zero values like stock: discard the impl's trailing nil
+    //------------------ instead of boxing it into a one-element MultiValue.
+    bool is_void = state.void_funcs.count(fname) > 0;
+    if (wrap_multi) {
+        if (is_void)
+            out << "(";
+        else
+            out << "clx::MultiValue(";
+    }
     //------------------ inside a triple-bound body, self has the triple signature, so even
     //------------------ self-recursion routes through the boxed wrapper (rare, always correct).
     if (state.in_native_impl && !state.in_dbl_impl && fname == state.current_native_func)
@@ -1078,8 +1107,12 @@ bool CodeEmitter::try_emit_native_call(
         emit_node(ctx.block_statements[first_arg + i]);
     }
     out << ")";
-    if (wrap_multi)
-        out << ")";
+    if (wrap_multi) {
+        if (is_void)
+            out << ", clx::MultiValue())";
+        else
+            out << ")";
+    }
     return true;
 }
 
@@ -1095,6 +1128,8 @@ bool CodeEmitter::dbl_call_eligible(uint32_t target_idx, uint32_t first_arg, uin
         return false;
     auto npc = state.func_param_counts.find(fname);
     if (npc == state.func_param_counts.end() || arg_count != npc->second)
+        return false;
+    if (arg_count > 0 && args_need_sb_decl(first_arg, arg_count))
         return false;
     for (uint32_t i = 0; i < arg_count; ++i) {
         if (!unboxed_arg_ok(ctx.block_statements[first_arg + i]))
