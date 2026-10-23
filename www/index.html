@@ -144,7 +144,9 @@
         .card {
             width: 100%;
             max-width: 1100px;
-            height: 720px;
+            height: min(720px, calc(100vh - 3rem));
+            height: min(720px, calc(100dvh - 3rem));
+            min-height: 0;
             background: var(--card);
             border: 1px solid var(--border);
             border-radius: 16px;
@@ -740,9 +742,9 @@
 
         @media (max-width: 960px) {
             .card {
-                height: 80vh;
-                max-height: 720px;
-                min-height: 480px;
+                height: min(80vh, 720px);
+                max-height: none;
+                min-height: 0;
             }
         }
 
@@ -1533,7 +1535,7 @@ print("Fibonacci(20) = " .. fib(20))</div>
                 </div>
                 <div class="doc-section">
                     <h3>Language Features</h3>
-                    <p>clx supports most Lua 5.5 features including variables, control flow, functions, tables, metatables, coroutines, standard libraries, and bitwise operations. <span class="inline-code">load()</span>, <span class="inline-code">loadfile()</span>, and <span class="inline-code">dofile()</span> are registered only for programs compiled with <span class="inline-code">--dynamic</span>; they execute source in the embedded Lua VM and are absent from ordinary AOT and <span class="inline-code">--minimal</span> builds. <span class="inline-code">require()</span> of Lua file modules through <span class="inline-code">package.path</span> also requires <span class="inline-code">--dynamic</span>: those files are compiled and executed on the embedded VM rather than AOT-compiled. <span class="inline-code">string.dump()</span> is registered in compiled code but always throws <span class="inline-code">string.dump not supported</span>; under <span class="inline-code">--dynamic</span> the embedded engine provides a real implementation for loaded chunks. The <span class="inline-code">debug</span> library is not exposed as a global in either mode — the <span class="inline-code">--dynamic</span> bridge environment does not copy it either.</p>
+                    <p>clx supports most Lua 5.5 features including variables, control flow, functions, tables, metatables, coroutines, standard libraries, and bitwise operations. <span class="inline-code">load()</span>, <span class="inline-code">loadfile()</span>, and <span class="inline-code">dofile()</span> are registered only for programs compiled with <span class="inline-code">--dynamic</span>; they execute source in the embedded Lua VM and are absent from ordinary AOT and <span class="inline-code">--minimal</span> builds. <span class="inline-code">require()</span> of Lua file modules through <span class="inline-code">package.path</span> also requires <span class="inline-code">--dynamic</span>: those files are compiled and executed on the embedded VM rather than AOT-compiled. Under <span class="inline-code">--dynamic</span>, <span class="inline-code">string.dump()</span> of a loaded chunk returns stock-format bytecode that <span class="inline-code">load()</span> reads back; dumping a compiled or C function returns a callable snapshot in every build mode. The <span class="inline-code">debug</span> library is not exposed as a global in either mode — the <span class="inline-code">--dynamic</span> bridge environment does not copy it either.</p>
                     <h4>Variables and Types</h4>
                     <div class="code-block">
                         <div class="code-header"><span class="lang">lua</span></div>
@@ -1843,7 +1845,7 @@ end
                     <ul>
                         <li>Requires compiling with <span class="inline-code">--dynamic</span>; skipped in <span class="inline-code">--minimal</span> builds.</li>
                         <li><span class="inline-code">load</span> accepts a source string only (no reader-function form).</li>
-                        <li><span class="inline-code">string.dump</span> and loading dumped bytecode aren't provided by the compiled runtime; under <span class="inline-code">--dynamic</span> they belong to the embedded engine.</li>
+                        <li><span class="inline-code">string.dump</span> of a compiled or C function returns a callable snapshot, not bytecode; only functions created by <span class="inline-code">load()</span> dump to real bytecode.</li>
                         <li>Tables, metatables, userdata, and coroutines don't share identity across the two environments.</li>
                     </ul>
                     <p>For full details, see <span class="inline-code">doc/dynamic-lua.md</span>.</p>
@@ -2958,7 +2960,7 @@ clx::<span class="fn">type_error</span>(L, 1, <span class="str">"number"</span>,
                         </div>
                         <div class="feature-card">
                             <div class="feature-title"><span class="inline-code">string.dump()</span></div>
-                            <div class="feature-desc">Registered but always throws <span class="inline-code">string.dump not supported</span> in compiled code; the embedded engine has a real implementation when loaded code calls it under <span class="inline-code">--dynamic</span>.</div>
+                            <div class="feature-desc">Under <span class="inline-code">--dynamic</span>, VM-loaded functions dump to stock-format bytecode; compiled or C functions dump to a callable snapshot in every build mode. Non-functions raise stock's error.</div>
                         </div>
                         <div class="feature-card">
                             <div class="feature-title">debug library</div>
