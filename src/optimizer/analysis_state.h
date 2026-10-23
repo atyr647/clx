@@ -8,6 +8,7 @@
 #ifndef ANALYSIS_STATE_H
 #define ANALYSIS_STATE_H
 
+#include "../builtins.h"
 #include "../syntax/nodes.h"
 #include <cstdint>
 #include <map>
@@ -114,6 +115,15 @@ struct AnalysisState {
     std::unordered_map<uint32_t, std::string> hoisted_lookups;
     std::unordered_map<std::string, std::string> hoisted_cfuncs;
     std::unordered_map<std::string, std::string> builtin_aliases;
+    //------------------ intrinsic_aliases: local bound to an intrinsically lowered std function
+    //------------------ (alias name -> registry entry); call sites lower to raw C++ calls.
+    std::map<std::string, const BuiltinEntry *, std::less<>> intrinsic_aliases;
+    //------------------ builtin_field_writes: "module.field" keys written somewhere in this
+    //------------------ module's own code, disqualifying static lowering for that key.
+    std::set<std::string, std::less<>> builtin_field_writes;
+    //------------------ builtin_module_writes: std module globals reassigned wholesale ("math = {}"
+    //------------------ or a dynamic-key write), disqualifying every lowering that reads that module.
+    std::set<std::string, std::less<>> builtin_module_writes;
     std::vector<std::string> const_snapshot_cells;
 
     //------------------ Codegen emission state (mutated as CodeEmitter walks the tree)
@@ -152,8 +162,7 @@ struct AnalysisState {
 };
 
 //------------------ struct_shape_key: canonical shape key for a struct local's field/kind/late layout
-inline std::string struct_shape_key(const StructLocal& sl)
-{
+inline std::string struct_shape_key(const StructLocal &sl) {
     std::string k;
     for (size_t i = 0; i < sl.fields.size(); ++i) {
         if (i)
@@ -168,11 +177,10 @@ inline std::string struct_shape_key(const StructLocal& sl)
 }
 
 //------------------ struct_field_kind: kind of a `p.f` read for a promoted struct local, else Unknown
-inline FieldKind struct_field_kind(const ASTContext& ctx, const AnalysisState& state, uint32_t node_idx)
-{
+inline FieldKind struct_field_kind(const ASTContext &ctx, const AnalysisState &state, uint32_t node_idx) {
     if (node_idx >= ctx.nodes.size() || ctx.nodes[node_idx].type != NodeType::TableAccess)
         return FieldKind::Unknown;
-    const auto& ta = ctx.nodes[node_idx].as.table_access;
+    const auto &ta = ctx.nodes[node_idx].as.table_access;
     if (ta.table >= ctx.nodes.size() || ctx.nodes[ta.table].type != NodeType::Identifier)
         return FieldKind::Unknown;
     if (ta.key >= ctx.nodes.size() || ctx.nodes[ta.key].type != NodeType::String)
@@ -195,12 +203,21 @@ inline FieldKind struct_field_kind(const ASTContext& ctx, const AnalysisState& s
     return FieldKind::Unknown;
 }
 
+//------------------ builtin_field_ok: static builtin module.field is never written in this file
+inline bool builtin_field_ok(const AnalysisState &state, std::string_view module, std::string_view field) {
+    if (state.builtin_module_writes.count(std::string(module)))
+        return false;
+    std::string key(module);
+    key += '.';
+    key.append(field.data(), field.size());
+    return state.builtin_field_writes.count(key) == 0;
+}
+
 //------------------ is_purely_integer_expr: returns true if a node always evaluates to an integer
-inline bool is_purely_integer_expr(const ASTContext& ctx, const AnalysisState& state, uint32_t node_idx)
-{
+inline bool is_purely_integer_expr(const ASTContext &ctx, const AnalysisState &state, uint32_t node_idx) {
     if (node_idx == 0xFFFFFFFF || node_idx >= ctx.nodes.size())
         return false;
-    const auto& n = ctx.nodes[node_idx];
+    const auto &n = ctx.nodes[node_idx];
     if (n.type == NodeType::Integer)
         return true;
     if (n.type == NodeType::Identifier) {
@@ -229,10 +246,9 @@ inline bool is_purely_integer_expr(const ASTContext& ctx, const AnalysisState& s
         if (struct_field_kind(ctx, state, node_idx) == FieldKind::Int)
             return true;
         if (ctx.nodes[n.as.table_access.table].type == NodeType::Identifier) {
-            std::string_view an(ctx.nodes[n.as.table_access.table].as.ident.name,
-                ctx.nodes[n.as.table_access.table].as.ident.length);
-            return state.int_numeric_arrays.count(an) > 0
-                && is_purely_integer_expr(ctx, state, n.as.table_access.key);
+            std::string_view an(
+                ctx.nodes[n.as.table_access.table].as.ident.name, ctx.nodes[n.as.table_access.table].as.ident.length);
+            return state.int_numeric_arrays.count(an) > 0 && is_purely_integer_expr(ctx, state, n.as.table_access.key);
         }
         return false;
     }
@@ -242,10 +258,9 @@ inline bool is_purely_integer_expr(const ASTContext& ctx, const AnalysisState& s
 //------------------ reassigned_with_non_int: true if the variable is assigned a value that is not
 
 inline bool reassigned_with_non_int(
-    const ASTContext& ctx, const AnalysisState& state, std::string_view nm, uint32_t decl_idx)
-{
+    const ASTContext &ctx, const AnalysisState &state, std::string_view nm, uint32_t decl_idx) {
     for (uint32_t ni = 0; ni < ctx.nodes.size(); ++ni) {
-        const auto& n = ctx.nodes[ni];
+        const auto &n = ctx.nodes[ni];
         if (n.type != NodeType::Assignment)
             continue;
         for (uint32_t ti = 0; ti < n.as.assign.target_count; ++ti) {
@@ -265,11 +280,10 @@ inline bool reassigned_with_non_int(
 }
 
 //------------------ is_integer_typed_expr: stricter than is_purely_integer_expr
-inline bool is_integer_typed_expr(const ASTContext& ctx, const AnalysisState& state, uint32_t node_idx)
-{
+inline bool is_integer_typed_expr(const ASTContext &ctx, const AnalysisState &state, uint32_t node_idx) {
     if (node_idx == 0xFFFFFFFF || node_idx >= ctx.nodes.size())
         return false;
-    const auto& n = ctx.nodes[node_idx];
+    const auto &n = ctx.nodes[node_idx];
     if (n.type == NodeType::Integer)
         return true;
     if (n.type == NodeType::Identifier) {
@@ -309,10 +323,9 @@ inline bool is_integer_typed_expr(const ASTContext& ctx, const AnalysisState& st
         if (struct_field_kind(ctx, state, node_idx) == FieldKind::Int)
             return true;
         if (ctx.nodes[n.as.table_access.table].type == NodeType::Identifier) {
-            std::string_view an(ctx.nodes[n.as.table_access.table].as.ident.name,
-                ctx.nodes[n.as.table_access.table].as.ident.length);
-            return state.int_numeric_arrays.count(an) > 0
-                && is_integer_typed_expr(ctx, state, n.as.table_access.key);
+            std::string_view an(
+                ctx.nodes[n.as.table_access.table].as.ident.name, ctx.nodes[n.as.table_access.table].as.ident.length);
+            return state.int_numeric_arrays.count(an) > 0 && is_integer_typed_expr(ctx, state, n.as.table_access.key);
         }
         return false;
     }
@@ -320,8 +333,7 @@ inline bool is_integer_typed_expr(const ASTContext& ctx, const AnalysisState& st
 }
 
 //------------------ owner_of_node: node index of the innermost enclosing FunctionDef (0xFFFFFFFF = file scope)
-inline uint32_t owner_of_node(const AnalysisState& state, uint32_t node_idx)
-{
+inline uint32_t owner_of_node(const AnalysisState &state, uint32_t node_idx) {
     auto it = state.node_func_owner.find(node_idx);
     return it != state.node_func_owner.end() ? it->second : 0xFFFFFFFFu;
 }
