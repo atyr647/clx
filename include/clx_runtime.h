@@ -21,6 +21,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <typeinfo>
 #include <unordered_set>
 #include <vector>
 
@@ -563,8 +564,66 @@ CLX_INLINE_HOT LUpValue make_upvalue(const LValue &val) {
     return std::make_shared<LValue>(val);
 }
 
-//------------------ C function type alias
-using CFunctionType = std::function<MultiValue(LState *, const LValue *, size_t)>;
+//------------------ C function type: single-indirection type erasure over a
+//------------------ shared box. Replaces std::function (which costs ~5 libstdc++
+//------------------ erasure frames per call and per frame unwound per throw) with one
+//------------------ static invoker frame. Copies share the box (a shared_ptr bump),
+//------------------ so captures are never re-copied on closure creation. target<T>()
+//------------------ keeps the two identity queries the runtime needs (CFuncAdapter
+//------------------ for the C API, the raw signature for the direct fast path).
+struct CFunctionType {
+    using Sig = MultiValue (*)(LState *, const LValue *, size_t);
+    using InvokeFn = MultiValue (*)(void *, LState *, const LValue *, size_t);
+    std::shared_ptr<void> box;
+    InvokeFn invoke = nullptr;
+    const std::type_info *type = nullptr;
+
+    CFunctionType() = default;
+    CFunctionType(const CFunctionType &) = default;
+    CFunctionType(CFunctionType &&) = default;
+    CFunctionType &operator=(const CFunctionType &) = default;
+    CFunctionType &operator=(CFunctionType &&) = default;
+    CFunctionType &operator=(std::nullptr_t) {
+        box.reset();
+        invoke = nullptr;
+        type = nullptr;
+        return *this;
+    }
+    template<typename F,
+        typename = std::enable_if_t<!std::is_same_v<std::decay_t<F>, CFunctionType>>>
+    CFunctionType(F &&f) {
+        assign(std::forward<F>(f));
+    }
+    template<typename F,
+        typename = std::enable_if_t<!std::is_same_v<std::decay_t<F>, CFunctionType>>>
+    CFunctionType &operator=(F &&f) {
+        assign(std::forward<F>(f));
+        return *this;
+    }
+    CLX_INLINE_HOT MultiValue operator()(LState *L, const LValue *args, size_t count) const {
+        if (!invoke)
+            throw std::bad_function_call();
+        return invoke(box.get(), L, args, count);
+    }
+    explicit operator bool() const {
+        return invoke != nullptr;
+    }
+    template<typename T> const T *target() const {
+        if (type && *type == typeid(T))
+            return static_cast<const T *>(box.get());
+        return nullptr;
+    }
+
+private:
+    template<typename F> void assign(F &&f) {
+        using D = std::decay_t<F>;
+        box = std::shared_ptr<void>(new D(std::forward<F>(f)));
+        type = &typeid(D);
+        invoke = [](void *p, LState *L, const LValue *a, size_t n) -> MultiValue {
+            return (*static_cast<D *>(p))(L, a, n);
+        };
+    }
+};
 
 struct LCFunction : public LHeader {
     CFunctionType func;
@@ -655,6 +714,9 @@ struct LTable : public LHeader {
     ValueType *array_types;
     size_t array_size;
     size_t array_cap;
+    //------------------ Length hint: array[0..array_lim-1] are all non-nil (array_lim <= array_size).
+    //------------------ A stale-low hint only costs a rescan; writers keep it from ever going stale-high.
+    size_t array_lim;
     TValue small_array[2];
     ValueType small_array_types[2];
 
@@ -683,9 +745,34 @@ private:
 };
 
 static_assert(sizeof(LTable) <= 96, "LTable must be compact (~96 bytes)");
-//------------------ Layout note (#4): hot array fields (array, array_types, array_size, array_cap) directly
-//------------------ follow the 16-byte LHeader, so header + hot fields occupy the first 64-byte cache line on
-//------------------ the t[i] fast path. (No offsetof assert: LTable is non-standard-layout via LHeader.)
+
+//------------------ Length-hint maintenance for a direct array-part write at 0-based idx0 (call only for
+//------------------ slots inside the array part; gap fills above array_size need no update). A nil stored
+//------------------ below the hint pulls it down; a value stored exactly at the hint extends it by one.
+//------------------ Both are O(1); forward progress is recovered by the next length query.
+CLX_INLINE_HOT void table_hint_on_array_write(LTable *t, size_t idx0, ValueType vt) {
+    size_t h = t->array_lim;
+    if (vt == Nil) {
+        if (idx0 < h)
+            t->array_lim = idx0;
+    } else if (idx0 == h) {
+        t->array_lim = h + 1;
+    }
+}
+
+//------------------ Scan the array part for the first nil starting at the hint; heals array_lim to the
+//------------------ boundary found (clamped to array_size). Callers probe integer keys above array_size after.
+CLX_INLINE_HOT size_t table_array_prefix_len(LTable *t) {
+    size_t h = t->array_lim;
+    size_t n = t->array_size;
+    if (h < n)
+        h += clx_find_first_nil(reinterpret_cast<const uint8_t *>(t->array_types) + h, n - h);
+    t->array_lim = h;
+    return h;
+}
+//------------------ Layout note (#4): hot array fields (array, array_types, array_size, array_cap, array_lim)
+//------------------ directly follow the 16-byte LHeader, so header + hot fields occupy the first 64-byte cache
+//------------------ line on the t[i] fast path. (No offsetof assert: LTable is non-standard-layout via LHeader.)
 
 //------------------ Generational write barrier
 
@@ -1263,6 +1350,7 @@ struct LState {
     const char *current_file;
     int current_line;
 
+
     //------------------ call-site context for stock luaL_argerror semantics: pending_* is set by generated//------------------ code before dispatch; a C-function wrapper moves it into arg_* for the callee to read.
     //------------------ pending_* is a stack: codegen pushes the saved frame (call_ctx_push) at the start of every
     //------------------ call-expression lambda and pops (call_ctx_pop) before restore. Nested evaluation (callee
@@ -1756,7 +1844,7 @@ CLX_INLINE void call_ctx_pop(LState *L) {
 
 //------------------ Rooted call wrapper for direct C function pointers (hoisted builtins, direct impls)
 //------------------ call_cfunc_rooted_impl: shared body for the overloads below. Templated so the
-//------------------ raw-pointer overload still skips std::function construction on hot builtin calls.
+//------------------ raw-pointer overload still skips CFunctionType construction on hot builtin calls.
 template<typename CFunc>
 CLX_INLINE_HOT MultiValue call_cfunc_rooted_impl(
     LState *L, CFunc f, const LValue *args, size_t count, const char *file, int line) {
@@ -1774,7 +1862,7 @@ CLX_INLINE_HOT MultiValue call_cfunc_rooted(
     return call_cfunc_rooted_impl(L, f, args, count, file, line);
 }
 
-//------------------ Raw pointer overload: skips std::function construction on hot builtin calls
+//------------------ Raw pointer overload: skips CFunctionType construction on hot builtin calls
 CLX_INLINE_HOT MultiValue call_cfunc_rooted(
     LState *L, RawCFunction f, const LValue *args, size_t count, const char *file, int line) {
     return call_cfunc_rooted_impl(L, f, args, count, file, line);
@@ -1783,6 +1871,23 @@ CLX_INLINE_HOT MultiValue call_cfunc_rooted(
 //------------------ Roots args[] across the direct-call fast path; else collections inside the callee miss survivor-aged args.
 CLX_INLINE_HOT MultiValue call_cfunc_direct(
     LState *L, const CFunctionType &f, const LValue *args, size_t count, const char *file = "", int line = 0) {
+    RootRange rr(L, const_cast<LValue *>(args), args ? count : 0);
+    CallCtxGuard cg(L);
+    if (line > 0) {
+        L->current_file = file;
+        L->current_line = line;
+    }
+    return f(L, args, count);
+}
+
+//------------------ Unboxed overload: invokes a concrete callable (a codegen lambda)
+//------------------ with no type erasure at all — no box, no indirection frame, and the
+//------------------ call is visible to the C++ compiler for inlining. Exact-match F wins
+//------------------ overload resolution over the CFunctionType conversion, while
+//------------------ CFunctionType arguments still prefer the non-template above.
+template<typename F>
+CLX_INLINE_HOT MultiValue call_cfunc_direct(
+    LState *L, const F &f, const LValue *args, size_t count, const char *file = "", int line = 0) {
     RootRange rr(L, const_cast<LValue *>(args), args ? count : 0);
     CallCtxGuard cg(L);
     if (line > 0) {
@@ -2947,15 +3052,19 @@ CLX_INLINE_COLD LValue len(LState *L, const LValue &a) {
     }
 
     if (t->array_size > 0) {
-        size_t n = clx_find_first_nil(reinterpret_cast<const uint8_t *>(t->array_types), t->array_size);
+        size_t n = table_array_prefix_len(t);
+        size_t hc = (t->ext != nullptr) ? t->ext->hash_count : 0;
         if (n == t->array_size) {
-            size_t hc = (t->ext != nullptr) ? t->ext->hash_count : 0;
             if (hc == 0)
                 return LValue(static_cast<int64_t>(t->array_size));
             LValue next = t->gettable(LValue(static_cast<int64_t>(t->array_size + 1)));
             if (next.type == ValueType::Nil)
                 return LValue(static_cast<int64_t>(t->array_size));
+        } else if (hc == 0) {
+            //------------------ hole inside a hash-free array part: the prefix scan found the border
+            return LValue(static_cast<int64_t>(n));
         }
+        //------------------ holes with integer keys above the array part: fall through to the probe below
     }
 
     int64_t lo = 0;
@@ -3261,6 +3370,7 @@ CLX_INLINE void table_set(LState *L, const LValue &obj, const LValue &key, const
                 t->array_types[k - 1] = val.type;
                 if (static_cast<size_t>(k) > t->array_size)
                     t->array_size = static_cast<size_t>(k);
+                table_hint_on_array_write(t, static_cast<size_t>(k) - 1, val.type);
                 return;
             }
         } else if (key.type == ValueType::Double) {
@@ -3274,6 +3384,7 @@ CLX_INLINE void table_set(LState *L, const LValue &obj, const LValue &key, const
                 t->array_types[idx - 1] = val.type;
                 if (static_cast<size_t>(idx) > t->array_size)
                     t->array_size = static_cast<size_t>(idx);
+                table_hint_on_array_write(t, static_cast<size_t>(idx) - 1, val.type);
                 return;
             }
         }
@@ -3351,6 +3462,7 @@ CLX_INLINE void table_set_int(LState *L, const LValue &obj, size_t idx, const LV
             t->array_types[idx - 1] = val.type;
             if (static_cast<size_t>(idx) > t->array_size)
                 t->array_size = idx;
+            table_hint_on_array_write(t, idx - 1, val.type);
             return;
         }
         gc_barrier_table(L, t, val);
@@ -3480,6 +3592,7 @@ MultiValue table_sort(LState *, const LValue *, size_t);
 MultiValue table_pack(LState *, const LValue *, size_t);
 MultiValue table_unpack(LState *, const LValue *, size_t);
 MultiValue table_move(LState *, const LValue *, size_t);
+MultiValue table_create(LState *, const LValue *, size_t);
 
 //------------------ math module (math.cpp); extern for direct-call lowering via the builtin registry
 MultiValue math_abs(LState *, const LValue *, size_t);
@@ -3507,6 +3620,19 @@ MultiValue math_tan(LState *, const LValue *, size_t);
 MultiValue math_tointeger(LState *, const LValue *, size_t);
 MultiValue math_type(LState *, const LValue *, size_t);
 MultiValue math_ult(LState *, const LValue *, size_t);
+
+//------------------ os module (os.cpp); extern for direct-call lowering via the builtin registry
+MultiValue os_clock(LState *, const LValue *, size_t);
+MultiValue os_date(LState *, const LValue *, size_t);
+MultiValue os_difftime(LState *, const LValue *, size_t);
+MultiValue os_execute(LState *, const LValue *, size_t);
+MultiValue os_exit(LState *, const LValue *, size_t);
+MultiValue os_getenv(LState *, const LValue *, size_t);
+MultiValue os_remove(LState *, const LValue *, size_t);
+MultiValue os_rename(LState *, const LValue *, size_t);
+MultiValue os_setlocale(LState *, const LValue *, size_t);
+MultiValue os_time(LState *, const LValue *, size_t);
+MultiValue os_tmpname(LState *, const LValue *, size_t);
 
 void luastd_base(LState *L);
 //------------------ Per-function base registrars (base.cpp): each registers exactly one global so the
