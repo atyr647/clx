@@ -25,41 +25,49 @@
 
 namespace clx {
 
+//------------------ emit_intrinsic_native_body: raw double-context emission of an IntrinsicCall node
+void CodeEmitter::emit_intrinsic_native_body(const ASTNode &n) {
+    const char *_cn = n.as.intrinsic_call.cname;
+    if (strcmp(_cn, "__clx_deg") == 0 || strcmp(_cn, "__clx_rad") == 0) {
+        if (n.as.intrinsic_call.arg_count > 0) {
+            emit_native(ctx.block_statements[n.as.intrinsic_call.first_arg]);
+            out << (_cn[7] == 'd' ? " * 57.29577951308232" : " * 0.017453292519943295");
+        } else
+            out << "0.0";
+        return;
+    }
+    if (strcmp(_cn, "std::log") == 0 && n.as.intrinsic_call.arg_count > 1) {
+        out << "std::log(";
+        emit_native(ctx.block_statements[n.as.intrinsic_call.first_arg]);
+        out << ") / std::log(";
+        emit_native(ctx.block_statements[n.as.intrinsic_call.first_arg + 1]);
+        out << ")";
+        return;
+    }
+    //------------------ Lua's math.atan(y, x) is atan2 when given two arguments
+    const char *fn = _cn;
+    if (strcmp(_cn, "std::atan") == 0 && n.as.intrinsic_call.arg_count > 1)
+        fn = "std::atan2";
+    out << fn << "(";
+    if (n.as.intrinsic_call.arg_count > 0) {
+        emit_native(ctx.block_statements[n.as.intrinsic_call.first_arg]);
+        if (n.as.intrinsic_call.arg_count > 1
+            && (strcmp(fn, "std::fmod") == 0 || strcmp(fn, "std::atan2") == 0 || strcmp(fn, "std::pow") == 0)) {
+            out << ", ";
+            emit_native(ctx.block_statements[n.as.intrinsic_call.first_arg + 1]);
+        }
+    } else
+        out << "0.0";
+    out << ")";
+}
+
 //------------------ emit_native: emits an expression coerced to a raw C++ double
 void CodeEmitter::emit_native(uint32_t n_idx) {
 
     if (yields_number(ctx, state, n_idx, nullptr, state.current_fast_func)) {
         const auto &n = ctx.nodes[n_idx];
         if (n.type == NodeType::IntrinsicCall) {
-            const char *_cn = n.as.intrinsic_call.cname;
-            if (strcmp(_cn, "__clx_deg") == 0 || strcmp(_cn, "__clx_rad") == 0) {
-                if (n.as.intrinsic_call.arg_count > 0) {
-                    emit_native(ctx.block_statements[n.as.intrinsic_call.first_arg]);
-                    out << (_cn[7] == 'd' ? " * 57.29577951308232" : " * 0.017453292519943295");
-                } else
-                    out << "0.0";
-                return;
-            }
-            if (strcmp(_cn, "std::log") == 0 && n.as.intrinsic_call.arg_count > 1) {
-                out << "std::log(";
-                emit_native(ctx.block_statements[n.as.intrinsic_call.first_arg]);
-                out << ") / std::log(";
-                emit_native(ctx.block_statements[n.as.intrinsic_call.first_arg + 1]);
-                out << ")";
-                return;
-            }
-            out << _cn << "(";
-            if (n.as.intrinsic_call.arg_count > 0) {
-                emit_native(ctx.block_statements[n.as.intrinsic_call.first_arg]);
-                if (n.as.intrinsic_call.arg_count > 1
-                    && (strcmp(_cn, "std::fmod") == 0 || strcmp(_cn, "std::atan2") == 0
-                        || strcmp(_cn, "std::pow") == 0)) {
-                    out << ", ";
-                    emit_native(ctx.block_statements[n.as.intrinsic_call.first_arg + 1]);
-                }
-            } else
-                out << "0.0";
-            out << ")";
+            emit_intrinsic_native_body(n);
             return;
         }
         if (n.type == NodeType::Number) {
@@ -301,8 +309,7 @@ void CodeEmitter::emit_native(uint32_t n_idx) {
                 emit_native(n.as.table_access.key);
                 out << ") - 1; auto* _t" << n_idx << " = static_cast<clx::LTable*>(_b" << n_idx
                     << ".as_pointer()); return (_idx" << n_idx << " < _t" << n_idx << "->array_size) ? clx::LValue(_t"
-                    << n_idx << "->array[_idx" << n_idx << "], _t" << n_idx << "->array_types[_idx" << n_idx
-                    << "])";
+                    << n_idx << "->array[_idx" << n_idx << "], _t" << n_idx << "->array_types[_idx" << n_idx << "])";
                 if (state.in_multi_impl)
                     out << " : ";
                 else
@@ -341,6 +348,22 @@ void CodeEmitter::emit_native(uint32_t n_idx) {
                     out << ", 0.0";
                 out << ")";
                 return;
+            }
+            //------------------ local alias of an intrinsically lowered std function: raw double body
+            if (!fname.empty()) {
+                auto _ait = state.intrinsic_aliases.find(std::string(fname));
+                if (_ait != state.intrinsic_aliases.end() && state.reassigned_vars.count(std::string(fname)) == 0
+                    && _ait->second->intrinsic && _ait->second->numeric
+                    && n.as.call_expr.arg_count >= _ait->second->min_args) {
+                    ASTNode _tmp { };
+                    _tmp.type = NodeType::IntrinsicCall;
+                    _tmp.line = n.line;
+                    _tmp.as.intrinsic_call.cname = _ait->second->intrinsic;
+                    _tmp.as.intrinsic_call.first_arg = n.as.call_expr.first_arg;
+                    _tmp.as.intrinsic_call.arg_count = n.as.call_expr.arg_count;
+                    emit_intrinsic_native_body(_tmp);
+                    return;
+                }
             }
         }
     }
@@ -452,12 +475,15 @@ void CodeEmitter::emitIntrinsicCall(const ASTNode &node, uint32_t node_idx) {
             emit_native(ctx.block_statements[node.as.intrinsic_call.first_arg + 1]);
             out << ")";
         } else {
-            out << _cn << "(";
+            //------------------ Lua's math.atan(y, x) is atan2 when given two arguments
+            const char *fn = _cn;
+            if (strcmp(_cn, "std::atan") == 0 && node.as.intrinsic_call.arg_count > 1)
+                fn = "std::atan2";
+            out << fn << "(";
             if (node.as.intrinsic_call.arg_count > 0) {
                 emit_native(ctx.block_statements[node.as.intrinsic_call.first_arg]);
                 if (node.as.intrinsic_call.arg_count > 1
-                    && (strcmp(_cn, "std::fmod") == 0 || strcmp(_cn, "std::atan2") == 0
-                        || strcmp(_cn, "std::pow") == 0)) {
+                    && (strcmp(fn, "std::fmod") == 0 || strcmp(fn, "std::atan2") == 0 || strcmp(fn, "std::pow") == 0)) {
                     out << ", ";
                     emit_native(ctx.block_statements[node.as.intrinsic_call.first_arg + 1]);
                 }
@@ -502,6 +528,26 @@ std::string CodeEmitter::gc_cells_arg(const std::string &exclude) {
     if (out_list.empty())
         return "";
     return "std::vector<clx::LUpValue>{ " + out_list + " }";
+}
+
+//------------------ builtin_cfunc_target: registry CFunc symbol for a direct module.func call
+//------------------ target, else nullptr (shadowed/reassigned module or written field falls back)
+static const char *builtin_cfunc_target(const ASTContext &ctx, const AnalysisState &state, uint32_t target_idx) {
+    if (target_idx >= ctx.nodes.size() || ctx.nodes[target_idx].type != NodeType::TableAccess)
+        return nullptr;
+    const auto &ta = ctx.nodes[target_idx].as.table_access;
+    if (ta.table >= ctx.nodes.size() || ta.key >= ctx.nodes.size())
+        return nullptr;
+    if (ctx.nodes[ta.table].type != NodeType::Identifier || !ctx.nodes[ta.table].as.ident.is_global)
+        return nullptr;
+    if (ctx.nodes[ta.key].type != NodeType::String)
+        return nullptr;
+    std::string_view mod(ctx.nodes[ta.table].as.ident.name, ctx.nodes[ta.table].as.ident.length);
+    std::string_view key(ctx.nodes[ta.key].as.string.text, ctx.nodes[ta.key].as.string.length);
+    if (!builtin_field_ok(state, mod, key))
+        return nullptr;
+    const BuiltinEntry *be = builtin_lookup(mod, key);
+    return be ? be->cfunc : nullptr;
 }
 
 //------------------ emitCallExpression: handles NodeType::CallExpression
@@ -582,15 +628,38 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
     bool trailing_single_arg = !is_method_call
         && trailing_single_call(node.as.call_expr.first_arg, node.as.call_expr.arg_count) != 0xFFFFFFFF;
     if (!is_method_call && node.as.call_expr.target < ctx.nodes.size()
-        && native_call_eligible(node.as.call_expr.target, node.as.call_expr.first_arg,
-            node.as.call_expr.arg_count, trailing_single_arg)) {
+        && native_call_eligible(
+            node.as.call_expr.target, node.as.call_expr.first_arg, node.as.call_expr.arg_count, trailing_single_arg)) {
         if (want_multi)
             out << "clx::MultiValue(";
-        try_emit_native_call(node.as.call_expr.target, node.as.call_expr.first_arg, node.as.call_expr.arg_count,
-            false, trailing_single_arg);
+        try_emit_native_call(node.as.call_expr.target, node.as.call_expr.first_arg, node.as.call_expr.arg_count, false,
+            trailing_single_arg);
         if (want_multi)
             out << ")";
         return;
+    }
+
+    //------------------ builtin intrinsic alias: a local bound to an intrinsically lowered std
+    //------------------ function lowers to a raw call. Fast/dbl/native/direct conflicts above
+    //------------------ returned already; calls below min_args keep generic dispatch so the
+    //------------------ runtime CFunc validates arity like stock Lua.
+    if (!is_method_call && !is_direct && !fname.empty() && state.reassigned_vars.count(std::string(fname)) == 0) {
+        auto _ait = state.intrinsic_aliases.find(std::string(fname));
+        if (_ait != state.intrinsic_aliases.end() && _ait->second->intrinsic
+            && node.as.call_expr.arg_count >= _ait->second->min_args) {
+            if (want_multi)
+                out << "clx::MultiValue(";
+            ASTNode _tmp { };
+            _tmp.type = NodeType::IntrinsicCall;
+            _tmp.line = node.line;
+            _tmp.as.intrinsic_call.cname = _ait->second->intrinsic;
+            _tmp.as.intrinsic_call.first_arg = node.as.call_expr.first_arg;
+            _tmp.as.intrinsic_call.arg_count = node.as.call_expr.arg_count;
+            emitIntrinsicCall(_tmp, node_idx);
+            if (want_multi)
+                out << ")";
+            return;
+        }
     }
 
     bool last_expands = false;
@@ -686,15 +755,18 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
                 << ctx.filename << "\", " << node.line << ");\n";
         } else if (!is_method_call && node.as.call_expr.target < ctx.nodes.size()
             && ctx.nodes[node.as.call_expr.target].type == NodeType::TableAccess) {
+            const char *_dcf = nullptr;
             auto _chit = state.hoisted_lookups.find(node.as.call_expr.target);
             if (_chit != state.hoisted_lookups.end()) {
                 auto _cf_it = state.hoisted_cfuncs.find(_chit->second);
-                if (_cf_it != state.hoisted_cfuncs.end()) {
-                    out << "    clx::MultiValue _main_ret = clx::call_cfunc_rooted(L, clx::" << _cf_it->second
-                        << ", _dyn_buf, _dyn_count, \"" << ctx.filename << "\", " << node.line << ");\n";
-                } else {
-                    goto _call_direct_dyn;
-                }
+                if (_cf_it != state.hoisted_cfuncs.end())
+                    _dcf = _cf_it->second.c_str();
+            }
+            if (!_dcf)
+                _dcf = builtin_cfunc_target(ctx, state, node.as.call_expr.target);
+            if (_dcf) {
+                out << "    clx::MultiValue _main_ret = clx::call_cfunc_rooted(L, clx::" << _dcf
+                    << ", _dyn_buf, _dyn_count, \"" << ctx.filename << "\", " << node.line << ");\n";
             } else {
                 goto _call_direct_dyn;
             }
@@ -802,8 +874,7 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
             }
             if (_sub1) {
                 out << "    size_t _ssaved = _fr.mark();\n";
-                out << "    for (size_t i = 0; i < " << node.as.call_expr.arg_count
-                    << "; ++i) _fr.push(args[i]);\n";
+                out << "    for (size_t i = 0; i < " << node.as.call_expr.arg_count << "; ++i) _fr.push(args[i]);\n";
                 out << "    clx::MultiValue _main_ret;\n";
                 if (_subvar) {
                     out << "    int64_t _sk = 0;\n";
@@ -833,16 +904,18 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
                     << node.as.call_expr.arg_count << ", \"" << ctx.filename << "\", " << node.line << ");\n";
             } else if (!is_method_call && node.as.call_expr.target < ctx.nodes.size()
                 && ctx.nodes[node.as.call_expr.target].type == NodeType::TableAccess) {
+                const char *_dcf = nullptr;
                 auto _chit = state.hoisted_lookups.find(node.as.call_expr.target);
                 if (_chit != state.hoisted_lookups.end()) {
                     auto _cf_it = state.hoisted_cfuncs.find(_chit->second);
-                    if (_cf_it != state.hoisted_cfuncs.end()) {
-                        out << "    clx::MultiValue _main_ret = clx::call_cfunc_rooted(L, clx::" << _cf_it->second
-                            << ", args, " << node.as.call_expr.arg_count << ", \"" << ctx.filename << "\", "
-                            << node.line << ");\n";
-                    } else {
-                        goto _call_direct_normal;
-                    }
+                    if (_cf_it != state.hoisted_cfuncs.end())
+                        _dcf = _cf_it->second.c_str();
+                }
+                if (!_dcf)
+                    _dcf = builtin_cfunc_target(ctx, state, node.as.call_expr.target);
+                if (_dcf) {
+                    out << "    clx::MultiValue _main_ret = clx::call_cfunc_rooted(L, clx::" << _dcf << ", args, "
+                        << node.as.call_expr.arg_count << ", \"" << ctx.filename << "\", " << node.line << ");\n";
                 } else {
                     goto _call_direct_normal;
                 }
@@ -877,15 +950,18 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
                     << ctx.filename << "\", " << node.line << ");\n";
             } else if (!is_method_call && node.as.call_expr.target < ctx.nodes.size()
                 && ctx.nodes[node.as.call_expr.target].type == NodeType::TableAccess) {
+                const char *_dcf = nullptr;
                 auto _chit = state.hoisted_lookups.find(node.as.call_expr.target);
                 if (_chit != state.hoisted_lookups.end()) {
                     auto _cf_it = state.hoisted_cfuncs.find(_chit->second);
                     if (_cf_it != state.hoisted_cfuncs.end())
-                        out << "    clx::MultiValue _main_ret = clx::call_cfunc_rooted(L, clx::" << _cf_it->second
-                            << ", nullptr, 0, \"" << ctx.filename << "\", " << node.line << ");\n";
-                    else {
-                        goto _call_direct_normal2;
-                    }
+                        _dcf = _cf_it->second.c_str();
+                }
+                if (!_dcf)
+                    _dcf = builtin_cfunc_target(ctx, state, node.as.call_expr.target);
+                if (_dcf) {
+                    out << "    clx::MultiValue _main_ret = clx::call_cfunc_rooted(L, clx::" << _dcf
+                        << ", nullptr, 0, \"" << ctx.filename << "\", " << node.line << ");\n";
                 } else {
                     goto _call_direct_normal2;
                 }
@@ -942,8 +1018,8 @@ void CodeEmitter::emitParenExpression(const ASTNode &node, uint32_t node_idx) {
 }
 
 //------------------ native call helpers (see codegen.h)
-bool CodeEmitter::native_call_eligible(uint32_t target_idx, uint32_t first_arg, uint32_t arg_count,
-    bool allow_trailing_single, int depth) {
+bool CodeEmitter::native_call_eligible(
+    uint32_t target_idx, uint32_t first_arg, uint32_t arg_count, bool allow_trailing_single, int depth) {
     if (target_idx >= ctx.nodes.size() || ctx.nodes[target_idx].type != NodeType::Identifier
         || ctx.nodes[target_idx].as.ident.is_global)
         return false;
@@ -984,8 +1060,8 @@ uint32_t CodeEmitter::trailing_single_call(uint32_t first_arg, uint32_t arg_coun
     return nidx;
 }
 
-bool CodeEmitter::try_emit_native_call(uint32_t target_idx, uint32_t first_arg, uint32_t arg_count, bool wrap_multi,
-    bool allow_trailing_single) {
+bool CodeEmitter::try_emit_native_call(
+    uint32_t target_idx, uint32_t first_arg, uint32_t arg_count, bool wrap_multi, bool allow_trailing_single) {
     if (!native_call_eligible(target_idx, first_arg, arg_count, allow_trailing_single))
         return false;
     std::string_view fname(ctx.nodes[target_idx].as.ident.name, ctx.nodes[target_idx].as.ident.length);
@@ -1028,8 +1104,7 @@ bool CodeEmitter::dbl_call_eligible(uint32_t target_idx, uint32_t first_arg, uin
 }
 
 bool CodeEmitter::dbl_self_ref(uint32_t target_idx) {
-    if (!state.in_dbl_impl || target_idx >= ctx.nodes.size()
-        || ctx.nodes[target_idx].type != NodeType::Identifier)
+    if (!state.in_dbl_impl || target_idx >= ctx.nodes.size() || ctx.nodes[target_idx].type != NodeType::Identifier)
         return false;
     std::string_view tn(ctx.nodes[target_idx].as.ident.name, ctx.nodes[target_idx].as.ident.length);
     return tn == state.current_native_func;
@@ -1204,8 +1279,7 @@ bool CodeEmitter::try_emit_array_cmp(int cmp_op, uint32_t l_idx, uint32_t r_idx,
         arr_ret2 = "clx::LValue((";
         arr_tail = "); })()";
     }
-    out << arr_open << lp << "; clx::LTable* _cb = " << rp
-        << "; int64_t _ka = static_cast<int64_t>(";
+    out << arr_open << lp << "; clx::LTable* _cb = " << rp << "; int64_t _ka = static_cast<int64_t>(";
     emit_native(lk);
     out << "); int64_t _kb = static_cast<int64_t>(";
     emit_native(rk);
@@ -1214,12 +1288,11 @@ bool CodeEmitter::try_emit_array_cmp(int cmp_op, uint32_t l_idx, uint32_t r_idx,
            " clx::ValueType _tya = _ca->array_types[_ka - 1]; clx::ValueType _tyb = _cb->array_types[_kb - 1];"
            " if (_tya == clx::ValueType::Int64 && _tyb == clx::ValueType::Int64) [[likely]]"
            " return "
-        << arr_ret1
-        << "_ca->array[_ka - 1].payload.i64 "
-        << cmp << arr_ret1_end
+        << arr_ret1 << "_ca->array[_ka - 1].payload.i64 " << cmp << arr_ret1_end
         << " if ((_tya == clx::ValueType::Int64 || _tya == clx::ValueType::Double)"
            " && (_tyb == clx::ValueType::Int64 || _tyb == clx::ValueType::Double)) return "
-        << arr_ret2 << "_tya == clx::ValueType::Int64 ? static_cast<double>(_ca->array[_ka - 1].payload.i64)"
+        << arr_ret2
+        << "_tya == clx::ValueType::Int64 ? static_cast<double>(_ca->array[_ka - 1].payload.i64)"
            " : _ca->array[_ka - 1].payload.f64) "
         << cmp
         << " (_tyb == clx::ValueType::Int64 ? static_cast<double>(_cb->array[_kb - 1].payload.i64)"
@@ -1747,6 +1820,23 @@ void CodeEmitter::emitString(const ASTNode &node, uint32_t node_idx) {
 
 //------------------ emitTableAccess: handles NodeType::TableAccess
 void CodeEmitter::emitTableAccess(const ASTNode &node, uint32_t node_idx) {
+    //------------------ std constant field fold: math.huge and friends lower to a boxed literal
+    {
+        uint32_t _ti = node.as.table_access.table;
+        uint32_t _ki = node.as.table_access.key;
+        if (_ti < ctx.nodes.size() && _ki < ctx.nodes.size() && ctx.nodes[_ti].type == NodeType::Identifier
+            && ctx.nodes[_ti].as.ident.is_global && ctx.nodes[_ki].type == NodeType::String) {
+            std::string_view _cm(ctx.nodes[_ti].as.ident.name, ctx.nodes[_ti].as.ident.length);
+            std::string_view _ck(ctx.nodes[_ki].as.string.text, ctx.nodes[_ki].as.string.length);
+            if (builtin_field_ok(state, _cm, _ck)) {
+                const BuiltinConst *_bc = builtin_const_lookup(_cm, _ck);
+                if (_bc) {
+                    out << _bc->boxed;
+                    return;
+                }
+            }
+        }
+    }
     {
         auto hit = state.hoisted_lookups.find(node_idx);
         if (hit != state.hoisted_lookups.end()) {
