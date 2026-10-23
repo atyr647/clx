@@ -81,49 +81,183 @@ void pass_constants_and_bounds(const ASTContext &ctx, AnalysisState &state, Pass
         }
     }
 
-    state.numeric_builtin_aliases.clear();
+    //------------------ alias shadow names: any parameter or loop variable binding whose name would
+    //------------------ shadow a local std-builtin alias; a use could bind to it instead, so the
+    //------------------ name is disqualified program-wide (params live in block_statements, the
+    //------------------ named vararg ident is a direct node index).
+    std::set<std::string, std::less<>> alias_shadow_names;
     for (const auto &node : ctx.nodes) {
-        uint32_t t_idx = 0xFFFFFFFF, v_idx = 0xFFFFFFFF;
-        if (node.type == NodeType::LocalDecl && node.as.local_decl.ident_count == 1
-            && node.as.local_decl.value_count == 1) {
-            t_idx = ctx.block_statements[node.as.local_decl.first_ident];
-            v_idx = ctx.block_statements[node.as.local_decl.first_value];
-        } else if (node.type == NodeType::Assignment && node.as.assign.target_count == 1
-            && node.as.assign.value_count == 1) {
-            t_idx = ctx.block_statements[node.as.assign.first_target];
-            v_idx = ctx.block_statements[node.as.assign.first_value];
+        if (node.type == NodeType::FunctionDef) {
+            for (uint32_t i = 0; i < node.as.func_def.param_count; ++i) {
+                uint32_t pi = ctx.block_statements[node.as.func_def.first_param + i];
+                if (pi < ctx.nodes.size() && ctx.nodes[pi].type == NodeType::Identifier)
+                    alias_shadow_names.insert(std::string(ctx.nodes[pi].as.ident.name, ctx.nodes[pi].as.ident.length));
+            }
+            uint32_t vgi = node.as.func_def.named_vararg_ident;
+            if (vgi != 0xFFFFFFFF && vgi < ctx.nodes.size() && ctx.nodes[vgi].type == NodeType::Identifier)
+                alias_shadow_names.insert(std::string(ctx.nodes[vgi].as.ident.name, ctx.nodes[vgi].as.ident.length));
+        } else if (node.type == NodeType::ForStatement && node.as.for_stmt.var_ident < ctx.nodes.size()
+            && ctx.nodes[node.as.for_stmt.var_ident].type == NodeType::Identifier) {
+            const auto &vn = ctx.nodes[node.as.for_stmt.var_ident];
+            alias_shadow_names.insert(std::string(vn.as.ident.name, vn.as.ident.length));
+        } else if (node.type == NodeType::GenericForStatement) {
+            for (uint32_t i = 0; i < node.as.generic_for.var_count; ++i) {
+                uint32_t vi = ctx.block_statements[node.as.generic_for.first_var + i];
+                if (vi < ctx.nodes.size() && ctx.nodes[vi].type == NodeType::Identifier)
+                    alias_shadow_names.insert(std::string(ctx.nodes[vi].as.ident.name, ctx.nodes[vi].as.ident.length));
+            }
+        }
+    }
+
+    //------------------ std module field/module writes: any assignment that can replace a builtin
+    //------------------ value or the module table itself disables static lowering for that key.
+    state.builtin_field_writes.clear();
+    state.builtin_module_writes.clear();
+    for (const auto &node : ctx.nodes) {
+        uint32_t first_t = 0, t_count = 0;
+        if (node.type == NodeType::Assignment) {
+            first_t = node.as.assign.first_target;
+            t_count = node.as.assign.target_count;
+        } else if (node.type == NodeType::GlobalDeclStatement) {
+            first_t = node.as.global_decl.first_ident;
+            t_count = node.as.global_decl.ident_count;
         } else {
             continue;
         }
-        if (t_idx >= ctx.nodes.size() || v_idx >= ctx.nodes.size())
-            continue;
-        if (ctx.nodes[t_idx].type != NodeType::Identifier || ctx.nodes[v_idx].type != NodeType::TableAccess)
-            continue;
-        const auto &ta = ctx.nodes[v_idx].as.table_access;
-        if (ta.table >= ctx.nodes.size() || ta.key >= ctx.nodes.size())
-            continue;
-        if (ctx.nodes[ta.table].type != NodeType::Identifier || ctx.nodes[ta.key].type != NodeType::String)
-            continue;
-        std::string_view mod(ctx.nodes[ta.table].as.ident.name, ctx.nodes[ta.table].as.ident.length);
-        std::string_view key(ctx.nodes[ta.key].as.string.text, ctx.nodes[ta.key].as.string.length);
-        if (mod != "math")
-            continue;
-        static const char *numeric_fns[] = { "abs", "acos", "asin", "atan", "atan2", "ceil", "cos",
-            "cosh", "deg", "exp", "floor", "fmod", "log", "max", "min", "pow", "rad", "sin",
-            "sinh", "sqrt", "tan", "tanh", nullptr };
-        bool is_num = false;
-        for (const char **f = numeric_fns; *f; ++f) {
-            if (key == *f) {
-                is_num = true;
-                break;
+        for (uint32_t i = 0; i < t_count; ++i) {
+            uint32_t t = ctx.block_statements[first_t + i];
+            if (t >= ctx.nodes.size())
+                continue;
+            const auto &tn = ctx.nodes[t];
+            if (tn.type == NodeType::Identifier) {
+                std::string_view nm(tn.as.ident.name, tn.as.ident.length);
+                if (is_std_module_name(nm))
+                    state.builtin_module_writes.insert(std::string(nm));
+                continue;
+            }
+            if (tn.type != NodeType::TableAccess)
+                continue;
+            std::vector<uint32_t> path;
+            uint32_t cur = t;
+            while (cur < ctx.nodes.size() && ctx.nodes[cur].type == NodeType::TableAccess) {
+                path.push_back(ctx.nodes[cur].as.table_access.key);
+                cur = ctx.nodes[cur].as.table_access.table;
+            }
+            if (cur >= ctx.nodes.size() || ctx.nodes[cur].type != NodeType::Identifier)
+                continue;
+            std::reverse(path.begin(), path.end());
+            std::string_view root(ctx.nodes[cur].as.ident.name, ctx.nodes[cur].as.ident.length);
+            bool root_is_g = root == "_G";
+            bool root_is_mod = is_std_module_name(root);
+            if (!root_is_g && !root_is_mod)
+                continue;
+            auto key_str = [&](uint32_t ki) -> std::string_view {
+                if (ki >= ctx.nodes.size() || ctx.nodes[ki].type != NodeType::String)
+                    return { };
+                return std::string_view(ctx.nodes[ki].as.string.text, ctx.nodes[ki].as.string.length);
+            };
+            //------------------ dynamic-key write: any module field could be replaced
+            std::string_view k0 = path.empty() ? std::string_view { } : key_str(path[0]);
+            if (k0.empty()) {
+                if (root_is_g) {
+                    for (const auto &m : kStdModules)
+                        state.builtin_module_writes.insert(std::string(m));
+                } else {
+                    state.builtin_module_writes.insert(std::string(root));
+                }
+                continue;
+            }
+            if (root_is_g && is_std_module_name(k0)) {
+                //------------------ _G.module[.field] = ... resolves one level against the module
+                if (path.size() == 1)
+                    state.builtin_module_writes.insert(std::string(k0));
+                else if (!key_str(path[1]).empty() && path.size() == 2)
+                    state.builtin_field_writes.insert(std::string(k0) + "." + std::string(key_str(path[1])));
+                else
+                    state.builtin_module_writes.insert(std::string(k0));
+                continue;
+            }
+            if (path.size() == 1) {
+                std::string fk(root);
+                fk += '.';
+                fk.append(k0.data(), k0.size());
+                state.builtin_field_writes.insert(std::move(fk));
+            } else if (root_is_g) {
+                //------------------ _G.<non-module>[...] = ... cannot be a registry field chain
+                std::string fk(root);
+                fk += '.';
+                fk.append(k0.data(), k0.size());
+                state.builtin_field_writes.insert(std::move(fk));
+            } else {
+                state.builtin_module_writes.insert(std::string(root));
             }
         }
-        if (!is_num)
+    }
+
+    //------------------ alias registration: local targets bound to registry std functions gain
+    //------------------ intrinsic/cfunc/numeric lowering; multi-name declarations pair index-wise.
+    state.numeric_builtin_aliases.clear();
+    state.intrinsic_aliases.clear();
+    state.builtin_aliases.clear();
+    for (const auto &node : ctx.nodes) {
+        uint32_t first_t = 0, t_count = 0, first_v = 0, v_count = 0;
+        if (node.type == NodeType::LocalDecl) {
+            first_t = node.as.local_decl.first_ident;
+            t_count = node.as.local_decl.ident_count;
+            first_v = node.as.local_decl.first_value;
+            v_count = node.as.local_decl.value_count;
+        } else if (node.type == NodeType::Assignment) {
+            first_t = node.as.assign.first_target;
+            t_count = node.as.assign.target_count;
+            first_v = node.as.assign.first_value;
+            v_count = node.as.assign.value_count;
+        } else {
             continue;
-        std::string_view alias(ctx.nodes[t_idx].as.ident.name, ctx.nodes[t_idx].as.ident.length);
-        if (state.reassigned_vars.count(alias))
-            continue;
-        state.numeric_builtin_aliases.emplace(alias);
+        }
+        uint32_t pair = std::min(t_count, v_count);
+        for (uint32_t i = 0; i < pair; ++i) {
+            uint32_t t = ctx.block_statements[first_t + i];
+            uint32_t v = ctx.block_statements[first_v + i];
+            if (t >= ctx.nodes.size() || v >= ctx.nodes.size())
+                continue;
+            const auto &tn = ctx.nodes[t];
+            if (tn.type != NodeType::Identifier || tn.as.ident.is_global)
+                continue;
+            std::string_view alias(tn.as.ident.name, tn.as.ident.length);
+            if (state.reassigned_vars.count(alias) || alias_shadow_names.count(alias))
+                continue;
+            const BuiltinEntry *be = nullptr;
+            const auto &vn = ctx.nodes[v];
+            if (vn.type == NodeType::TableAccess) {
+                uint32_t ti = vn.as.table_access.table;
+                uint32_t ki = vn.as.table_access.key;
+                if (ti >= ctx.nodes.size() || ki >= ctx.nodes.size())
+                    continue;
+                if (ctx.nodes[ti].type != NodeType::Identifier || !ctx.nodes[ti].as.ident.is_global
+                    || ctx.nodes[ki].type != NodeType::String)
+                    continue;
+                std::string_view mod(ctx.nodes[ti].as.ident.name, ctx.nodes[ti].as.ident.length);
+                std::string_view key(ctx.nodes[ki].as.string.text, ctx.nodes[ki].as.string.length);
+                if (!builtin_field_ok(state, mod, key))
+                    continue;
+                be = builtin_lookup(mod, key);
+            } else if (vn.type == NodeType::Identifier && vn.as.ident.is_global) {
+                std::string_view gname(vn.as.ident.name, vn.as.ident.length);
+                if (!builtin_field_ok(state, "_G", gname))
+                    continue;
+                be = builtin_lookup("_G", gname);
+            } else {
+                continue;
+            }
+            if (!be || !be->alias_ok)
+                continue;
+            if (be->intrinsic)
+                state.intrinsic_aliases[std::string(alias)] = be;
+            if (be->cfunc)
+                state.builtin_aliases[std::string(alias)] = be->cfunc;
+            if (be->numeric)
+                state.numeric_builtin_aliases.insert(std::string(alias));
+        }
     }
 
     auto block_writes_table = [&](auto &self, uint32_t block_idx, std::string_view table_name) -> bool {
@@ -691,8 +825,33 @@ void pass_int_returns_masks(const ASTContext &ctx, AnalysisState &state, PassScr
                         continue;
                     if (v.type == NodeType::Identifier) {
                         std::string_view n(v.as.ident.name, v.as.ident.length);
-                        if (state.native_integers.count(std::string(n)))
-                            continue;
+                        if (state.native_integers.count(std::string(n))) {
+                            uint32_t ret_owner = owner_of_node(state, si);
+                            bool poisoned = false;
+                            for (uint32_t k = 0; k < ctx.nodes.size() && !poisoned; ++k) {
+                                const auto &dn = ctx.nodes[k];
+                                if (dn.type != NodeType::LocalDecl)
+                                    continue;
+                                if (owner_of_node(state, k) != ret_owner)
+                                    continue;
+                                for (uint32_t ii = 0; ii < dn.as.local_decl.ident_count; ++ii) {
+                                    uint32_t idi = ctx.block_statements[dn.as.local_decl.first_ident + ii];
+                                    if (idi >= ctx.nodes.size() || ctx.nodes[idi].type != NodeType::Identifier)
+                                        continue;
+                                    std::string_view iname(
+                                        ctx.nodes[idi].as.ident.name, ctx.nodes[idi].as.ident.length);
+                                    if (iname != n)
+                                        continue;
+                                    uint32_t viu = (ii < dn.as.local_decl.value_count)
+                                        ? ctx.block_statements[dn.as.local_decl.first_value + ii]
+                                        : 0xFFFFFFFF;
+                                    if (viu == 0xFFFFFFFF || !is_purely_integer_expr(ctx, state, viu))
+                                        poisoned = true;
+                                }
+                            }
+                            if (!poisoned)
+                                continue;
+                        }
                         if (loop_vars.count(n))
                             continue;
                     }
@@ -1001,8 +1160,8 @@ static bool nogc_is_expanding(const ASTContext &ctx, uint32_t node_idx) {
 //------------------ stock Lua) binary/unary operators on non-table/userdata operands never consult
 //------------------ metamethods (find_bin_metamethod checks Table/UserData only), so arithmetic,
 //------------------ bitwise, concat and comparisons of non-GC operands yield plain values or throw.
-static bool nogc_rhs_ok(const ASTContext &ctx, const AnalysisState &state,
-    const std::set<std::string_view> &cands, uint32_t node_idx, int depth) {
+static bool nogc_rhs_ok(const ASTContext &ctx, const AnalysisState &state, const std::set<std::string_view> &cands,
+    uint32_t node_idx, int depth) {
     if (depth > 64 || node_idx == 0xFFFFFFFF || node_idx >= ctx.nodes.size())
         return false;
     const auto &n = ctx.nodes[node_idx];
@@ -1053,8 +1212,7 @@ static bool nogc_rhs_ok(const ASTContext &ctx, const AnalysisState &state,
         std::string_view nm(n.as.ident.name, n.as.ident.length);
         if (cands.count(nm))
             return true;
-        if (std::find(state.native_numbers.begin(), state.native_numbers.end(), nm)
-            != state.native_numbers.end())
+        if (std::find(state.native_numbers.begin(), state.native_numbers.end(), nm) != state.native_numbers.end())
             return true;
         if (state.int_typed_locals.count(std::string(nm)))
             return true;
