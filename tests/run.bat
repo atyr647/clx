@@ -35,7 +35,7 @@ set FAIL=0
 :: Walk through subdirectories
 for %%D in (conformance regression stress compiler_killers edge_cases) do (
     if exist "%%D" (
-        for /f "delims=" %%F in ('dir /b "%%D\*.lua" 2^>nul ^| findstr /v /i "^package\.lua$ ^mymod\.lua$ ^test_native_mod\.lua$ ^test_capi_mod\.lua$ ^load\.lua$"') do (
+        for /f "delims=" %%F in ('dir /b "%%D\*.lua" 2^>nul ^| findstr /v /i "^package\.lua$ ^mymod\.lua$ ^test_native_mod\.lua$ ^test_capi_mod\.lua$ ^load\.lua$ ^struct_odr_main\.lua$ ^struct_odr_a\.lua$ ^struct_odr_b\.lua$"') do (
             set "name=%%~nF"
             set "prefix=%%D_!name!"
 
@@ -330,6 +330,35 @@ if exist "%MULTI_BIN%" (
     set /a FAIL+=1
 )
 del /f /q "%SCRIPT_DIR%\package_compile.log" >nul 2>&1
+
+:: ----------------------------------------------------------------------
+:: Cross-TU struct shape-name collision (struct_odr_main + a + b)
+:: ----------------------------------------------------------------------
+echo.
+echo --- struct_odr (cross-TU struct name collision) ---
+
+set "ODR_BIN=%SCRIPT_DIR%\struct_odr_test.exe"
+
+"%COMPILER%" "%SCRIPT_DIR%\conformance\struct_odr_main.lua" "%SCRIPT_DIR%\conformance\struct_odr_a.lua" "%SCRIPT_DIR%\conformance\struct_odr_b.lua" --output "%ODR_BIN%" > "%SCRIPT_DIR%\struct_odr_compile.log" 2>&1
+if exist "%ODR_BIN%" (
+    "%ODR_BIN%" > "%SCRIPT_DIR%\struct_odr_output.log" 2>&1
+    set "ODR_EXIT=!errorlevel!"
+    type "%SCRIPT_DIR%\struct_odr_output.log"
+    if !ODR_EXIT! neq 0 (
+        echo [FAIL] struct_odr -- runtime exit code !ODR_EXIT!
+        set /a FAIL+=1
+    ) else (
+        findstr /c:"[FAIL]" "%SCRIPT_DIR%\struct_odr_output.log" >nul 2>&1
+        if !errorlevel! equ 0 ( echo [FAIL] struct_odr & set /a FAIL+=1 ) else ( echo [PASS] struct_odr & set /a PASS+=1 )
+    )
+    del /f /q "%ODR_BIN%" >nul 2>&1
+    del /f /q "%SCRIPT_DIR%\struct_odr_output.log" >nul 2>&1
+) else (
+    echo [FAIL] struct_odr -- compilation failed
+    type "%SCRIPT_DIR%\struct_odr_compile.log"
+    set /a FAIL+=1
+)
+del /f /q "%SCRIPT_DIR%\struct_odr_compile.log" >nul 2>&1
 
 echo.
 echo Results: %PASS% passed, %FAIL% failed.
