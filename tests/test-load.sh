@@ -51,11 +51,30 @@ cat "$LOG"
 # not propagate fail_count through their exit status.
 if [ "$RUN_EXIT" -eq 0 ] && grep -Eq '^[[:space:]]*fail[[:space:]]*:[[:space:]]*0[[:space:]]*$' "$LOG"; then
     echo "[PASS] load-mode test suite"
-    exit 0
+else
+    echo "[FAIL] load-mode test suite"
+    if [ "$RUN_EXIT" -ne 0 ]; then
+        echo "Harness exit code: $RUN_EXIT"
+    fi
+    exit 1
 fi
 
-echo "[FAIL] load-mode test suite"
-if [ "$RUN_EXIT" -ne 0 ]; then
-    echo "Harness exit code: $RUN_EXIT"
+# AOT-side string.dump coverage: the same test the default suite runs bare,
+# compiled with --dynamic so the VM round-trip section executes with a real
+# AOT caller on the clx side of the bridge.
+echo "Compiling tests/conformance/string_dump.lua with --dynamic..."
+DUMP_BIN="$TMP_DIR/dump_dynamic"
+DUMP_LOG="$TMP_DIR/dump_dynamic.log"
+if ! "$COMPILER" --dynamic tests/conformance/string_dump.lua --output "$DUMP_BIN"; then
+    echo "[FAIL] Could not compile the AOT-side dump test."
+    exit 1
 fi
-exit 1
+"$DUMP_BIN" >"$DUMP_LOG" 2>&1
+DUMP_EXIT=$?
+cat "$DUMP_LOG"
+if [ "$DUMP_EXIT" -ne 0 ] || grep -q "\[FAIL\]" "$DUMP_LOG"; then
+    echo "[FAIL] AOT-side string.dump (--dynamic)"
+    exit 1
+fi
+echo "[PASS] AOT-side string.dump (--dynamic)"
+exit 0
