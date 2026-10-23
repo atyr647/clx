@@ -130,6 +130,7 @@ target_include_directories(clx_lua PUBLIC
 # the bridge's clx:: references resolve to libclx.a at link time.
 target_sources(clx_lua PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../load_builtin.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../dump_builtin.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../dynamic_vm.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../vm_convert.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../vm_function_object.cpp
