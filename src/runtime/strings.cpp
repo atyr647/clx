@@ -7,6 +7,7 @@
 
 #include "../include/clx_simd.h"
 #include "clx_runtime.h"
+#include "internal.h"
 #include <algorithm>
 #include <cctype>
 #include <climits>
@@ -267,9 +268,15 @@ MultiValue str_char(LState *L, const LValue *args, size_t count) {
     return result;
 }
 
-//------------------ str_dump — string.dump: stub (not supported)
+//------------------ str_dump — string.dump: VM-backed when linked with --dynamic (see
+//------------------ dump_builtin.cpp); in bare builds no bytecode exists, so a function dumps to
+//------------------ itself as its own callable snapshot
 MultiValue str_dump(LState *L, const LValue *args, size_t count) {
-    throw_runtime_error("string.dump not supported");
+    if (clx_string_dump_hook)
+        return clx_string_dump_hook(L, args, count);
+    if (count < 1 || args[0].type != Function || args[0].as_pointer() == nullptr)
+        throw_runtime_error(bad_arg_msg(L, 1, "string.dump", "Lua function expected"));
+    return MultiValue(args[0]);
 }
 
 //------------------ get2digits — skip up to 2 decimal digits (stock lstrlib.c)
