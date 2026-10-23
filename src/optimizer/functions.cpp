@@ -347,12 +347,24 @@ void pass_callables(const ASTContext &ctx, AnalysisState &state, PassScratch &sk
     //------------------ native-direct qualification: LOCAL, non-reassigned,
 
     for (const auto &ldnode : ctx.nodes) {
-        if (ldnode.type != NodeType::LocalDecl)
+        uint32_t t_idx = 0xFFFFFFFF;
+        uint32_t v_idx = 0xFFFFFFFF;
+        if (ldnode.type == NodeType::LocalDecl) {
+            if (ldnode.as.local_decl.ident_count != 1 || ldnode.as.local_decl.value_count != 1)
+                continue;
+            t_idx = ctx.block_statements[ldnode.as.local_decl.first_ident];
+            v_idx = ctx.block_statements[ldnode.as.local_decl.first_value];
+        } else if (ldnode.type == NodeType::Assignment) {
+            //------------------ assignment-defined functions (e.g. mutually recursive `expr`)
+            //------------------ qualify with the same checks; forward references degrade to the
+            //------------------ generic cell path via native_emitted gating at codegen time.
+            if (ldnode.as.assign.target_count != 1 || ldnode.as.assign.value_count != 1)
+                continue;
+            t_idx = ctx.block_statements[ldnode.as.assign.first_target];
+            v_idx = ctx.block_statements[ldnode.as.assign.first_value];
+        } else {
             continue;
-        if (ldnode.as.local_decl.ident_count != 1 || ldnode.as.local_decl.value_count != 1)
-            continue;
-        uint32_t t_idx = ctx.block_statements[ldnode.as.local_decl.first_ident];
-        uint32_t v_idx = ctx.block_statements[ldnode.as.local_decl.first_value];
+        }
         if (ctx.nodes[t_idx].type != NodeType::Identifier || ctx.nodes[t_idx].as.ident.is_global)
             continue;
         if (ctx.nodes[v_idx].type != NodeType::FunctionDef)
@@ -376,8 +388,9 @@ void pass_callables(const ASTContext &ctx, AnalysisState &state, PassScratch &sk
                         return;
                     }
                     if (n.type == NodeType::Identifier) {
-                        if (n.as.ident.is_global)
-                            nd_ok = false;
+                        //------------------ globals resolve through _G exactly like locals (chunk
+                        //------------------ locals are _G-registered), so only nested closures are
+                        //------------------ unsound here: their cells would freeze by-value impl params.
                         return;
                     }
                     if (n.type == NodeType::Vararg) {
@@ -472,8 +485,20 @@ void pass_callables(const ASTContext &ctx, AnalysisState &state, PassScratch &sk
                 };
                 nd_scan(nd_scan, fn.as.func_def.body_block);
 
+                //------------------ void functions (no ReturnStatement owned by the body) skip the
+                //------------------ all-paths-return proof: every path falls through to the impl's
+                //------------------ trailing nil return, which is exactly stock's zero-value result.
+                bool has_return = false;
+                for (uint32_t oi = 0; oi < ctx.nodes.size(); ++oi) {
+                    auto oit = state.node_func_owner.find(oi);
+                    if (oit != state.node_func_owner.end() && oit->second == v_idx
+                        && ctx.nodes[oi].type == NodeType::ReturnStatement) {
+                        has_return = true;
+                        break;
+                    }
+                }
                 bool nd_exact = nd_ok && nd_single && !nd_callret;
-                if (nd_exact) {
+                if (nd_exact && has_return) {
 
                     auto apr = [&](auto &self, uint32_t bidx) -> bool {
                         if (bidx == 0xFFFFFFFF || bidx >= ctx.nodes.size())
@@ -617,8 +642,11 @@ void pass_callables(const ASTContext &ctx, AnalysisState &state, PassScratch &sk
                     };
                     sscan(sscan, fn.as.func_def.body_block);
                 }
-                if (nd_ok && nd_exact)
+                if (nd_ok && nd_exact) {
                     state.native_direct_funcs.insert(fname);
+                    if (!has_return)
+                        state.void_funcs.insert(fname);
+                }
             }
         }
     }
