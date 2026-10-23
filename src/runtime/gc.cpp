@@ -83,6 +83,7 @@ static void gc_dispose_swept(LState *L, LHeader *curr) {
                 t->ext->hash_tombs = 0;
             }
             t->array_size = 0;
+            t->array_lim = 0;
             if (t->array && t->array != t->small_array) {
                 t->next = L->free_tables_big;
                 L->free_tables_big = t;
@@ -171,6 +172,7 @@ static void gc_drain_finalizables(LState *L) {
             t->ext->meta_next = nullptr;
         }
         t->array_size = t->array_cap = 0;
+        t->array_lim = 0;
         t->flags &= ~(LFLAG_META_LIST | LFLAG_FINALIZABLE);
         if (t->array && t->array != t->small_array) {
             t->next = L->free_tables_big;
