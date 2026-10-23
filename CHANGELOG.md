@@ -6,6 +6,102 @@ The format is loosely based on Keep a Changelog and the project follows Semantic
 
 ---
 
+## [0.5.0] - 2026-10-25
+
+### Added
+
+* Centralized std builtin registry (`src/builtins.h`): the single source of truth for parser intrinsic rewrites, alias registration, direct-call lowering and hoisted cfunc selection, with per-entry intrinsic names, runtime symbols, arity floors and numeric-result flags
+* Allocation and GC stat counters in the runtime, with a one-line summary report covering table closures, interning, GC and mark/sweep phases
+* New Speed Tips guide (`doc/speedtips.md`, linked from README and docs index) listing the patterns that unlock native fast paths, plus a FAQ entry explaining why the backend is C++20 and not C
+
+### Changed
+
+* Numeric-`for` loops dispatch on the runtime control types like stock `OP_FORPREP`: integer controls keep an integer loop variable, so `math.type(i)` and `tostring(i)` match Lua where the old `double` counter did not
+* Multi-file `--cpp` emits one translation unit per input module instead of only the entry chunk
+* String escapes decode once at parse time with `file:line` errors, and the parser resolves captures/globals/symbols while parsing
+* Builtin and intrinsic calls lower through one shared path: alias call sites synthesize temp nodes, tail calls emit raw calls before generic dispatch, and direct module calls qualified by the builtin registry prove numeric
+* Smarter numeric inference: function parameters used in arithmetic and loop/array bounds are detected as numeric, and integer classification is re-validated at declaration sites
+* `math.*` runtime entries have external linkage so per-function registrar tables can reference them
+* Struct promotion rejects non-identifier field names outright instead of mangling them with a suffix
+* Repo hygiene: `article.md` and `deviations.md` are excluded via `.git/info/exclude` (local-only) instead of `.gitignore`
+
+### Fixed
+
+* `utf8` now matches stock byte-for-byte: `len`/`codepoint`/`offset`/`codes` errors carry the `file:line:` prefix, `codes` uses the `bad argument #1` shape for leading continuations and errors with zero yields on stray continuations, and `offset(s, 0, i)` returns the correct end position
+* `get_string` coerces numbers like `luaL_checklstring`, with stock `string expected, got <type>` errors otherwise; `%q` escaping and `find`/`match` edge semantics fixed
+* Float-typed locals shadowed by an earlier integer of the same name are no longer misdeclared `int64_t`, so `a // 0` yields `inf` via the float path like stock
+* Promoted structs are emitted in an anonymous namespace (internal linkage), so same-named shapes in different translation units cannot violate ODR
+* `table.insert`/`table.remove` aliases count as length-changing in table analysis
+* Silenced the Apple Clang deprecated-enum warning coming from upstream sokol headers
+
+### Tests
+
+* New cross-TU struct-collision regression test (`struct_odr_main` + `struct_odr_a`/`struct_odr_b`, wired into `run.sh` and `run.bat`): two modules emitting the same struct name with different layouts must link and run correctly
+
+---
+
+## [0.5.0] - 2026-10-19
+
+### Added
+
+* Lua 5.5 C API bridge. C modules written against the official API (`lua.h`, `lauxlib.h`, `lualib.h`) now compile and run unchanged on top of the clx runtime, including thread context support, state hooks, GC references for C API objects, and `lua_callk`/`lua_pcallk` continuations that run on yield. New `weather` example (LuaSocket over the C API) with a Windows build script, plus C API bridge documentation and webpage sections. Module archives are scanned for C/C++ openers and linked accordingly, with readable errors for missing modules
+* Filtered standard-library registration. `--minimal` plus `--modules` link only the std functions a program references (with full-open fallback), backed by per-module archives, per-function registrars, an `open_bare` state opener, and reference tracking for globals, `_ENV` and string-builder concatenation. Binaries that use little of the std library are smaller and start faster
+* Faster pattern matching. The `%s*()` idiom used at every JSON token boundary now takes a dedicated whitespace-scan fast path instead of warming up the full pattern engine
+* New unboxed integer comparisons and a `clx::Integer()` constructor for hot integer paths in generated code
+* New ray tracer benchmark source, a Windows x86-64 MSVC benchmark table, and refreshed Linux (GCC 15.2) and macOS ARM64 numbers
+* New C API test module with continuation idioms and call counters, `lua_callk`/`lua_pcallk` conformance tests, a rooting-across-collection regression test, and a metamethod-cache test
+* MinGW and clang-cl toolchain support on Windows, with `CLX_CXX` dialect selection documented in the CLI reference
+
+### Changed
+
+* New root-frame garbage-collector rooting model. The shadow stack is replaced by `RootRange`/`Frame`/`FrameGuard` regions: call args, returns, loader values, converted values, finalizers, sort comparators and fiber switches root through frames instead of per-value stack slots. Allocation-heavy programs spend less time rooting, and several rare use-after-free crashes are gone
+* Cheaper strings. `StringBuilder` arenas rewind instead of orphaning on clear, concatenation and `to_string` dropped temp allocations, zero-init passes and double copies, and `string.format`/`gsub` tails, long `read_line` chunks, `utf8.char` codepoints and short strings are arena-copied instead of interned one by one
+* Smarter optimizer. Struct-shaped locals promote to native C++ structs, the integer subtype survives more expressions, numeric builtins (including `math` constants folded at compile time) promote to native arithmetic, and new multi-native / no-GC-locals passes keep more values in registers. `string.format` now matches stock output
+* Stock error messages across the runtime. Bad-argument, concat/insert/create, bitwise, comparison and UTF-8 errors now use Lua's exact wording via shared helpers, and index errors carry `file:line`
+* Stock string-escape handling. Escapes decode once at parse time with `file:line` errors: strict `\x`/`\u`, `\z` and line continuations, digit escapes capped at 255, invalid escapes rejected, and long-bracket strings left raw. Generated C++ string literals are pure ASCII, so non-UTF8 bytes can no longer leak into them
+* Faster fractal zooming. The Mandelbrot example's escape loop is now plain native-double arithmetic (parameterized inputs, cached squares, literal bound) and renders interlaced rows, roughly 6-8x faster per frame when zoomed in; `sokol.pixels()` uploads dense numeric buffers straight from table storage
+* Adaptive minor collections. Byte accounting now covers array side buffers, hash growth, swept bytes and converted arrays, the minor threshold starts at the minimum and paces itself, dead young objects are reclaimed in-cycle, and nested collections during a minor are blocked
+* Batched, GC-safe IO. Output is batched per `FILE*`, `print`/`warn` route through the batch, and open files are protected from collection during setup and held across `io.input()`/`io.output()` reassignment
+* Hardened call dispatch. Call-site flags live on a frame stack preserved across metamethod dispatch, guarded dispatch paths reset them, and `pcall` clears them, closing several rare state-corruption windows
+* Friendlier module UX. `--modules` tries both `.a` and `.lib`, missing modules and `/link` flags on GCC produce clear errors instead of cryptic failures, and the sokol bindings log initialization failures instead of dying silently
+* Quieter, more portable Windows builds. MSVC UTF-8 source handling, `/EHs` so `extern "C"` Lua functions may throw, GCC-only section flags kept off clang-cl, and Windows path lookup plus stack options in the driver
+
+### Fixed
+
+* Fixed return expressions evaluating after the frame was restored, integer flags desyncing after multi-assign, and call results being folded into integer-flag expressions
+* Fixed flow-reference checks for table constructors and intrinsic calls in arena analysis
+* Fixed finalizer and remembered-set handling during minor collections, and pinned byte accounting on array-churning tables
+* Fixed `string.find`/`match` arity, `%q` escaping, and decimal-escape decoding to match stock Lua byte-for-byte
+* Fixed Windows file-readability checks in `package`, and table `next()` bitmap scanning
+* Fixed MSVC warnings on UTF-8 encoded files
+* Fixed coroutine yield bookkeeping overtaking rooted-call error handling
+
+### Tests
+
+* New regression coverage for rooting across collections in return expressions, C API continuations, and the metamethod cache
+* Native/capi module builds are now gated on the detected `clx --cxx` dialect (`g++`/`ar` vs `cl`/`clang-cl`), and benchmark harnesses run from `benchmarks/` with Windows-safe timing wrappers
+
+### Refactored
+
+* Split the three compiler monoliths into thematic files with no behavior change: `runtime.cpp` into threads/values/tables/state/gc/calls plus `internal.h`, `codegen.cpp` into helpers/expressions/statements/loops/assignments, and `optimizer.cpp` into a pass orchestrator over owners/numbers/functions/tables with shared state in `PassScratch`
+* Narrowed `hash_version` bumps to rehashes only so hot inline-cache reads survive cold writes, and corrected the per-table inline-cache size to 8 entries
+
+### Documentation
+
+* New Lua C API bridge docs, `--minimal`/`--modules`/per-module-archive docs, `CLX_CXX` and clang-cl support notes, and Windows install prerequisites
+* Synced the website with the docs sources, restored the C++ API section, and added a new blog entry
+
+### Build
+
+* MinGW and clang-cl support, `/EHs` for throwing C functions, MSVC/Clang UTF-8 handling, and fixed MSVC warnings
+* `for`-loop counter analysis replaced with referenced-globals tracking for filtered registration; vararg payloads emit only for vararg functions
+
+### Benchmarks
+
+* New ray tracer source, refreshed Linux and Windows tables, updated macOS ARM64 results, and portable benchmark-runner paths
+
+---
+
 ## [0.4.0] - 2026-09-28
 
 ### Added
