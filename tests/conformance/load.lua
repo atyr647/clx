@@ -121,5 +121,11 @@ do
     assert_eq(f(), "hello", "load() with global function")
 end
 
+-- NOTE: string.dump coverage lives in tests/conformance/string_dump.lua, whose
+-- VM round-trip section runs with a real AOT caller (wired into test-load.sh).
+-- It is deliberately NOT asserted here: nested load() calls inside VM chunks
+-- return bridge-boxed functions (pre-existing representation wart), which even
+-- stock's own string.dump rejects — that is a nested-load issue, not a dump one.
+
 print(string.format("\nload conformance: %d/%d passed", passed, total))
 if passed ~= total then os.exit(1) end
