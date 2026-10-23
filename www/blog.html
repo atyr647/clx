@@ -124,7 +124,9 @@
         .card {
             width: 100%;
             max-width: 1100px;
-            height: 720px;
+            height: min(720px, calc(100vh - 3rem));
+            height: min(720px, calc(100dvh - 3rem));
+            min-height: 0;
             background: var(--card);
             border: 1px solid var(--border);
             border-radius: 16px;
@@ -665,9 +667,9 @@
 
         @media (max-width: 960px) {
             .card {
-                height: 80vh;
-                max-height: 720px;
-                min-height: 480px;
+                height: min(80vh, 720px);
+                max-height: none;
+                min-height: 0;
             }
         }
 
