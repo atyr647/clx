@@ -266,7 +266,11 @@ bool DynamicVM::load_buffer(const char* src, size_t len, const char* name, const
     }
     if (env_ref != LUA_NOREF) {
         lua_rawgeti(L_, LUA_REGISTRYINDEX, env_ref);
-        lua_setupvalue(L_, -2, 1);
+        //------------------ lua_setupvalue only pops when upvalue #1 exists; a chunk with no
+        //------------------ upvalues (e.g. a dumped function body referencing no globals) must not
+        //------------------ leave the env table behind for luaL_ref to capture instead of the function
+        if (!lua_setupvalue(L_, -2, 1))
+            lua_pop(L_, 1);
     }
     *out_ref = luaL_ref(L_, LUA_REGISTRYINDEX);
     return true;
@@ -286,7 +290,9 @@ bool DynamicVM::load_file(const char* path, const char* mode_str, int env_ref, i
     }
     if (env_ref != LUA_NOREF) {
         lua_rawgeti(L_, LUA_REGISTRYINDEX, env_ref);
-        lua_setupvalue(L_, -2, 1);
+        //------------------ same no-upvalue guard as load_buffer: never ref the env table itself
+        if (!lua_setupvalue(L_, -2, 1))
+            lua_pop(L_, 1);
     }
     *out_ref = luaL_ref(L_, LUA_REGISTRYINDEX);
     return true;
