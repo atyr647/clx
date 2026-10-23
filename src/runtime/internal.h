@@ -21,6 +21,13 @@ namespace clx {
 extern void (*clx_io_flush_all_ptr)();
 extern void (*clx_io_write_ptr)(FILE *fp, const char *p, size_t n);
 
+//------------------ string.dump hook: assigned by the embedded-VM bridge (libclx_lua) when linked
+//------------------ with --dynamic, null otherwise. Same pattern as the io hooks: the pointer lives
+//------------------ in always-linked state.cpp so referencing it never pulls vm code into plain builds.
+//------------------ Takes over string.dump entirely when set (VM bytecode strings for VM functions,
+//------------------ VM-side boxes for native closures); when null, string.dump throws unsupported.
+extern MultiValue (*clx_string_dump_hook)(LState *L, const LValue *args, size_t count);
+
 //------------------ register_static_preload: registers a static preload loader for a module
 void register_static_preload(LState *L, const char *name, LValue(open_func)(LState *));
 
