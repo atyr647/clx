@@ -467,8 +467,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                 out << "clx::LValue l_" << name << ";\n";
                                 out << "auto l_" << name << "_cell = std::make_shared<clx::LValue>();\n";
                                 out << "auto _impl_" << name
-                                    << " = std::make_shared<std::function<clx::MultiValue(clx::LState*, const "
-                                       "clx::LValue*, size_t)>>();\n";
+                                    << " = std::make_shared<clx::CFunctionType>();\n";
                                 std::string saved_raw_cell = state.raw_lambda_cell;
                                 state.raw_lambda_cell = std::string(name);
                                 if (state.string_builders.count(name) && !state.module_string_builders.count(name)) {
@@ -1103,7 +1102,9 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                     << t_idx << ", _td" << t_idx << "->array_size, static_cast<size_t>(_kd" << t_idx
                                     << ") - 1); _td" << t_idx << "->array[_kd" << t_idx << " - 1] = _tv" << t_idx
                                     << "; _td" << t_idx << "->array_types[_kd" << t_idx << " - 1] = _tt" << t_idx
-                                    << "; if (static_cast<size_t>(_kd" << t_idx << ") > _td" << t_idx
+                                    << "; clx::table_hint_on_array_write(_td" << t_idx << ", static_cast<size_t>(_kd"
+                                    << t_idx << ") - 1, _tt" << t_idx
+                                    << "); if (static_cast<size_t>(_kd" << t_idx << ") > _td" << t_idx
                                     << "->array_size) _td" << t_idx << "->array_size = static_cast<size_t>(_kd" << t_idx
                                     << "); } else { clx::LValue _sv" << t_idx << " = ";
                                 emit_node(_vo);
@@ -1130,8 +1131,9 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                     out << "if (_k" << t_idx << " - 1 > _t" << t_idx << "->array_size) clx::table_fill_gap(_t" << t_idx
                         << ", _t" << t_idx << "->array_size, _k" << t_idx << " - 1); _t" << t_idx << "->array[_k"
                         << t_idx << " - 1] = _sv" << t_idx << ".val; _t" << t_idx << "->array_types[_k" << t_idx
-                        << " - 1] = _sv" << t_idx << ".type; if (_k" << t_idx << " > _t" << t_idx << "->array_size) _t"
-                        << t_idx << "->array_size = _k" << t_idx
+                        << " - 1] = _sv" << t_idx << ".type; clx::table_hint_on_array_write(_t" << t_idx << ", _k"
+                        << t_idx << " - 1, _sv" << t_idx << ".type); if (_k" << t_idx << " > _t" << t_idx
+                        << "->array_size) _t" << t_idx << "->array_size = _k" << t_idx
                         << "; } else "
                            "clx::table_set_int(L, clx::LValue(clx::ValueType::Table, _t"
                         << t_idx << "), _k" << t_idx << ", _sv" << t_idx << "); }\n";
@@ -1163,7 +1165,8 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                         && yields_number(ctx, state, ctx.block_statements[first_v], nullptr, state.current_fast_func);
                     if (!lhs_val_numeric)
                         out << "; clx::gc_barrier_table(L, _t, _sv)";
-                    out << "; _t->array[_k - 1] = _sv.val; _t->array_types[_k - 1] = _sv.type; } else "
+                    out << "; _t->array[_k - 1] = _sv.val; _t->array_types[_k - 1] = _sv.type; "
+                           "clx::table_hint_on_array_write(_t, _k - 1, _sv.type); } else "
                            "clx::table_set_int(L, clx::LValue(clx::ValueType::Table, _t), _k, ";
                     if (v_count > 0)
                         emit_node(ctx.block_statements[first_v]);
@@ -1779,8 +1782,9 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                 out << "if (_k" << t_idx << " - 1 > _t" << t_idx << "->array_size) clx::table_fill_gap(_t" << t_idx
                     << ", _t" << t_idx << "->array_size, _k" << t_idx << " - 1); _t" << t_idx << "->array[_k" << t_idx
                     << " - 1] = _sv" << t_idx << ".val; _t" << t_idx << "->array_types[_k" << t_idx << " - 1] = _sv"
-                    << t_idx << ".type; if (_k" << t_idx << " > _t" << t_idx << "->array_size) _t" << t_idx
-                    << "->array_size = _k" << t_idx
+                    << t_idx << ".type; clx::table_hint_on_array_write(_t" << t_idx << ", _k" << t_idx
+                    << " - 1, _sv" << t_idx << ".type); if (_k" << t_idx << " > _t" << t_idx << "->array_size) _t"
+                    << t_idx << "->array_size = _k" << t_idx
                     << "; } else clx::table_set_int(L, clx::LValue(clx::ValueType::Table, _t" << t_idx << "), _k"
                     << t_idx << ", " << val_str << "); }\n";
             } else {
@@ -1804,8 +1808,9 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                     out << "); if (_k - 1 < _t->array_size) [[likely]] { clx::LValue _svw = " << val_str << "; ";
                     if (!val_is_number)
                         out << "clx::gc_barrier_table(L, _t, _svw); ";
-                    out << "_t->array[_k - 1] = _svw.val; _t->array_types[_k - 1] = "
-                           "_svw.type; } else clx::table_set_int(L, clx::LValue(clx::ValueType::Table, _t), _k, "
+                    out << "_t->array[_k - 1] = _svw.val; _t->array_types[_k - 1] = _svw.type; "
+                           "clx::table_hint_on_array_write(_t, _k - 1, _svw.type); "
+                           "} else clx::table_set_int(L, clx::LValue(clx::ValueType::Table, _t), _k, "
                         << val_str << "); }\n";
                 } else {
                     uint32_t kt2 = t_node.as.table_access.key;
@@ -1960,7 +1965,8 @@ void CodeEmitter::emitTableConstructor(const ASTNode &node, uint32_t node_idx) {
             out << "{ clx::LValue _tv = ";
             emit_node(v);
             out << "; _fr.push(_tv); _ta->array[" << (implicit_seq - 1) << "] = _tv.val; _ta->array_types["
-                << (implicit_seq - 1) << "] = _tv.type; _fr.pop(); }\n";
+                << (implicit_seq - 1) << "] = _tv.type; clx::table_hint_on_array_write(_ta, "
+                << (implicit_seq - 1) << ", _tv.type); _fr.pop(); }\n";
         } else {
             out << "{\n";
             out << "clx::LValue _tv = ";
