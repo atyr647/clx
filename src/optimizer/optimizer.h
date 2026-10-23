@@ -104,11 +104,11 @@ inline bool yields_number(const ASTContext &ctx, const AnalysisState &state, uin
 
         if (tbl_idx < ctx.nodes.size() && ctx.nodes[tbl_idx].type == NodeType::Identifier) {
             std::string_view tn(ctx.nodes[tbl_idx].as.ident.name, ctx.nodes[tbl_idx].as.ident.length);
-            if (tn == "math" && n.as.table_access.key < ctx.nodes.size()
+            if (ctx.nodes[tbl_idx].as.ident.is_global && n.as.table_access.key < ctx.nodes.size()
                 && ctx.nodes[n.as.table_access.key].type == NodeType::String) {
                 std::string_view mk(
                     ctx.nodes[n.as.table_access.key].as.string.text, ctx.nodes[n.as.table_access.key].as.string.length);
-                if (mk == "huge" || mk == "pi" || mk == "maxinteger" || mk == "mininteger") {
+                if (builtin_field_ok(state, tn, mk) && builtin_const_lookup(tn, mk)) {
                     result = true;
                     goto done;
                 }
@@ -211,19 +211,18 @@ inline bool yields_number(const ASTContext &ctx, const AnalysisState &state, uin
         if (tgt < ctx.nodes.size() && ctx.nodes[tgt].type == NodeType::TableAccess) {
             const auto &ta = ctx.nodes[tgt].as.table_access;
             if (ta.table < ctx.nodes.size() && ta.key < ctx.nodes.size()
-                && ctx.nodes[ta.table].type == NodeType::Identifier
+                && ctx.nodes[ta.table].type == NodeType::Identifier && ctx.nodes[ta.table].as.ident.is_global
                 && ctx.nodes[ta.key].type == NodeType::String) {
                 std::string_view mod(ctx.nodes[ta.table].as.ident.name, ctx.nodes[ta.table].as.ident.length);
-                std::string_view key(
-                    ctx.nodes[ta.key].as.string.text, ctx.nodes[ta.key].as.string.length);
-                if (mod == "math"
-                    && (key == "abs" || key == "acos" || key == "asin" || key == "atan" || key == "atan2"
-                        || key == "ceil" || key == "cos" || key == "cosh" || key == "deg" || key == "exp"
-                        || key == "floor" || key == "fmod" || key == "log" || key == "max" || key == "min"
-                        || key == "pow" || key == "rad" || key == "sin" || key == "sinh" || key == "sqrt"
-                        || key == "tan" || key == "tanh")) {
-                    result = true;
-                    goto done;
+                std::string_view key(ctx.nodes[ta.key].as.string.text, ctx.nodes[ta.key].as.string.length);
+                //------------------ direct module call proven numeric by the registry, with the
+                //------------------ same write guards that gate static call lowering
+                if (builtin_field_ok(state, mod, key)) {
+                    const BuiltinEntry *be = builtin_lookup(mod, key);
+                    if (be && be->numeric) {
+                        result = true;
+                        goto done;
+                    }
                 }
             }
         }
