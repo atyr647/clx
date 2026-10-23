@@ -2,9 +2,14 @@
 
 ## Overview
 
-clx is a Lua-to-C++ compiler that transpiles Lua source code into optimized C++ code, which is then compiled using the system's C++ compiler to produce native machine code. The normal execution path is entirely AOT. An optional `--dynamic` link path embeds a separate Lua VM for loading and executing Lua source at runtime.
+clx compiles Lua to C++, then compiles that C++ with your system compiler into a
+native program. There is no interpreter in the normal path — that is what AOT
+(ahead-of-time) means here.
 
-The AOT runtime and the embedded VM are separate runtimes. They have different value representations, heaps, garbage collectors, standard-library implementations, and coroutine systems. The bridge converts primitive values and wraps supported tables, userdata, and functions; it does not make the two runtimes share native objects.
+An optional `--dynamic` mode additionally embeds a real Lua VM, so the program can
+also `load` and run Lua source at runtime. The two runtimes stay separate (different
+values, heaps, collectors, coroutine systems); a small bridge copies primitives and
+wraps tables, userdata, and functions across the boundary.
 
 ## System Architecture
 
@@ -145,72 +150,53 @@ clx/
 
 ### 1. CLI (src/clx.cpp)
 
-The command-line interface handles:
-- Argument parsing (`--executable`, `--object`, `--static`, `--debug`, `--size`, `--fast`, `--cpp`, `--modules`, `--dynamic`, `--output`/`-o`, `--minimal`, `--version`, `--cxx`, `--help`)
-- File I/O and multiple lua files compilation
-- Invoking the C++ compiler (fixed at build time via CMake)
-- Locating its own runtime libraries, headers, and native modules via a unified search: the in-tree `build/` dir and executable-relative `lib`/`lib64` dirs first, then the install prefix/libdir embedded from CMake/GNUInstallDirs (`CLX_INSTALL_PREFIX`/`CLX_INSTALL_LIBDIR`/`CLX_INSTALL_INCLUDEDIR`). Default install prefix: `/usr/local` on POSIX, `%ProgramFiles%\clx` on Windows.
-- Selecting the optional dynamic link path: `--dynamic` links `libclx_lua.a` on POSIX or `clx_lua.lib` on Windows and emits registration for `load`, `loadfile`, and `dofile`
-- Output file management and temp file cleanup
-- Dead code elimination by default via `-ffunction-sections` + `-Wl,--gc-sections` (Linux gcc/clang), `-Wl,-dead_strip` (macOS), or `/Gy /link /OPT:REF /OPT:ICF` (MSVC)
-- Default optimization profile is `--size`: `-O1 -foptimize-sibling-calls -fno-inline-functions -fvisibility=hidden` (gcc/clang) or `/O1 /Ob0 /GL /GR- /MD /EHsc /GS- /fp:fast /Gw /Gy /utf-8` (MSVC); `--fast` switches to `-O3 -flto=auto` / `/O2 /Ot /GL`
+The driver parses flags, compiles each `.lua` file to C++, invokes the system C++
+compiler, and links the result. The C++ toolchain is fixed when clx itself is built
+(CMake records it), so every user gets the same codegen. It also finds clx's own
+runtime libraries and headers (in-tree `build/` dir first, then the install prefix),
+manages temp files, and strips dead code by default (function sections + linker GC).
+
+Build profiles: `--size` (default, small binaries), `--fast` (optimized, with LTO
+outside Windows), `--debug` (debug info, no optimization). See
+[Optimizations](./optimizations.md#optimization-levels) for the exact flags.
 
 ### 2. Lexer (src/syntax/lexer.cpp)
 
-The tokenizer converts raw source code into a stream of tokens:
-- Keywords (`if`, `while`, `function`, etc.)
-- Identifiers
-- Literals (numbers, strings)
-- Operators (+, -, *, /, etc.)
-- Delimiters (parentheses, braces, brackets)
+Turns raw source into a token stream (keywords, names, numbers, strings, operators).
+String escapes (`\n`, `\x41`, …) are decoded here, once, with `file:line` errors —
+by the time codegen runs, string contents are final.
 
 ### 3. Parser (src/syntax/parser.cpp)
 
-The recursive descent parser builds an Abstract Syntax Tree (AST):
-- `parse_statement()` - parses statements
-- `parse_expression()` - parses expressions
-- `parse_block()` - parses statement blocks
-- `parse_funcbody()` - parses function definitions
+A hand-written recursive-descent parser that builds the AST (`parse_statement`,
+`parse_expression`, `parse_block`, `parse_funcbody`, …). It also resolves every name
+to global / local / captured while parsing, so later passes never guess at scoping.
 
 ### 4. AST Nodes (src/syntax/nodes.h)
 
-Core AST node types:
-- `Block` - statement block
-- `Identifier` - variable reference
-- `BinaryOp` / `UnaryOp` - operations
-- `FunctionDef` - function definition
-- `TableConstructor` - table literals
-- `ForStatement` / `WhileStatement` - loops
-- `IfStatement` - conditional
-- `CallExpression` - function calls
+Plain structs, one per Lua construct: `Block`, `Identifier`, `BinaryOp`/`UnaryOp`,
+`FunctionDef`, `TableConstructor`, `ForStatement`, `CallExpression`, and so on.
+If you add a Lua feature, you add a node here first.
 
 ### 5. Optimizer (src/optimizer/)
 
-`Optimizer::run()` is a thin orchestrator over 15 pass functions (declared in `passes.h`,
-implemented across `owners.cpp`, `numbers.cpp`, `functions.cpp`, `tables.cpp`,
-`structs.cpp`), sharing run-scoped state via `PassScratch`/`AnalysisState`. Passes analyze
-the AST and annotate nodes with optimization hints:
-- Numeric expression detection (Integer and Number fast paths)
-- Variable scope resolution
-- Table access purity analysis
-- Constant folding preparation
-- `yields_number` analysis for numeric for loops
-- Non-fast function parameter numeric detection (marks params used in arithmetic as native doubles)
-- Function parameter numeric-record array inference (traces `local bi = bodies[i]` + field accesses to prove numeric fields)
+`Optimizer::run()` is a thin orchestrator over 15 small passes (declared in
+`passes.h`, grouped by topic into `owners.cpp`, `numbers.cpp`, `functions.cpp`,
+`tables.cpp`, `structs.cpp`). Passes share scratch state via `PassScratch` /
+`AnalysisState` and only ever *annotate* — they record facts like "this variable is
+numeric" or "this table is only indexed with integers". Codegen decides what to do
+with those facts. The two questions every pass answers are: *what type does this hold?*
+and *can this value escape?* (Rule of thumb: `hash_version` is *runtime* table state,
+not an optimizer fact — don't mix the two.)
 
-(Inline-cache invalidation uses `hash_version`, which is *runtime* table state, not an
-optimizer pass.)
+### 6. Code Generator (src/codegen/)
 
-### 6. Code Generator (src/codegen/codegen.cpp)
-
-The code generator produces C++ code:
-- Fast-path code for numeric operations (Integer and Number)
-- Slow-path code for dynamic operations
-- Loop transformation (numeric for, generic for with direct `LCFunction` pointer calls)
-- Expression emission with `[[likely]]` branch prediction hints
-- Per-LTable `InlineCache` (8 entries, `LTABLE_IC_SIZE`) for string-keyed table access, checked inside `LTable::gettable()`/`LTable::settable()`
-- StringBuilder-based string concatenation
-- Wyhash-based string hashing
+Walks the annotated AST and prints C++ (one file per contributor topic:
+`expressions.cpp`, `statements.cpp`, `loops.cpp`, `assignments.cpp`). For every
+operation it picks one of two shapes: the *native* shape (plain C++ on `double` /
+`int64_t`, used when the optimizer proved the types) or the *generic* shape
+(`clx::add(L, …)` and friends, which check types at runtime). When in doubt it picks
+generic — the failure mode is slower code, never wrong code.
 
 ### 7. Runtime Library (src/runtime/)
 
@@ -327,19 +313,13 @@ the version, allowing efficient read-then-write patterns.
 
 The dynamic path is a boundary, not an alternate code generator. A loaded chunk is interpreted by the embedded VM; it is never turned into AOT C++ during program execution.
 
-## Memory Management
+## Memory Management### Value Representation
 
-### Value Representation
-
-clx uses a 16-byte `LValue` (8-byte payload + separate `ValueType` tag) to store Lua values:
-- Numbers: Direct double representation (IEEE 754)
-- Integers: 64-bit signed integer in TValue payload
- - Strings: Either TAG_ISTR inline (≤6 bytes, stored directly in `val`) or pointer to heap-allocated interned string (via StringPool)
-- Tables: Pointer to heap-allocated table
-- Functions: Pointer to function closure
-- Nil/Boolean: Special sentinel values
-- Threads: Pointer to LThread (coroutine/fiber)
-- Userdata: Pointer to user-defined data
+Every Lua value that can't stay a native number travels in a 16-byte `LValue` box:
+a type tag plus 8 bytes of payload (a `double`, an `int64_t`, a pointer — or, for
+strings of ≤6 bytes, the characters themselves, `TAG_ISTR`). Long-lived values (tables,
+functions, threads, userdata) live on the GC heap; the box just points at them. See
+[Runtime](./runtime.md) for the full layout.
 
 ### Runtime Ownership and Bridge Objects
 
@@ -357,23 +337,9 @@ Proxy nodes keep the referenced clx object alive from the VM side. The two colle
 
 ### Garbage Collection
 
-Generational collector (default; `CLX_GC_MODE=incremental` opts out):
-- **Minor collections**: trace roots (the root-frame chain, threads, permanent roots) plus the remembered set, mark reachable young objects, promote survivors (young to survivor to old), and free unreachable survivor garbage — old objects are never traced or freed here. See [Runtime](./runtime.md) for the `RootRange`/`Frame`/`FrameGuard` rooting model, which replaced the old shadow stack and its `ScopeGuard` push/restore guards
-- **Write barriers**: storing a young value into an old table, closure, coroutine or upvalue cell records the owner, so the next minor sees the edge
-- **Major collections**: full mark-and-sweep fallback when the old generation outgrows its budget; the incremental collector remains available as the opt-out path
-
-Tables whose metatables are set are linked into a `meta_next` metatable list, so the mark
-phase scans only metatabled tables for finalizer references instead of every table. Permanent
-roots (a small set of long-lived objects, including the string/io metatables and default io
-handles) are marked directly each cycle so they are never collected. The mark phase validates
-GC-header fields before writing and skips opaque/external userdata.
-
-#### Per-function table arenas
-
-The optimizer performs escape analysis on table constructors. Tables proven not to escape
-their function (not returned, not stored in globals/upvalues/fields, not captured, not used
-in growing loops) are allocated from a per-function bump-pointer arena (`FuncArena`) instead
-of the collector heap. `arena_create_table` placement-news the whole table — `LTable` header,
-array part, type part, hash part, and `LTableExt` — into one arena blob, freed wholesale at
-function exit. This removes per-table `new`/`free` for the common temporary-table case and is
-excluded from GC accounting.
+Generational collector by default (`CLX_GC_MODE=incremental` opts out to the legacy
+collector). Young objects die in cheap *minor* collections; survivors graduate to
+older generations; a full mark-and-sweep *major* runs only when the old generation
+overgrows. Write barriers record old-to-young edges so minors never walk old subtrees.
+See [Runtime](./runtime.md) for the details, including the root-frame rooting model
+and per-function table arenas (bump-allocated tables for values proven not to escape).
