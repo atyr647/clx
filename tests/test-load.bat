@@ -52,13 +52,39 @@ type "%LOG%"
 :: summary as well as the process status because older harness versions did
 :: not propagate fail_count through their exit status.
 findstr /c:"fail  : 0" "%LOG%" >nul 2>&1
-if !RUN_EXIT! equ 0 if !errorlevel! equ 0 (
-    echo [PASS] load-mode test suite
-    goto :success
-)
+if !RUN_EXIT! neq 0 goto :harness_fail
+if !errorlevel! neq 0 goto :harness_fail
+echo [PASS] load-mode test suite
+goto :dump_test
 
+:harness_fail
 echo [FAIL] load-mode test suite
 if !RUN_EXIT! neq 0 echo Harness exit code: !RUN_EXIT!
+goto :fail
+
+:: AOT-side string.dump coverage: the same test the default suite runs bare,
+:: compiled with --dynamic so the VM round-trip section executes with a real
+:: AOT caller on the clx side of the bridge.
+:dump_test
+echo Compiling tests\conformance\string_dump.lua with --dynamic...
+set "DUMP_BIN=%TMP_DIR%\dump_dynamic.exe"
+set "DUMP_LOG=%TMP_DIR%\dump_dynamic.log"
+"%COMPILER%" --dynamic tests\conformance\string_dump.lua --output "%DUMP_BIN%"
+if errorlevel 1 (
+    echo [FAIL] Could not compile the AOT-side dump test.
+    goto :fail
+)
+"%DUMP_BIN%" >"%DUMP_LOG%" 2>&1
+set "DUMP_EXIT=!errorlevel!"
+type "%DUMP_LOG%"
+findstr /c:"[FAIL]" "%DUMP_LOG%" >nul 2>&1
+if !DUMP_EXIT! neq 0 goto :dump_fail
+if !errorlevel! equ 0 goto :dump_fail
+echo [PASS] AOT-side string.dump (--dynamic)
+goto :success
+
+:dump_fail
+echo [FAIL] AOT-side string.dump (--dynamic)
 goto :fail
 
 :compile_fail
