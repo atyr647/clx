@@ -106,7 +106,6 @@ compiled runtime. See [Dynamic Lua](./dynamic-lua.md).
 
 | Feature | What's the story |
 | --- | --- |
-| `string.dump()` | Registered but always throws `string.dump not supported` in compiled code; the embedded engine has a real implementation when loaded code calls it under `--dynamic` |
 | `debug` library | Not exposed as a compiled-code global; the `--dynamic` bridge environment also does not copy `debug`. Loaded chunks can only reach it if you put it in the environment yourself |
 
 > clx is under active development. Additional Lua 5.5 compatibility work,
