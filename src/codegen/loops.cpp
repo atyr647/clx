@@ -129,42 +129,51 @@ void CodeEmitter::emitForStatement(const ASTNode &node, uint32_t node_idx) {
                 out << ") " << (bin.op == static_cast<int>(BinaryOp::Add) ? "+" : "-") << " static_cast<int64_t>(";
                 emit_native(bin.right);
                 out << ");\n";
+
             } else {
                 out << "int64_t s_" << node_idx << " = ";
                 emit_native(node.as.for_stmt.start_expr);
                 out << ";\n";
+
             }
             if (ctx.nodes[node.as.for_stmt.limit_expr].type == NodeType::Integer) {
                 out << "int64_t l_" << node_idx << " = ";
                 emit_native(node.as.for_stmt.limit_expr);
                 out << ";\n";
+
             } else if (step_known_negative) {
                 out << "int64_t l_" << node_idx << " = static_cast<int64_t>(std::ceil(";
                 emit_native(node.as.for_stmt.limit_expr);
                 out << "));\n";
+
             } else {
                 out << "int64_t l_" << node_idx << " = static_cast<int64_t>(std::floor(";
                 emit_native(node.as.for_stmt.limit_expr);
                 out << "));\n";
+
             }
             if (node.as.for_stmt.step_expr != 0xFFFFFFFF) {
                 out << "int64_t st_" << node_idx << " = ";
                 emit_native(node.as.for_stmt.step_expr);
                 out << ";\n";
+
             } else {
                 out << "int64_t st_" << node_idx << " = 1;\n";
             }
         } else {
-            out << "double s_" << node_idx << " = ";
-            emit_native(node.as.for_stmt.start_expr);
-            out << ";\n";
-            out << "double l_" << node_idx << " = ";
-            emit_native(node.as.for_stmt.limit_expr);
-            out << ";\n";
+                out << "double s_" << node_idx << " = ";
+                emit_native(node.as.for_stmt.start_expr);
+                out << ";\n";
+
+                out << "double l_" << node_idx << " = ";
+                emit_native(node.as.for_stmt.limit_expr);
+                out << ";\n";
+
             if (node.as.for_stmt.step_expr != 0xFFFFFFFF) {
                 out << "double st_" << node_idx << " = ";
                 emit_native(node.as.for_stmt.step_expr);
                 out << ";\n";
+
             } else {
                 out << "double st_" << node_idx << " = 1.0;\n";
             }
@@ -178,15 +187,18 @@ void CodeEmitter::emitForStatement(const ASTNode &node, uint32_t node_idx) {
         out << "clx::LValue start_" << node_idx << " = ";
         emit_node(node.as.for_stmt.start_expr);
         out << ";\n";
+
         out << "_fr.push(start_" << node_idx << ");\n";
         out << "clx::LValue limit_" << node_idx << " = ";
         emit_node(node.as.for_stmt.limit_expr);
         out << ";\n";
+
         out << "_fr.push(limit_" << node_idx << ");\n";
         if (node.as.for_stmt.step_expr != 0xFFFFFFFF) {
             out << "clx::LValue step_" << node_idx << " = ";
             emit_node(node.as.for_stmt.step_expr);
             out << ";\n";
+
         } else {
             out << "clx::LValue step_" << node_idx << " = clx::LValue(static_cast<int64_t>(1));\n";
         }
