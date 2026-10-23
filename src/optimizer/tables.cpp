@@ -273,6 +273,13 @@ void pass_pure_arrays(const ASTContext &ctx, AnalysisState &state, PassScratch &
                         std::string_view _fname(
                             ctx.nodes[_call_target].as.ident.name, ctx.nodes[_call_target].as.ident.length);
                         _is_dynamic = (_fname == "setmetatable");
+                        //------------------ alias of table.insert/table.remove changes length too
+                        //                        (aliases registered by pass_constants_and_bounds)
+                        if (!_is_dynamic) {
+                            auto _bit = state.builtin_aliases.find(std::string(_fname));
+                            _is_dynamic = _bit != state.builtin_aliases.end()
+                                && (_bit->second == "table_insert" || _bit->second == "table_remove");
+                        }
                     } else if (ctx.nodes[_call_target].type == NodeType::TableAccess) {
                         uint32_t _tbl = ctx.nodes[_call_target].as.table_access.table;
                         uint32_t _key = ctx.nodes[_call_target].as.table_access.key;
@@ -968,24 +975,24 @@ void pass_array_safety(const ASTContext &ctx, AnalysisState &state, PassScratch 
                         self(self, ctx.block_statements[n.as.assign.first_value + vi]);
                     return;
                 }
-            if (n.type == NodeType::LocalDecl || n.type == NodeType::GlobalDeclStatement) {
-                uint32_t v_count
-                    = (n.type == NodeType::LocalDecl) ? n.as.local_decl.value_count : n.as.global_decl.value_count;
-                for (uint32_t vi = 0; vi < v_count; ++vi) {
-                    uint32_t v = (n.type == NodeType::LocalDecl)
-                        ? ctx.block_statements[n.as.local_decl.first_value + vi]
-                        : ctx.block_statements[n.as.global_decl.first_value + vi];
-                    self(self, v);
+                if (n.type == NodeType::LocalDecl || n.type == NodeType::GlobalDeclStatement) {
+                    uint32_t v_count
+                        = (n.type == NodeType::LocalDecl) ? n.as.local_decl.value_count : n.as.global_decl.value_count;
+                    for (uint32_t vi = 0; vi < v_count; ++vi) {
+                        uint32_t v = (n.type == NodeType::LocalDecl)
+                            ? ctx.block_statements[n.as.local_decl.first_value + vi]
+                            : ctx.block_statements[n.as.global_decl.first_value + vi];
+                        self(self, v);
+                    }
+                    return;
                 }
-                return;
-            }
-            if (n.type == NodeType::ReturnStatement) {
-                for (uint32_t vi = 0; vi < n.as.return_stmt.value_count; ++vi)
-                    self(self, ctx.block_statements[n.as.return_stmt.first_value + vi]);
-                return;
-            }
-            if (n.type == NodeType::IfStatement) {
-                self(self, n.as.if_stmt.condition);
+                if (n.type == NodeType::ReturnStatement) {
+                    for (uint32_t vi = 0; vi < n.as.return_stmt.value_count; ++vi)
+                        self(self, ctx.block_statements[n.as.return_stmt.first_value + vi]);
+                    return;
+                }
+                if (n.type == NodeType::IfStatement) {
+                    self(self, n.as.if_stmt.condition);
                     if (n.as.if_stmt.then_block != 0xFFFFFFFF)
                         self(self, n.as.if_stmt.then_block);
                     if (n.as.if_stmt.else_block != 0xFFFFFFFF)
@@ -1134,10 +1141,10 @@ void pass_array_safety(const ASTContext &ctx, AnalysisState &state, PassScratch 
                         ? ctx.block_statements[n.as.local_decl.first_value + vi]
                         : ctx.block_statements[n.as.global_decl.first_value + vi];
                     if (vi < id_count) {
-                        uint32_t idi = ctx.block_statements[((n.type == NodeType::LocalDecl)
-                                                                ? n.as.local_decl.first_ident
-                                                                : n.as.global_decl.first_ident)
-                            + vi];
+                        uint32_t idi
+                            = ctx.block_statements[((n.type == NodeType::LocalDecl) ? n.as.local_decl.first_ident
+                                                                                    : n.as.global_decl.first_ident)
+                                + vi];
                         if (idi < ctx.nodes.size() && ctx.nodes[idi].type == NodeType::Identifier) {
                             std::string_view nm(ctx.nodes[idi].as.ident.name, ctx.nodes[idi].as.ident.length);
                             if (int_arrays.count(nm) && !violate_int.count(nm) && ctor_violates_int(v))
@@ -1231,8 +1238,7 @@ void pass_array_safety(const ASTContext &ctx, AnalysisState &state, PassScratch 
 
 //------------------ write_stores_non_number: true if an assignment value statically must hold a
 //------------------ non-number (declared above the drop scan that uses it; see comment there)
-static bool write_stores_non_number(const ASTContext &ctx, uint32_t node_idx, int depth = 0)
-{
+static bool write_stores_non_number(const ASTContext &ctx, uint32_t node_idx, int depth = 0) {
     if (depth > 32 || node_idx == 0xFFFFFFFF || node_idx >= ctx.nodes.size())
         return false;
     const auto &n = ctx.nodes[node_idx];
@@ -1744,9 +1750,8 @@ void pass_table_fields(const ASTContext &ctx, AnalysisState &state, PassScratch 
                     continue;
                 if (t_key >= ctx.nodes.size() || ctx.nodes[t_key].type != NodeType::String)
                     continue;
-                uint32_t vi = (ti < node.as.assign.value_count)
-                    ? ctx.block_statements[node.as.assign.first_value + ti]
-                    : 0xFFFFFFFF;
+                uint32_t vi = (ti < node.as.assign.value_count) ? ctx.block_statements[node.as.assign.first_value + ti]
+                                                                : 0xFFFFFFFF;
                 if (vi != 0xFFFFFFFF && !write_stores_non_number(ctx, vi))
                     continue;
                 std::string_view nm(ctx.nodes[t_tbl].as.ident.name, ctx.nodes[t_tbl].as.ident.length);
