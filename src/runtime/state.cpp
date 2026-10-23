@@ -176,6 +176,7 @@ void LState::invoke_gc_finalizer(LUserdata *ud, const char *tag) {
 
 void (*clx_io_flush_all_ptr)() = nullptr;
 void (*clx_io_write_ptr)(FILE *fp, const char *p, size_t n) = nullptr;
+MultiValue (*clx_string_dump_hook)(LState *L, const LValue *args, size_t count) = nullptr;
 
 //------------------ LState::~LState — state destructor
 LState::~LState() {
@@ -390,6 +391,7 @@ LValue LState::create_table(size_t asize, size_t hsize) {
     } else {
         t->array_size = 0;
     }
+    t->array_lim = 0;
 
     allocated_bytes += table_heap_bytes(t);
 
