@@ -44,12 +44,12 @@ inline struct tm *localtime(const time_t *timep, struct tm *result) {
 namespace clx {
 
 //------------------ os_clock: returns CPU time in seconds
-static MultiValue os_clock(LState *L, const LValue *args, size_t count) {
+MultiValue os_clock(LState *L, const LValue *args, size_t count) {
     return MultiValue(clx::number(static_cast<double>(std::clock()) / CLOCKS_PER_SEC));
 }
 
 //------------------ os_date: returns formatted date/time string or table
-static MultiValue os_date(LState *L, const LValue *args, size_t count) {
+MultiValue os_date(LState *L, const LValue *args, size_t count) {
     const char *format = opt_string(L, count >= 1 ? args[0] : LValue(), "%c");
     time_t t = std::time(nullptr);
     if (count >= 2 && args[1].type != Nil) {
@@ -97,7 +97,7 @@ static MultiValue os_date(LState *L, const LValue *args, size_t count) {
 }
 
 //------------------ os_difftime: returns difference in seconds between two times
-static MultiValue os_difftime(LState *L, const LValue *args, size_t count) {
+MultiValue os_difftime(LState *L, const LValue *args, size_t count) {
     if (count < 2)
         throw_runtime_error(bad_arg_msg(L, 1, "os.difftime", "number expected, got no value"));
     double t2 = check_number(L, args[0]);
@@ -106,7 +106,7 @@ static MultiValue os_difftime(LState *L, const LValue *args, size_t count) {
 }
 
 //------------------ os_execute: executes a system command
-static MultiValue os_execute(LState *L, const LValue *args, size_t count) {
+MultiValue os_execute(LState *L, const LValue *args, size_t count) {
     if (count == 0 || args[0].type == Nil) {
         int r = std::system(nullptr);
         return MultiValue(clx::boolean(r != 0));
@@ -117,7 +117,7 @@ static MultiValue os_execute(LState *L, const LValue *args, size_t count) {
 }
 
 //------------------ os_exit: terminates the program with a status code
-static MultiValue os_exit(LState *L, const LValue *args, size_t count) {
+MultiValue os_exit(LState *L, const LValue *args, size_t count) {
     int64_t code = 0;
     if (count >= 1 && args[0].type != Nil) {
         code = check_integer(L, args[0]);
@@ -127,7 +127,7 @@ static MultiValue os_exit(LState *L, const LValue *args, size_t count) {
 }
 
 //------------------ os_getenv: gets an environment variable
-static MultiValue os_getenv(LState *L, const LValue *args, size_t count) {
+MultiValue os_getenv(LState *L, const LValue *args, size_t count) {
     if (count == 0)
         throw_runtime_error(bad_arg_msg(L, 1, "os.getenv", "string expected, got no value"));
     const char *name = check_string(L, args[0]);
@@ -138,7 +138,7 @@ static MultiValue os_getenv(LState *L, const LValue *args, size_t count) {
 }
 
 //------------------ os_remove: deletes a file
-static MultiValue os_remove(LState *L, const LValue *args, size_t count) {
+MultiValue os_remove(LState *L, const LValue *args, size_t count) {
     if (count == 0)
         throw_runtime_error(bad_arg_msg(L, 1, "os.remove", "string expected, got no value"));
     const char *path = check_string(L, args[0]);
@@ -155,7 +155,7 @@ static MultiValue os_remove(LState *L, const LValue *args, size_t count) {
 }
 
 //------------------ os_rename: renames a file or directory
-static MultiValue os_rename(LState *L, const LValue *args, size_t count) {
+MultiValue os_rename(LState *L, const LValue *args, size_t count) {
     if (count < 2)
         throw_runtime_error(bad_arg_msg(L, 1, "os.rename", "string expected, got no value"));
     const char *oldname = check_string(L, args[0]);
@@ -171,7 +171,7 @@ static MultiValue os_rename(LState *L, const LValue *args, size_t count) {
 }
 
 //------------------ os_setlocale: sets or queries the program's locale
-static MultiValue os_setlocale(LState *L, const LValue *args, size_t count) {
+MultiValue os_setlocale(LState *L, const LValue *args, size_t count) {
     if (count == 0) {
         const char *cur = std::setlocale(LC_ALL, nullptr);
         return MultiValue(clx::string(L, cur ? cur : "C"));
@@ -204,7 +204,7 @@ static MultiValue os_setlocale(LState *L, const LValue *args, size_t count) {
 }
 
 //------------------ os_time: returns current time or converts a table to a time value
-static MultiValue os_time(LState *L, const LValue *args, size_t count) {
+MultiValue os_time(LState *L, const LValue *args, size_t count) {
     if (count == 0 || args[0].type == Nil) {
         return MultiValue(clx::number(static_cast<double>(std::time(nullptr))));
     }
@@ -234,7 +234,7 @@ static MultiValue os_time(LState *L, const LValue *args, size_t count) {
 }
 
 //------------------ os_tmpname: generates a temporary file path
-static MultiValue os_tmpname(LState *L, const LValue *args, size_t count) {
+MultiValue os_tmpname(LState *L, const LValue *args, size_t count) {
     try {
         static std::atomic<uint64_t> counter { 0 };
         auto temp_dir = std::filesystem::temp_directory_path();
