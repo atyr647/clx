@@ -94,6 +94,18 @@ inline const BuiltinEntry *builtin_lookup(std::string_view module, std::string_v
         { "string", "pack", nullptr, "str_pack", 1, true, false },
         { "string", "packsize", nullptr, "str_packsize", 1, true, false },
         { "string", "unpack", nullptr, "str_unpack", 1, true, false },
+        //------------------ os (cfunc only)
+        { "os", "clock", nullptr, "os_clock", 0, true, true },
+        { "os", "date", nullptr, "os_date", 0, true, false },
+        { "os", "difftime", nullptr, "os_difftime", 2, true, true },
+        { "os", "execute", nullptr, "os_execute", 0, true, false },
+        { "os", "exit", nullptr, "os_exit", 0, true, false },
+        { "os", "getenv", nullptr, "os_getenv", 1, true, false },
+        { "os", "remove", nullptr, "os_remove", 1, true, false },
+        { "os", "rename", nullptr, "os_rename", 2, true, false },
+        { "os", "setlocale", nullptr, "os_setlocale", 0, true, false },
+        { "os", "time", nullptr, "os_time", 0, true, true },
+        { "os", "tmpname", nullptr, "os_tmpname", 0, true, false },
         //------------------ table (cfunc only)
         { "table", "concat", nullptr, "table_concat", 1, true, false },
         { "table", "insert", nullptr, "table_insert", 2, true, false },
@@ -102,6 +114,7 @@ inline const BuiltinEntry *builtin_lookup(std::string_view module, std::string_v
         { "table", "pack", nullptr, "table_pack", 1, true, false },
         { "table", "unpack", nullptr, "table_unpack", 1, true, false },
         { "table", "move", nullptr, "table_move", 5, true, false },
+        { "table", "create", nullptr, "table_create", 0, true, false },
         //------------------ _G (intrinsic only — no clx:: CFunc symbols exist)
         { "_G", "type", "__clx_type", nullptr, 1, true, false },
         { "_G", "tostring", "__clx_tostring", nullptr, 1, true, false },
@@ -131,7 +144,7 @@ inline const BuiltinConst *builtin_const_lookup(std::string_view module, std::st
 }
 
 //------------------ kStdModules: std module globals known to the registry (write-scan coverage)
-inline constexpr std::string_view kStdModules[] = { "math", "string", "table", "_G" };
+inline constexpr std::string_view kStdModules[] = { "math", "string", "table", "os", "_G" };
 
 //------------------ is_std_module_name: name is a std module known to the registry
 inline bool is_std_module_name(std::string_view name) {
