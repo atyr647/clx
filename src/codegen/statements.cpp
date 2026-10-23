@@ -200,11 +200,9 @@ bool CodeEmitter::try_match_cmp_swap(uint32_t if_idx, CmpSwapMatch &m) {
         return false;
     const ASTNode &in = ctx.nodes[if_idx];
     uint32_t cond = in.as.if_stmt.condition;
-    while (cond != 0xFFFFFFFF && cond < ctx.nodes.size()
-        && ctx.nodes[cond].type == NodeType::ParenExpression)
+    while (cond != 0xFFFFFFFF && cond < ctx.nodes.size() && ctx.nodes[cond].type == NodeType::ParenExpression)
         cond = ctx.nodes[cond].as.paren_expr.expr;
-    if (cond == 0xFFFFFFFF || cond >= ctx.nodes.size()
-        || ctx.nodes[cond].type != NodeType::BinaryOp)
+    if (cond == 0xFFFFFFFF || cond >= ctx.nodes.size() || ctx.nodes[cond].type != NodeType::BinaryOp)
         return false;
     const ASTNode &bc = ctx.nodes[cond];
     int op = bc.as.bin_op.op;
@@ -287,10 +285,9 @@ void CodeEmitter::emit_cmp_swap(const CmpSwapMatch &m, uint32_t tag) {
     out << "auto _cssz" << s << " = _cs" << s << "->array_size;\n";
     out << "auto _cscap" << s << " = _cs" << s << "->array_cap;\n";
     out << "bool _csgen" << s << " = true;\n";
-    out << "if (_cko1" << s << " >= 1 && _cko2" << s << " >= 1 && static_cast<size_t>(_cko1" << s << ") <= _cssz"
-        << s << " && static_cast<size_t>(_cko2" << s << ") <= _cssz" << s << " && static_cast<size_t>(_cko1"
-        << s << ") <= _cscap" << s << " && static_cast<size_t>(_cko2" << s << ") <= _cscap" << s
-        << ") [[likely]] {\n";
+    out << "if (_cko1" << s << " >= 1 && _cko2" << s << " >= 1 && static_cast<size_t>(_cko1" << s << ") <= _cssz" << s
+        << " && static_cast<size_t>(_cko2" << s << ") <= _cssz" << s << " && static_cast<size_t>(_cko1" << s
+        << ") <= _cscap" << s << " && static_cast<size_t>(_cko2" << s << ") <= _cscap" << s << ") [[likely]] {\n";
     out << "#line " << m.body_line << " \"" << ctx.filename << "\"\n";
     out << "clx::TValue _csv1" << s << " = _csarr" << s << "[_cko1" << s << " - 1];\n";
     out << "clx::ValueType _csy1" << s << " = _cstyp" << s << "[_cko1" << s << " - 1];\n";
@@ -313,10 +310,10 @@ void CodeEmitter::emit_cmp_swap(const CmpSwapMatch &m, uint32_t tag) {
     out << "_cstyp" << s << "[_cko1" << s << " - 1] = _csy2" << s << ";\n";
     out << "_csarr" << s << "[_cko2" << s << " - 1] = _csv1" << s << ";\n";
     out << "_cstyp" << s << "[_cko2" << s << " - 1] = _csy1" << s << ";\n";
-    out << "clx::gc_barrier_table(L, _cs" << s << ", _csarr" << s << "[_cko1" << s << " - 1], _cstyp" << s
-        << "[_cko1" << s << " - 1]);\n";
-    out << "clx::gc_barrier_table(L, _cs" << s << ", _csarr" << s << "[_cko2" << s << " - 1], _cstyp" << s
-        << "[_cko2" << s << " - 1]);\n";
+    out << "clx::gc_barrier_table(L, _cs" << s << ", _csarr" << s << "[_cko1" << s << " - 1], _cstyp" << s << "[_cko1"
+        << s << " - 1]);\n";
+    out << "clx::gc_barrier_table(L, _cs" << s << ", _csarr" << s << "[_cko2" << s << " - 1], _cstyp" << s << "[_cko2"
+        << s << " - 1]);\n";
     out << "}\n_csgen" << s << " = false;\n";
     out << "}\n}\n";
     out << "if (_csgen" << s << ") {\n";
@@ -325,10 +322,10 @@ void CodeEmitter::emit_cmp_swap(const CmpSwapMatch &m, uint32_t tag) {
     out << ";\nclx::LValue _cg2" << s << " = ";
     emit_node(m.ord_r);
     out << ";\nif (clx::" << fn << "(L, _cg1" << s << ", _cg2" << s << ").as_bool()) {\n";
-    out << "clx::table_set(L, clx::LValue(clx::ValueType::Table, _cs" << s << "), clx::LValue(static_cast<int64_t>(_cko1"
-        << s << ")), _cg2" << s << ");\n";
-    out << "clx::table_set(L, clx::LValue(clx::ValueType::Table, _cs" << s << "), clx::LValue(static_cast<int64_t>(_cko2"
-        << s << ")), _cg1" << s << ");\n";
+    out << "clx::table_set(L, clx::LValue(clx::ValueType::Table, _cs" << s
+        << "), clx::LValue(static_cast<int64_t>(_cko1" << s << ")), _cg2" << s << ");\n";
+    out << "clx::table_set(L, clx::LValue(clx::ValueType::Table, _cs" << s
+        << "), clx::LValue(static_cast<int64_t>(_cko2" << s << ")), _cg1" << s << ");\n";
     out << "}\n}\n}\n";
 }
 
@@ -1180,9 +1177,37 @@ void CodeEmitter::emitReturnStatement(const ASTNode &node, uint32_t node_idx) {
                 out << "clx::MultiValue _mv_" << node_idx << " = clx::MultiValue(";
                 try_emit_native_call(tgt, call_node.as.call_expr.first_arg, call_node.as.call_expr.arg_count, false);
                 out << ");\n";
-                    out << "return _mv_" << node_idx << ";\n";
+                out << "return _mv_" << node_idx << ";\n";
             }
             return;
+        }
+
+        //------------------ builtin intrinsic alias tail call: raw call before generic dispatch;
+        //------------------ below-min-arg calls keep the cfunc/generic path for runtime arity checks
+        if (!is_direct && !fname.empty() && state.reassigned_vars.count(std::string(fname)) == 0
+            && state.fast_callables.count(std::string(fname)) == 0) {
+            auto _ait = state.intrinsic_aliases.find(std::string(fname));
+            if (_ait != state.intrinsic_aliases.end() && _ait->second->intrinsic
+                && call_node.as.call_expr.arg_count >= _ait->second->min_args) {
+                if (state.in_function_def && state.current_arena_func != 0xFFFFFFFF)
+                    out << "clx::arena_reset(&_arena);\n";
+                ASTNode _tmp { };
+                _tmp.type = NodeType::IntrinsicCall;
+                _tmp.line = call_node.line;
+                _tmp.as.intrinsic_call.cname = _ait->second->intrinsic;
+                _tmp.as.intrinsic_call.first_arg = call_node.as.call_expr.first_arg;
+                _tmp.as.intrinsic_call.arg_count = call_node.as.call_expr.arg_count;
+                if (state.in_function_def) {
+                    out << "return clx::MultiValue(";
+                    emitIntrinsicCall(_tmp, last_v_idx);
+                    out << ");\n";
+                } else {
+                    out << "return ";
+                    emitIntrinsicCall(_tmp, last_v_idx);
+                    out << ";\n";
+                }
+                return;
+            }
         }
 
         out << "{\n";
@@ -1217,7 +1242,7 @@ void CodeEmitter::emitReturnStatement(const ASTNode &node, uint32_t node_idx) {
                     out << "    for (size_t i = 0; i < _dyn_count; ++i) _fr.push(_dyn_buf[i]);\n";
                     out << "    clx::MultiValue _res = clx::call_cfunc_direct(L, " << impl_call(fname)
                         << ", _dyn_buf, _dyn_count);\n";
-                            out << "    return _res;\n";
+                    out << "    return _res;\n";
                 } else {
                     out << "    clx::MultiValue _res = clx::call_cfunc_direct(L, " << impl_call(fname)
                         << ", _dyn_buf, _dyn_count);\n";
@@ -1230,7 +1255,7 @@ void CodeEmitter::emitReturnStatement(const ASTNode &node, uint32_t node_idx) {
                 if (state.in_function_def) {
                     out << "    clx::MultiValue _res = clx::call_cfunc_rooted(L, clx::" << _bi_cf
                         << ", _dyn_buf, _dyn_count);\n";
-                            out << "    return _res;\n";
+                    out << "    return _res;\n";
                 } else {
                     out << "    clx::MultiValue _res = clx::call_cfunc_rooted(L, clx::" << _bi_cf
                         << ", _dyn_buf, _dyn_count);\n";
@@ -1249,7 +1274,7 @@ void CodeEmitter::emitReturnStatement(const ASTNode &node, uint32_t node_idx) {
                 emit_node(tgt);
                 out << ", _dyn_buf, _dyn_count, \"" << ctx.filename << "\", " << call_node.line << ");\n";
                 out << "    clx::call_ctx_pop(L);\n";
-                    out << "    return _res;\n";
+                out << "    return _res;\n";
             } else {
                 out << "    bool _rsm = L->pending_call_is_method; bool _rns = L->pending_call_name_short;\n";
                 out << "    L->pending_call_is_method = " << (ret_is_method ? "true" : "false")
@@ -1280,7 +1305,7 @@ void CodeEmitter::emitReturnStatement(const ASTNode &node, uint32_t node_idx) {
                             out << "    clx::arena_reset(&_arena);\n";
                         out << "    clx::MultiValue _res = clx::call_cfunc_direct(L, " << impl_call(fname) << ", args_"
                             << last_v_idx << ", " << call_node.as.call_expr.arg_count << ");\n";
-                                    out << "    return _res;\n";
+                        out << "    return _res;\n";
                     } else {
                         out << "    clx::MultiValue _res = clx::call_cfunc_direct(L, " << impl_call(fname) << ", args_"
                             << last_v_idx << ", " << call_node.as.call_expr.arg_count << ");\n";
@@ -1293,7 +1318,7 @@ void CodeEmitter::emitReturnStatement(const ASTNode &node, uint32_t node_idx) {
                     if (state.in_function_def) {
                         out << "    clx::MultiValue _res = clx::call_cfunc_rooted(L, clx::" << _bi_cf << ", args_"
                             << last_v_idx << ", " << call_node.as.call_expr.arg_count << ");\n";
-                                    out << "    return _res;\n";
+                        out << "    return _res;\n";
                     } else {
                         out << "    clx::MultiValue _res = clx::call_cfunc_rooted(L, clx::" << _bi_cf << ", args_"
                             << last_v_idx << ", " << call_node.as.call_expr.arg_count << ");\n";
@@ -1313,7 +1338,7 @@ void CodeEmitter::emitReturnStatement(const ASTNode &node, uint32_t node_idx) {
                     out << ", args_" << last_v_idx << ", " << call_node.as.call_expr.arg_count << ", \"" << ctx.filename
                         << "\", " << call_node.line << ");\n";
                     out << "    clx::call_ctx_pop(L);\n";
-                            out << "    return _res;\n";
+                    out << "    return _res;\n";
                 } else {
                     out << "    bool _rsm = L->pending_call_is_method; bool _rns = L->pending_call_name_short;\n";
                     out << "    L->pending_call_is_method = " << (ret_is_method ? "true" : "false")
@@ -1333,7 +1358,7 @@ void CodeEmitter::emitReturnStatement(const ASTNode &node, uint32_t node_idx) {
                     if (state.in_function_def) {
                         if (state.current_arena_func != 0xFFFFFFFF)
                             out << "    clx::arena_reset(&_arena);\n";
-                                    out << "    CLX_MUSTTAIL return " << impl_call(fname) << "(L, nullptr, 0);\n";
+                        out << "    CLX_MUSTTAIL return " << impl_call(fname) << "(L, nullptr, 0);\n";
                     } else {
                         out << "    clx::MultiValue _res = " << impl_call(fname) << "(L, nullptr, 0);\n";
                         out << "    return (_res.count > 0) ? _res[0] : clx::LValue();\n";
@@ -1342,7 +1367,7 @@ void CodeEmitter::emitReturnStatement(const ASTNode &node, uint32_t node_idx) {
                     && state.reassigned_vars.count(std::string(fname)) == 0) {
                     const std::string &_bi_cf = state.builtin_aliases.at(std::string(fname));
                     if (state.in_function_def) {
-                                    out << "    return clx::" << _bi_cf << "(L, nullptr, 0);\n";
+                        out << "    return clx::" << _bi_cf << "(L, nullptr, 0);\n";
                     } else {
                         out << "    clx::MultiValue _res = clx::" << _bi_cf << "(L, nullptr, 0);\n";
                         out << "    return (_res.count > 0) ? _res[0] : clx::LValue();\n";
@@ -1360,7 +1385,7 @@ void CodeEmitter::emitReturnStatement(const ASTNode &node, uint32_t node_idx) {
                         emit_node(tgt);
                         out << ", nullptr, 0, \"" << ctx.filename << "\", " << call_node.line << ");\n";
                         out << "    clx::call_ctx_pop(L);\n";
-                                    out << "    return _res;\n";
+                        out << "    return _res;\n";
                     } else {
                         out << "    bool _rsm = L->pending_call_is_method; bool _rns = L->pending_call_name_short;\n";
                         out << "    L->pending_call_is_method = " << (ret_is_method ? "true" : "false")
