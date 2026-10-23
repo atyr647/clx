@@ -11,6 +11,7 @@ extending clx, the Lua to native compiler.
 - **[Lua modules](./modules.md)** - Splitting your project across files, plus native C++ modules
 - **[Dynamic Lua](./dynamic-lua.md)** - Loading and running Lua at runtime with `--dynamic`
 - **[Lua 5.5 compatibility](./compatibility.md)** - What's supported and what isn't
+- **[Speed Tips](./speedtips.md)** - How to structure Lua so clx's optimizer keeps everything native
 - **[Benchmarks](./benchmarks.md)** - How clx compares with other Lua runtimes
 
 ## For developers
