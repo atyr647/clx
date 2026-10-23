@@ -1,6 +1,12 @@
 # clx Runtime
 
-The clx runtime library (`libclx.a`) implements Lua's core semantics in C++. It provides the necessary runtime support for compiled Lua programs.
+`libclx.a` is the C++ library every compiled Lua program links against. When the
+emitted code can't prove something at compile time, it calls into this library,
+which behaves exactly like stock Lua (same values, same errors, same GC promises).
+
+You don't need to read this page top to bottom. The first three sections (values, GC,
+roots) explain ideas the rest of the docs assume; everything after that is a
+per-module reference.
 
 ## Components
 
@@ -77,27 +83,14 @@ Generational collector, enabled by default:
 
 Set `CLX_GC_MODE=incremental` to opt back out to the legacy incremental collector. Tune the generations with `CLX_GC_MINOR_KB` and `CLX_GC_MAJOR_KB`.
 
-#### GC roots: root frames, not guards
+#### GC roots: root frames
 
-GC roots live in a chain of **root frames**, not on a manually managed stack. The
-primitives are in `include/clx_runtime.h`:
-
-- `RootRange` — one frame: a `base[0..n)` array marked by value plus `ind[]` aliases
-  marked by dereference. The constructor links it into the owning thread's `top_root`
-  chain; the destructor unlinks it, so unwinding unroots automatically with no explicit
-  restore.
-- `Frame<N>` / `FrameBase` — the single root frame emitted at the top of every generated
-  function (`clx::Frame<16> _fr(L)`). Locals, args, and temporaries are rooted with
-  `_fr.push(x)`. `N` inline slots cover realistic functions; a heap spill covers the rest,
-  transparently to the collector.
-- `FrameGuard` — RAII watermark save/restore for one block scope (loops, blocks). The
-  old `ScopeGuard` + `shadow_top` push/restore machinery is gone.
-
-Consequences for generated code: `return` statements emit **no** root restore — the return
-expression is evaluated with the full root set live (see
-`tests/regression/return_root_restore.lua`), and the frame unlinks itself when the C++
-function exits. Coroutine switches stash/load the whole root-frame chain
-(`root_stash`/`root_load` in `src/runtime/threads.cpp`) instead of copying a stack region.
+The GC must never free a value the program still uses. Every generated function opens
+with `clx::Frame<16> _fr(L)` and pins each local with `_fr.push(x)`. Frames chain
+together; when a C++ scope exits, its frame unlinks itself — no manual bookkeeping,
+and exceptions unsubscribe automatically. (Blocks use a `FrameGuard` watermark for the
+same idea at smaller scope.) Coroutine switches stash and reload the whole chain
+instead of copying memory around.
 
 ### 2. Base Library (src/runtime/base.cpp)
 
@@ -221,47 +214,30 @@ Module loading via `require` is implemented in the package library (package.cpp)
 
 ### 9. Closures and Upvalues
 
-clx supports lexical scoping with full closure capture:
-- Local variables captured by inner functions become upvalues
-- Shared upvalues (multiple closures sharing the same captured variable)
-- Loop variable capture (closures created in a for loop each capture the correct iteration value)
-- Triple nesting and arbitrary capture depth
-- Tail calls in return position are emitted as plain `return f(...)` temporaries; constant-stack
-  recursion for tail-recursive patterns depends on the C++ compiler's tail-call elimination
-  (the `CLX_MUSTTAIL` attribute covers only one zero-arg direct-call site — see
-  [Optimizations](./optimizations.md))
+Locals captured by inner functions become heap upvalues, shared correctly between
+closures (including the classic loop-variable capture). `return f(...)` tail calls
+compile to temporaries and rely on the C++ compiler's tail-call elimination (see
+[Optimizations](./optimizations.md)).
 
 ### 10. Goto and Labels
 
-Full `goto` / `::label::` support with proper lexical scoping:
-- Forward and backward jumps
-- Duplicate labels in different scopes resolve correctly
-- Goto can create loops (backward jumps)
+Full `goto` / `::label::` with lexical scoping — forward, backward, and duplicate
+labels in different scopes all work.
 
 ### 11. String Pool & Inlining (include/clx_runtime.h + LValue)
 
-Strings ≤6 bytes use **TAG_ISTR** — stored inline in the LValue (no heap allocation):
+Short strings (≤6 bytes) live *inside* the `LValue` itself (`TAG_ISTR`): the top byte
+holds the length, the low bytes hold the characters — no allocation at all. Longer
+strings are interned in the `StringPool`: one shared copy per distinct string,
+with the hash and length baked into a 16-byte header in front of the characters, so
+`len` and hash are each a single 4-byte load. Storage comes from a bump-allocated
+`StringArena` (64 KB blocks). Inline and interned strings hash identically, so
+comparisons work across the two forms.
 
 ```
 Byte layout (8 bytes): [len] [pad] [char5] [char4] [char3] [char2] [char1] [char0]
 Bits:                   63←56 55←48  47←40   39←32   31←24   23←16   15←8    7←0
 ```
-
-The top byte stores the length (0–6). Bytes 0–5 store up to 6 characters. Byte 6 is unused padding.
-
-Longer strings are interned via the StringPool:
-
-- **Baked allocation**: 16-byte header `[uint32 hash_low @0][pad @4][uint32 len @8][pad @12][char data...\0 @16]`
-- **One probe on hit**: No double lookup or side map
-- **Pre-hashed strings**: low 32 bits of the hash stored at `ptr[-16]` for near-zero recompute (single 4-byte load)
-- **Arena-backed**: strings are bump-allocated from a 64 KB-block `StringArena`
-- **Intern preallocated**: Supports adopting pre-formatted buffers (zero-allocation concat)
-
-Cross-type safety: `lvalue_hash` and `lvalue_eq_fast` (in `include/clx_runtime.h`) handle
-TAG_ISTR↔TAG_STRING lookups correctly — hashes match because both content-types use the same
-`swar_hash_8()` for strings ≤8 bytes.
-- For strings ≤8 bytes, `swar_hash_8()` loads all bytes into a single register (one unaligned `memcpy`) and mixes via `wyhash64(data ^ len)` — no branching, no function call overhead.
-- For strings >8 bytes, `wyhash_str()` is used (processes in 8-byte chunks).
 
 ### 12. StringBuilder (include/clx_runtime.h)
 
@@ -275,29 +251,12 @@ O(n) string concatenation avoiding quadratic blow-up:
 ### 13. Per-Table Inline Cache (include/clx_runtime.h)
 
 Per-LTable inline cache for string-keyed hash access. The cache lives in the table's lazily
-allocated `LTableExt` (so pure array-part tables never allocate it) and holds **8 entries**:
-
-```cpp
-static constexpr int LTABLE_IC_SIZE = 8;
-
-struct LTableInlineCache {
-    uint64_t key_payload = 0;  // Key's raw payload for fast comparison
-    uint32_t entry_idx = 0;    // Hash entry index
-    uint32_t table_ver = 0;    // Snapshot of hash_version at insertion
-};
-```
-
-On `gettable()`, the IC is indexed by a bit-mix of the key's payload. A hit requires:
-1. `key_payload` matches the key's raw 64-bit payload
-2. `table_ver` matches the table's current `hash_version` (no mutation since cache fill)
-3. The entry at `entry_idx` is not nil (tombstone/empty check)
-
-On miss, a linear-probe hash search runs and populates the IC slot.
-Works for any hash key — no restriction to specific table types or identifiers.
-
-The hot `table_get` fast path (array indexing + inline cache) is kept inline; a miss falls
-through to an out-of-line `table_get_slow` that performs the hash probe and metamethod
-(`__index`) dispatch.
+allocated `LTableExt` (so pure array-part tables never allocate it) and holds **8 entries**
+that remember key bits, entry index, and table version. A hit (same key, same version,
+entry still live) skips the hash probe; a miss probes normally and fills the slot. The
+cache is invalidated by `hash_version`, which moves only on structural change (rehash,
+metatable set, recycle). See [Optimizations](./optimizations.md#3-inline-caching) for
+the full story.
 
 ## Metamethods
 
@@ -327,64 +286,18 @@ clx supports all standard Lua metamethods:
 
 ### To-be-closed Variables (`<close>`)
 
-CLX supports Lua 5.4+ `<close>` attribute via `CloseGuard` (`clx_runtime.h`). When a variable is declared `local x <close> = ...`, the codegen emits a `CloseGuard` that calls the `__close` metamethod when the variable goes out of scope. `CloseGuard` holds its value directly as a by-value `LValue` member (kept alive for the guard's lifetime); it does not participate in the root-frame chain — rooting locals is the owning `Frame`'s job.
+`local x <close> = ...` runs the `__close` metamethod when `x` goes out of scope, via a `CloseGuard` in the generated code. The guard holds the value itself, so it stays alive exactly as long as needed.
 
 ## Memory Layout
 
-### Table Layout
-
-`LTable` is kept **compact (80 bytes)**. Hash, inline-cache, and metatable state are moved
-behind a lazily-allocated `LTableExt` pointer:
-
-```
-┌───────────────────────────────────────────────────────┐
-│ LHeader (16 bytes)                                    │
-│   - type, marked, flags, next                         │
-├───────────────────────────────────────────────────────┤
-│ Array fields (40 bytes)                               │
-│   - array pointer (8)                                 │
-│   - array_types pointer (8)                           │
-│   - array_size, array_cap (16)                        │
-│   - small_array[2], small_array_types[2]  (inline)    │
-├───────────────────────────────────────────────────────┤
-│ Indirection (8 bytes)                                 │
-│   - ext pointer → LTableExt (lazily allocated)        │
-└───────────────────────────────────────────────────────┘
-
-LTableExt (lazily allocated, only when hash/ic/metatable needed):
-  - entries, hash_size, hash_count, hash_tombs
-  - hash_bitmap pointer  (slot-occupancy bitmap)
-  - hash_version
-  - ic pointer           (8-entry inline cache)
-  - metatable, meta_next (GC metatable-list link)
-```
-
-Tables that stay purely array-part never allocate an `LTableExt`, keeping the hot read path
-on a single cache line. Arrays of size ≤ 2 use `small_array`/`small_array_types` inline.
-
-Hash entries are stored in a contiguous `HashEntry` array (24 bytes each: key TValue, val
-TValue, ktype, vtype). A `hash_bitmap` tracks occupied slots for fast iteration.
-
-`hash_version` is bumped only by hash **rehash** (the sole structural invalidator — rehashing
-relocates entries), plus metatable set and table recycle. Plain inserts and deletes never move
-entries and intentionally leave the version alone; value-only overwrites do not invalidate the
-cache.
-
-### String Layout
-
-Interned strings are stored with a **16-byte baked header** (low 32 bits of the wyhash + 32-bit length):
-
-- 4 bytes: baked hash (low 32 bits of wyhash), at `ptr[-16..-13]`
-- 4 bytes: padding
-- 4 bytes: length, at `ptr[-8..-5]`
-- 4 bytes: padding
-- char data: string content
-- 1 byte: null terminator
-
-The LValue stores a pointer to the char data (skipping the 16-byte header). Length and hash
-are each a single 4-byte load (`clx_memcpy(&len, ptr - 8, 4)` / `clx_memcpy(&h_low, ptr - 16, 4)`).
-String storage is backed by a block-based `StringArena` (64 KB blocks, bump
-allocated).
+`LTable` is **80 bytes**: the hot array part inline (plus a 2-slot inline buffer for
+tiny arrays), with hash entries, the occupancy bitmap, the inline cache, and the
+metatable moved behind a lazily allocated `LTableExt` pointer. Array-only tables
+never allocate the extension, keeping the hot read path on one cache line; the
+tag/payload arrays and the hash entries/bitmap each share one allocation. Strings
+carry a 16-byte header (baked hash + length) in front of the characters. See
+[Optimizations §2](./optimizations.md#2-table-memory-layout) for the rationale and
+the ASCII diagrams.
 
 ## Performance Characteristics
 
@@ -402,24 +315,21 @@ allocated).
 
 ## SIMD Runtime Scans
 
-The runtime uses AVX2 (32-byte) with SSE2 (x64) or NEON (ARM64) fallbacks to accelerate
-type-array scans. Scalar fallback handles non-32-byte-aligned remainders:
-
-- **`rawlen()`** — finds first nil in the array part to determine sequence length
-- **`next()`** — finds first non-nil after a given key index
-- **`table_concat` validation** — validates all elements are String/Double/Int64 in 32/16-byte chunks
-- **GC mark loop** — skips nil entries in the array part when tracing reachable objects
-
-The `LTableExt` `hash_bitmap` records which hash slots are occupied, letting `next()` and the
-GC skip empty slots directly when scanning the hash part.
+Type tags are single bytes, so 16–32 of them fit in one SIMD register. `rawlen`,
+`next`, `table_concat` validation, and the GC mark loop all scan tag arrays that
+way (AVX2 / SSE2 / NEON with scalar fallback). Details in
+[Optimizations §4](./optimizations.md#4-simd-runtime-scans).
 
 ## Pre-interned Metamethods
 
-To avoid repeated string interning on every metamethod dispatch, clx pre-interns common metamethod strings at LState initialization:
+To avoid repeated string interning on every metamethod dispatch, clx pre-interns the full metamethod set at LState initialization (`state.cpp`):
 
-- `str_index`, `str_newindex`, `str_gc`, `str_call`, `str_close`, `str_pairs`, `str_tostring`
+- `__index`, `__newindex`, `__gc`, `__call`, `__close`, `__pairs`, `__tostring`, `__len`,
+  `__eq`, `__lt`, `__le`, `__concat`, `__add`, `__sub`, `__mul`, `__div`, `__mod`,
+  `__idiv`, `__pow`, `__unm`, `__band`, `__bor`, `__bxor`, `__shl`, `__shr`, `__bnot`,
+  `__metatable`, `__name`, `__ipairs`
 
-These are stored directly in LState and used for fast metamethod lookup.
+These are stored directly in LState (`str_index`, `str_add`, …) and used for fast metamethod lookup.
 
 ## GC Options
 
