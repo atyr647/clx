@@ -8,6 +8,8 @@
 #include "dynamic_vm.h"
 #include "vm_convert.h"
 #include "vm_function_object.h"
+#include "dump_builtin.h"
+#include "../internal.h"
 #include <clx.h>
 #include <clx_runtime.h>
 #include <cstdio>
@@ -101,7 +103,8 @@ static MultiValue clx_load(LState *L, const LValue *args, size_t count) {
         return MultiValue(LValue(false), LValue(L->intern_string("load(): no chunk given")));
     }
 
-    const char *chunkname = nullptr;
+    //------------------ stock load() defaults chunkname to the chunk string itself (luaB_load)
+    const char *chunkname = src;
     if (count > 1 && args[1].type != Nil) {
         if (args[1].type != String)
             throw_runtime_error("bad argument #2 to 'load' (string expected)");
@@ -180,6 +183,10 @@ extern "C" void clx_register_load_builtins(clx::LState *L) {
     LValue load_fn = L->create_closure(clx_load);
     LValue loadfile_fn = L->create_closure(clx_loadfile);
     LValue dofile_fn = L->create_closure(clx_dofile);
+
+    //------------------ --dynamic builds give string.dump a VM backing: bytecode strings
+    //------------------ for VM functions, callable VM boxes for native closures (see dump_builtin.cpp)
+    clx_string_dump_hook = clx_string_dump_dynamic;
 
     set_global(L, "load", load_fn);
     set_global(L, "loadfile", loadfile_fn);
