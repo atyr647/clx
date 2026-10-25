@@ -58,7 +58,7 @@ inline const BuiltinEntry *builtin_lookup(std::string_view module, std::string_v
         { "math", "tanh", "std::tanh", nullptr, 1, false, true },
         { "math", "atan2", "std::atan2", nullptr, 2, false, true },
         { "math", "pow", "std::pow", nullptr, 2, false, true },
-        { "math", "fmod", "std::fmod", "math_fmod", 2, true, true },
+        { "math", "fmod", nullptr, "math_fmod", 2, true, true },
         { "math", "deg", "__clx_deg", "math_deg", 1, true, true },
         { "math", "rad", "__clx_rad", "math_rad", 1, true, true },
         //------------------ math (cfunc only)
