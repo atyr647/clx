@@ -317,10 +317,11 @@ CLX_INLINE_HOT void clx_reverse_bytes(char* dst, const char* src, size_t n)
         __m128i out = _mm_shuffle_epi8(v, rev);
         _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i), out);
     }
-    //------------------ scalar middle + head
-    for (size_t j = n - i; j > i; --j, ++i) {
-        dst[i] = src[j - 1];
-    }
+    //------------------ scalar middle + head: dst[i..n) mirrors src[0..n-i); the old
+    //------------------ j/i two-pointer form stopped early on odd remainders, leaving the
+    //------------------ tail (and the middle byte) unwritten
+    for (size_t m = n - i, k = 0; k < m; ++k)
+        dst[i + k] = src[m - 1 - k];
 #elif defined(CLX_HAS_NEON)
     static const uint8_t rev_idx[16] = { 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0 };
     const uint8x16_t rev = vld1q_u8(rev_idx);
@@ -329,9 +330,8 @@ CLX_INLINE_HOT void clx_reverse_bytes(char* dst, const char* src, size_t n)
         uint8x16_t out = vqtbl1q_u8(v, rev);
         vst1q_u8(reinterpret_cast<uint8_t*>(dst + i), out);
     }
-    for (size_t j = n - i; j > i; --j, ++i) {
-        dst[i] = src[j - 1];
-    }
+    for (size_t m = n - i, k = 0; k < m; ++k)
+        dst[i + k] = src[m - 1 - k];
 #else
     for (; i < n; ++i)
         dst[i] = src[n - 1 - i];
@@ -343,51 +343,53 @@ CLX_INLINE_HOT int clx_find_byte_of_set(const char* s, size_t n)
 {
     size_t i = 0;
 #if defined(CLX_HAS_AVX2) || defined(CLX_HAS_SSE2) || defined(CLX_HAS_NEON)
-    static const char kSpecials[8] = { '^', '$', '*', '+', '?', '.', '(', '[' };
-    static const char kSpecials2[8] = { '%', '-', 0, 0, 0, 0, 0, 0 };
+    static const char kSpecials[10] = { '^', '$', '*', '+', '?', '.', '(', '[', '%', '-' };
 #endif
 
     //------------------ 32-byte AVX2 path
 #if defined(CLX_HAS_AVX2)
     {
-        const __m256i sp1v = _mm256_set1_epi64x(*reinterpret_cast<const long long*>(kSpecials));
-        const __m256i sp2v = _mm256_set1_epi64x(*reinterpret_cast<const long long*>(kSpecials2));
+        const __m256i sp[10] = { _mm256_set1_epi8(kSpecials[0]), _mm256_set1_epi8(kSpecials[1]),
+            _mm256_set1_epi8(kSpecials[2]), _mm256_set1_epi8(kSpecials[3]), _mm256_set1_epi8(kSpecials[4]),
+            _mm256_set1_epi8(kSpecials[5]), _mm256_set1_epi8(kSpecials[6]), _mm256_set1_epi8(kSpecials[7]),
+            _mm256_set1_epi8(kSpecials[8]), _mm256_set1_epi8(kSpecials[9]) };
         for (; i + 32 <= n; i += 32) {
             __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i));
-            __m256i c1 = _mm256_cmpeq_epi8(v, sp1v);
-            __m256i c2 = _mm256_cmpeq_epi8(v, sp2v);
-            uint32_t mask = _mm256_movemask_epi8(_mm256_or_si256(c1, c2));
-            if (mask)
+            __m256i hit = _mm256_cmpeq_epi8(v, sp[0]);
+            for (int k = 1; k < 10; ++k)
+                hit = _mm256_or_si256(hit, _mm256_cmpeq_epi8(v, sp[k]));
+            if (_mm256_movemask_epi8(hit))
                 return 1;
         }
     }
     //------------------ 16-byte SSE2 path
 #elif defined(CLX_HAS_SSE2)
     {
-        const __m128i sp1v = _mm_set1_epi64x(*reinterpret_cast<const long long*>(kSpecials));
-        const __m128i sp2v = _mm_set1_epi64x(*reinterpret_cast<const long long*>(kSpecials2));
+        const __m128i sp[10] = { _mm_set1_epi8(kSpecials[0]), _mm_set1_epi8(kSpecials[1]),
+            _mm_set1_epi8(kSpecials[2]), _mm_set1_epi8(kSpecials[3]), _mm_set1_epi8(kSpecials[4]),
+            _mm_set1_epi8(kSpecials[5]), _mm_set1_epi8(kSpecials[6]), _mm_set1_epi8(kSpecials[7]),
+            _mm_set1_epi8(kSpecials[8]), _mm_set1_epi8(kSpecials[9]) };
         for (; i + 16 <= n; i += 16) {
             __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s + i));
-            __m128i c1 = _mm_cmpeq_epi8(v, sp1v);
-            __m128i c2 = _mm_cmpeq_epi8(v, sp2v);
-            int mask = _mm_movemask_epi8(_mm_or_si128(c1, c2));
-            if (mask)
+            __m128i hit = _mm_cmpeq_epi8(v, sp[0]);
+            for (int k = 1; k < 10; ++k)
+                hit = _mm_or_si128(hit, _mm_cmpeq_epi8(v, sp[k]));
+            if (_mm_movemask_epi8(hit))
                 return 1;
         }
     }
     //------------------ 16-byte NEON path
 #elif defined(CLX_HAS_NEON)
     {
-        uint8x16_t sp1v = vld1q_u8(reinterpret_cast<const uint8_t*>(kSpecials));
-        uint8x16_t sp2v = vld1q_u8(reinterpret_cast<const uint8_t*>(kSpecials2));
-
-        sp1v = vcombine_u8(vget_low_u8(sp1v), vget_low_u8(sp1v));
-        sp2v = vcombine_u8(vget_low_u8(sp2v), vget_low_u8(sp2v));
+        uint8x16_t sp[10];
+        for (int k = 0; k < 10; ++k)
+            sp[k] = vdupq_n_u8(static_cast<uint8_t>(kSpecials[k]));
         for (; i + 16 <= n; i += 16) {
             uint8x16_t v = vld1q_u8(reinterpret_cast<const uint8_t*>(s + i));
-            uint8x16_t c1 = vceqq_u8(v, sp1v);
-            uint8x16_t c2 = vceqq_u8(v, sp2v);
-            uint64x2_t lanes = vreinterpretq_u64_u8(vorrq_u8(c1, c2));
+            uint8x16_t hit = vceqq_u8(v, sp[0]);
+            for (int k = 1; k < 10; ++k)
+                hit = vorrq_u8(hit, vceqq_u8(v, sp[k]));
+            uint64x2_t lanes = vreinterpretq_u64_u8(hit);
             if (vgetq_lane_u64(lanes, 0) != 0 || vgetq_lane_u64(lanes, 1) != 0)
                 return 1;
         }
