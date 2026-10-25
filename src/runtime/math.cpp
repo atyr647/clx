@@ -216,14 +216,14 @@ MultiValue math_modf(LState *L, const LValue *args, size_t count) {
     return MultiValue({ clx::number(intpart), clx::number(fracpart) });
 }
 
-//------------------ math_tointeger: converts number to integer if possible
+//------------------ math_tointeger: converts number to integer if possible, else single nil
 MultiValue math_tointeger(LState *L, const LValue *args, size_t count) {
     if (count == 0)
         clx::error(L, bad_arg_msg(L, 1, "math.tointeger", "value expected").c_str());
     int64_t i;
     if (clx::to_integer(args[0], i))
         return MultiValue(clx::integer(i));
-    return MultiValue();
+    return MultiValue(LValue());
 }
 
 //------------------ math_random: returns pseudo-random number
