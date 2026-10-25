@@ -171,10 +171,13 @@ MultiValue str_upper(LState *L, const LValue *args, size_t count) {
 }
 
 //------------------ str_rep — string.rep: repeat string N times with optional separator
+//------------------ (stock requires arg 2; only an explicit nil falls back to the default 1)
 MultiValue str_rep(LState *L, const LValue *args, size_t count) {
     size_t len;
     const char *s = get_string(L, args, count, len, 1, "string.rep");
-    int64_t n = (count >= 2 && args[1].type != Nil) ? get_integer(L, args, count, 2, "string.rep") : 1;
+    if (count < 2)
+        throw_runtime_error(bad_arg_msg(L, 2, "string.rep", "number expected, got no value"));
+    int64_t n = (args[1].type != Nil) ? get_integer(L, args, count, 2, "string.rep") : 1;
     size_t lsep = 0;
     const char *sep = "";
     if (count >= 3 && args[2].type == String) {
