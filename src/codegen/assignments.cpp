@@ -265,8 +265,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                 if (v_count > 0) {
                     if (use_rhs_tmp) {
                         out << "_intf_l_" << single_name << " = _rhsf_" << node_idx << ";\n";
-                        out << "_ii_l_" << single_name << " = _intf_l_" << single_name << " ? (int64_t)("
-                            << int_value_expr(ctx.block_statements[first_v], 1) << ") : 0;\n";
+                        out << "_ii_l_" << single_name << " = _rhsi_" << node_idx << ";\n";
                     } else {
                         out << "_intf_l_" << single_name << " = (" << rhs_flag_text << ");\n";
                         out << "_ii_l_" << single_name << " = _intf_l_" << single_name << " ? (int64_t)("
@@ -1547,7 +1546,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                         break;
                     }
                 }
-                uint32_t v_init = (v_count > 0 && first_v + i < ctx.block_statements.size())
+                uint32_t v_init = (v_count > 0 && i < v_count && first_v + i < ctx.block_statements.size())
                     ? ctx.block_statements[first_v + i]
                     : 0xFFFFFFFF;
                 bool init_is_int = (v_init == 0xFFFFFFFF) || clx::is_purely_integer_expr(ctx, state, v_init);
