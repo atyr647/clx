@@ -257,6 +257,7 @@ void pass_callables(const ASTContext &ctx, AnalysisState &state, PassScratch &sk
             }
             if (pnames.empty())
                 continue;
+            auto &native_vec = is_native_vec;
             auto nil_scan = [&](auto &self, uint32_t nidx) -> void {
                 if (nidx >= ctx.nodes.size())
                     return;
@@ -272,7 +273,7 @@ void pass_callables(const ASTContext &ctx, AnalysisState &state, PassScratch &sk
                             uint32_t pi = ctx.block_statements[fn.as.func_def.first_param + p];
                             if (ctx.nodes[pi].type == NodeType::Identifier
                                 && std::string_view(ctx.nodes[pi].as.ident.name, ctx.nodes[pi].as.ident.length) == nm) {
-                                is_native_vec[p] = false;
+                                native_vec[p] = false;
                                 break;
                             }
                         }
