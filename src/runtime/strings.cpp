@@ -89,7 +89,7 @@ static size_t getendpos(int64_t pos, size_t len) {
 MultiValue str_len(LState *L, const LValue *args, size_t count) {
     size_t l;
     get_string(L, args, count, l, 1, "string.len");
-    return MultiValue(LValue(static_cast<int64_t>(l)));
+    return MultiValue(static_cast<int64_t>(l));
 }
 
 //------------------ str_sub — string.sub: extract substring by range
@@ -959,9 +959,9 @@ static MultiValue str_find_aux(LState *L, const LValue *args, size_t count, int 
         while (e < ls && std::isspace((unsigned char)s[e]))
             e++;
         if (find)
-            return MultiValue(LValue(static_cast<int64_t>(init + 1)), LValue(static_cast<int64_t>(e)),
-                LValue(static_cast<int64_t>(e + 1)));
-        return MultiValue(LValue(static_cast<int64_t>(e + 1)));
+            return MultiValue(static_cast<int64_t>(init + 1), static_cast<int64_t>(e),
+                static_cast<int64_t>(e + 1));
+        return MultiValue(static_cast<int64_t>(e + 1));
     }
 
     if (find && (plain || nospecials(p, lp))) {
@@ -1586,7 +1586,7 @@ MultiValue str_packsize(LState *L, const LValue *args, size_t count) {
             throw_runtime_error("format result too large");
         totalsize += size;
     }
-    return MultiValue(LValue(static_cast<int64_t>(totalsize)));
+    return MultiValue(static_cast<int64_t>(totalsize));
 }
 
 //------------------ str_unpack — string.unpack: unpack values from binary string
