@@ -62,16 +62,16 @@ clx::MultiValue lua_xpcall(clx::LState *L, const clx::LValue *args, size_t count
             = clx::call_function_rooted(L, func, func_args, arg_count, L->current_file, L->current_line);
 
         if (ret.count == 0)
-            return clx::MultiValue({ clx::boolean(true) });
+            return clx::MultiValue(true);
         if (ret.count == 1)
-            return clx::MultiValue({ clx::boolean(true), ret[0] });
+            return clx::MultiValue(true, ret[0]);
 
-        std::vector<clx::LValue> results;
-        results.reserve(ret.count + 1);
-        results.push_back(clx::boolean(true));
+        clx::MultiValue out;
+        out.alloc_L = L;
+        out.push_back(true);
         for (size_t i = 0; i < ret.count; ++i)
-            results.push_back(ret[i]);
-        return clx::MultiValue(results, L);
+            out.push_back(ret[i]);
+        return out;
 
     } catch (const clx::LRuntimeException &e) {
         clx::LValue err_obj = e.error_obj;
@@ -80,10 +80,10 @@ clx::MultiValue lua_xpcall(clx::LState *L, const clx::LValue *args, size_t count
         try {
             msgh_ret = clx::call_function_rooted(L, msgh, &err_obj, 1, L->current_file, L->current_line);
         } catch (...) {
-            return clx::MultiValue({ clx::boolean(false), clx::string(L, "error in error handling") });
+            return clx::MultiValue(false, clx::string(L, "error in error handling"));
         }
 
-        return clx::MultiValue({ clx::boolean(false), msgh_ret.count > 0 ? msgh_ret[0] : clx::LValue() });
+        return clx::MultiValue(false, msgh_ret.count > 0 ? msgh_ret[0] : clx::LValue());
 
     } catch (const std::exception &e) {
         clx::LValue err_obj = clx::string(L, e.what());
@@ -92,10 +92,10 @@ clx::MultiValue lua_xpcall(clx::LState *L, const clx::LValue *args, size_t count
         try {
             msgh_ret = clx::call_function_rooted(L, msgh, &err_obj, 1, L->current_file, L->current_line);
         } catch (...) {
-            return clx::MultiValue({ clx::boolean(false), clx::string(L, "error in error handling") });
+            return clx::MultiValue(false, clx::string(L, "error in error handling"));
         }
 
-        return clx::MultiValue({ clx::boolean(false), msgh_ret.count > 0 ? msgh_ret[0] : clx::LValue() });
+        return clx::MultiValue(false, msgh_ret.count > 0 ? msgh_ret[0] : clx::LValue());
     }
 }
 
