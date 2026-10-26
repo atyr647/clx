@@ -60,6 +60,19 @@ static inline void root_load(LState *L, LThread *t) {
     t->top_root = nullptr;
 }
 
+//---------- coro_switch_to: the single site for the platform context switch (fiber end, resume
+//---------- and yield each had their own copy). Conditions preserved exactly: the two middle
+//---------- branches had identical bodies, so they are OR-ed, nothing else changes.
+static inline void coro_switch_to(LThread *from, LThread *to) {
+#if defined(_WIN32)
+    SwitchToFiber(to->fiber);
+#elif ((defined(__APPLE__) || defined(__linux__)) && defined(__aarch64__)) || (defined(__linux__) && defined(__x86_64__))
+    clx_coro_switch(&from->ctx, &to->ctx);
+#else
+    swapcontext(&from->ctx, &to->ctx);
+#endif
+}
+
 static void fiber_entry_impl(LThread *t) {
     LState *L = t->state;
     for (;;) {
@@ -97,15 +110,7 @@ static void fiber_entry_impl(LThread *t) {
     L->running_thread = caller;
     caller->status = THREAD_RUNNING;
 
-#if defined(_WIN32)
-    SwitchToFiber(caller->fiber);
-#elif (defined(__APPLE__) || defined(__linux__)) && defined(__aarch64__)
-    clx_coro_switch(&t->ctx, &caller->ctx);
-#elif defined(__linux__) && defined(__x86_64__)
-    clx_coro_switch(&t->ctx, &caller->ctx);
-#else
-    swapcontext(&t->ctx, &caller->ctx);
-#endif
+    coro_switch_to(t, caller);
 }
 
 #if defined(_WIN32)
@@ -176,12 +181,10 @@ LValue create_thread(LState *L, const LValue &func, double stack_size) {
     if (!t->stack_memory)
         t->stack_memory = new char[t->stack_bytes];
     clx_coro_init(&t->ctx, t->stack_memory + t->stack_bytes, (void *)fiber_trampoline);
-    g_starting_thread = t;
 #elif defined(__linux__) && defined(__x86_64__)
     if (!t->stack_memory)
         t->stack_memory = new char[t->stack_bytes];
     clx_coro_init(&t->ctx, t->stack_memory + t->stack_bytes, (void *)fiber_trampoline);
-    g_starting_thread = t;
 #else
     getcontext(&t->ctx);
     if (!t->stack_memory)
@@ -189,7 +192,6 @@ LValue create_thread(LState *L, const LValue &func, double stack_size) {
     t->ctx.uc_stack.ss_sp = t->stack_memory;
     t->ctx.uc_stack.ss_size = static_cast<size_t>(stack_size);
     t->ctx.uc_link = nullptr;
-    g_starting_thread = t;
     makecontext(&t->ctx, fiber_trampoline, 0);
 #endif
 
@@ -205,8 +207,15 @@ LValue create_thread(LState *L, const LValue &func, double stack_size) {
 //------------------ resume: resumes a suspended coroutine (public API)
 MultiValue resume(LState *L, const LValue &thread, const LValue *args, size_t count) {
     LThread *t = static_cast<LThread *>(thread.as_pointer());
-    t->resume_args = MultiValue(args, count, L);
+    //------------------ assign() reuses the thread's already-constructed inline slots: no temp
+    //------------------ MultiValue + move-assign copy chain on every resume.
+    t->resume_args.assign(args, count, L);
     t->has_error = false;
+#if !defined(_WIN32)
+    // fiber_trampoline() reads g_starting_thread on the thread's first entry. create_thread() also sets it,
+    // but with several coroutines created before the first resume it would point at the last one created.
+    if (!t->started) g_starting_thread = t;
+#endif
     t->started = true;
     if (L->gc_mode == LState::GCMode::Generational && t->age == AGE_OLD) {
         for (size_t i = 0; i < t->resume_args.count; ++i)
@@ -219,28 +228,28 @@ MultiValue resume(LState *L, const LValue &thread, const LValue *args, size_t co
     root_load(L, t);
     L->running_thread = t;
 
-#if defined(_WIN32)
-    SwitchToFiber(t->fiber);
-#elif (defined(__APPLE__) || defined(__linux__)) && defined(__aarch64__)
-    clx_coro_switch(&t->caller->ctx, &t->ctx);
-#elif defined(__linux__) && defined(__x86_64__)
-    clx_coro_switch(&t->caller->ctx, &t->ctx);
-#else
-    swapcontext(&t->caller->ctx, &t->ctx);
-#endif
+    coro_switch_to(t->caller, t);
 
+    //------------------ Build (ok, yield_args...) directly in the return slot: one placement-new per
+    //------------------ value, no temp buffer + re-copy (was: fill buf[total], then MultiValue(buf)
+    //------------------ copied every slot a second time, plus dead default-ctors for the inline buf).
     size_t total = 1 + t->yield_args.count;
-    LValue *buf;
-    LValue inline_buf[3];
-    if (total <= 3) {
-        buf = inline_buf;
+    MultiValue ret;
+    ret.count = total;
+    ret.alloc_L = L;
+    LValue *dst = ret.inline_ptr();
+    size_t n_inline = (total < MultiValue::INLINE_CAP) ? total : MultiValue::INLINE_CAP;
+    new (dst) LValue(!t->has_error);
+    for (size_t i = 1; i < n_inline; ++i)
+        new (dst + i) LValue(t->yield_args[i - 1]);
+    if (total <= MultiValue::INLINE_CAP) {
+        ret.overflow = nullptr;
     } else {
-        buf = L->alloc_overflow(total);
+        ret.overflow = L->alloc_overflow(total - MultiValue::INLINE_CAP);
+        for (size_t i = MultiValue::INLINE_CAP; i < total; ++i)
+            ret.overflow[i - MultiValue::INLINE_CAP] = t->yield_args[i - 1];
     }
-    buf[0] = boolean(!t->has_error);
-    for (size_t i = 0; i < t->yield_args.count; ++i)
-        buf[1 + i] = t->yield_args[i];
-    return MultiValue(buf, total, L);
+    return ret;
 }
 
 //------------------ yield: yields from a coroutine (public API)
@@ -248,12 +257,16 @@ MultiValue yield(LState *L, const LValue *args, size_t count) {
     LThread *t = L->running_thread;
     if (t->is_main)
         clx::error(L, "attempt to yield from outside a coroutine");
-    t->yield_args = MultiValue(args, count, L);
+    t->yield_args.assign(args, count, L);
     if (L->gc_mode == LState::GCMode::Generational && t->age == AGE_OLD) {
         for (size_t i = 0; i < t->yield_args.count; ++i)
             gc_barrier_header(L, t, t->yield_args[i]);
     }
     t->status = THREAD_SUSPENDED;
+    // The coroutine may have stored young objects in its frame slots since the last minor GC scanned it.
+    // An old suspended thread is only rescanned if remembered, so remember it whenever it suspends.
+    if (L->gc_mode == LState::GCMode::Generational && t->age == AGE_OLD)
+        L->gc_remember(t);
 
     LThread *caller = t->caller;
     root_stash(L, t);
@@ -261,15 +274,7 @@ MultiValue yield(LState *L, const LValue *args, size_t count) {
     L->running_thread = caller;
     caller->status = THREAD_RUNNING;
 
-#if defined(_WIN32)
-    SwitchToFiber(caller->fiber);
-#elif (defined(__APPLE__) || defined(__linux__)) && defined(__aarch64__)
-    clx_coro_switch(&t->ctx, &caller->ctx);
-#elif defined(__linux__) && defined(__x86_64__)
-    clx_coro_switch(&t->ctx, &caller->ctx);
-#else
-    swapcontext(&t->ctx, &caller->ctx);
-#endif
+    coro_switch_to(t, caller);
 
     if (t->close_requested) {
         t->close_requested = false;
@@ -287,7 +292,7 @@ MultiValue close_thread(LState *L, const LValue &thread) {
     LThread *t = static_cast<LThread *>(thread.as_pointer());
 
     if (t->status == THREAD_DEAD)
-        return MultiValue(clx::boolean(true));
+        return MultiValue(true);
 
     if (t->status == THREAD_RUNNING)
         clx::error(L, "cannot close running coroutine");
@@ -299,9 +304,9 @@ MultiValue close_thread(LState *L, const LValue &thread) {
     MultiValue result = resume(L, thread, nullptr, 0);
 
     if (t->status == THREAD_DEAD)
-        return MultiValue(clx::boolean(true));
+        return MultiValue(true);
 
-    return MultiValue(clx::boolean(false));
+    return MultiValue(false);
 }
 
 }
