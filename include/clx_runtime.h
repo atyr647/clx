@@ -447,37 +447,88 @@ struct MultiValue {
     size_t count = 0;
     clx::LValue *overflow = nullptr;
     LState *alloc_L = nullptr;
-    clx::LValue inline_vals[INLINE_CAP];
+    //------------------ Raw inline storage: only the first min(count, INLINE_CAP) slots are ever
+    //------------------ constructed (placement-new). LValue is trivially destructible, so unused slots cost
+    //------------------ nothing and no destruction is needed. This removes 3-4 dead LValue()/TValue()
+    //------------------ constructions per MultiValue temporary (the default ctor used to build all four).
+    alignas(clx::LValue) unsigned char inline_buf[INLINE_CAP * sizeof(clx::LValue)];
+
+    CLX_INLINE_HOT clx::LValue *inline_ptr() { return reinterpret_cast<clx::LValue *>(inline_buf); }
+    CLX_INLINE_HOT const clx::LValue *inline_ptr() const {
+        return reinterpret_cast<const clx::LValue *>(inline_buf);
+    }
 
     MultiValue() = default;
 
     MultiValue(const clx::LValue &single)
         : count(1) {
-        inline_vals[0] = single;
+        new (inline_buf) clx::LValue(single);
     }
 
     MultiValue(const clx::LValue &a, const clx::LValue &b)
         : count(2) {
-        inline_vals[0] = a;
-        inline_vals[1] = b;
+        new (inline_buf) clx::LValue(a);
+        new (inline_buf + sizeof(clx::LValue)) clx::LValue(b);
     }
 
     MultiValue(const clx::LValue &a, const clx::LValue &b, const clx::LValue &c)
         : count(3) {
-        inline_vals[0] = a;
-        inline_vals[1] = b;
-        inline_vals[2] = c;
+        new (inline_buf) clx::LValue(a);
+        new (inline_buf + sizeof(clx::LValue)) clx::LValue(b);
+        new (inline_buf + 2 * sizeof(clx::LValue)) clx::LValue(c);
     }
+
+    //------------------ Primitive ctors: construct the LValue in place, skipping the LValue temporary
+    //------------------ + copy that `MultiValue(LValue(int64))` paid at every single-value return.
+    MultiValue(int64_t i)
+        : count(1) {
+        new (inline_buf) clx::LValue(i);
+    }
+
+    MultiValue(bool b)
+        : count(1) {
+        new (inline_buf) clx::LValue(b);
+    }
+
+    MultiValue(bool a, const clx::LValue &b)
+        : count(2) {
+        new (inline_buf) clx::LValue(a);
+        new (inline_buf + sizeof(clx::LValue)) clx::LValue(b);
+    }
+
+    MultiValue(int64_t a, int64_t b, int64_t c)
+        : count(3) {
+        new (inline_buf) clx::LValue(a);
+        new (inline_buf + sizeof(clx::LValue)) clx::LValue(b);
+        new (inline_buf + 2 * sizeof(clx::LValue)) clx::LValue(c);
+    }
+
+    //------------------ push_back: appends one value, constructing it in place in the inline slots
+    //------------------ (no LValue temporary + vector hop). Overflow beyond INLINE_CAP is bump-allocated;
+    //------------------ the growth path is cold (only 4+ returns take it) and keeps alloc_L-backed data
+    //------------------ safe across the realloc inside alloc_overflow via a snapshot copy.
+    CLX_INLINE_HOT void push_back(const clx::LValue &v) { new (push_slot()) clx::LValue(v); }
+
+    CLX_INLINE_HOT void push_back(bool b) { new (push_slot()) clx::LValue(b); }
+
+    CLX_INLINE_HOT clx::LValue *push_slot() {
+        if (count < INLINE_CAP)
+            return inline_ptr() + count++;
+        return push_grow();
+    }
+
+    //------------------ Defined out of line (below LState) like overflow_init: needs LState complete.
+    CLX_INLINE_COLD clx::LValue *push_grow();
 
     MultiValue(const clx::LValue *arr, size_t c, LState *L = nullptr)
         : count(c)
         , alloc_L(L) {
         if (c <= INLINE_CAP) {
             for (size_t i = 0; i < c; ++i)
-                inline_vals[i] = arr[i];
+                new (inline_buf + i * sizeof(clx::LValue)) clx::LValue(arr[i]);
         } else {
             for (size_t i = 0; i < INLINE_CAP; ++i)
-                inline_vals[i] = arr[i];
+                new (inline_buf + i * sizeof(clx::LValue)) clx::LValue(arr[i]);
             overflow_init(arr, c);
         }
     }
@@ -492,8 +543,9 @@ struct MultiValue {
         : count(other.count)
         , alloc_L(other.alloc_L) {
         size_t inline_c = (count < INLINE_CAP) ? count : INLINE_CAP;
+        const clx::LValue *src = other.inline_ptr();
         for (size_t i = 0; i < inline_c; ++i)
-            inline_vals[i] = other.inline_vals[i];
+            new (inline_buf + i * sizeof(clx::LValue)) clx::LValue(src[i]);
         overflow = other.overflow;
     }
 
@@ -502,8 +554,9 @@ struct MultiValue {
         , overflow(other.overflow)
         , alloc_L(other.alloc_L) {
         size_t inline_c = (count < INLINE_CAP) ? count : INLINE_CAP;
+        const clx::LValue *src = other.inline_ptr();
         for (size_t i = 0; i < inline_c; ++i)
-            inline_vals[i] = other.inline_vals[i];
+            new (inline_buf + i * sizeof(clx::LValue)) clx::LValue(src[i]);
         other.overflow = nullptr;
         other.count = 0;
         other.alloc_L = nullptr;
@@ -511,12 +564,21 @@ struct MultiValue {
 
     MultiValue &operator=(MultiValue &&other) noexcept {
         if (this != &other) {
+            //------------------ Slots below old_live are already constructed: assign. Slots at or above
+            //------------------ it are raw: placement-new. (LValue is trivially destructible, so shrinking
+            //------------------ needs no destruction; growing must not assign into raw storage.)
+            size_t old_live = (count < INLINE_CAP) ? count : INLINE_CAP;
             count = other.count;
             overflow = other.overflow;
             alloc_L = other.alloc_L;
             size_t inline_c = (count < INLINE_CAP) ? count : INLINE_CAP;
-            for (size_t i = 0; i < inline_c; ++i)
-                inline_vals[i] = other.inline_vals[i];
+            const clx::LValue *src = other.inline_ptr();
+            clx::LValue *dst = inline_ptr();
+            size_t i = 0;
+            for (; i < inline_c && i < old_live; ++i)
+                dst[i] = src[i];
+            for (; i < inline_c; ++i)
+                new (dst + i) clx::LValue(src[i]);
             other.overflow = nullptr;
             other.count = 0;
             other.alloc_L = nullptr;
@@ -526,22 +588,50 @@ struct MultiValue {
 
     MultiValue &operator=(const MultiValue &other) {
         if (this != &other) {
+            size_t old_live = (count < INLINE_CAP) ? count : INLINE_CAP;
             count = other.count;
             alloc_L = other.alloc_L;
             size_t inline_c = (count < INLINE_CAP) ? count : INLINE_CAP;
-            for (size_t i = 0; i < inline_c; ++i)
-                inline_vals[i] = other.inline_vals[i];
+            const clx::LValue *src = other.inline_ptr();
+            clx::LValue *dst = inline_ptr();
+            size_t i = 0;
+            for (; i < inline_c && i < old_live; ++i)
+                dst[i] = src[i];
+            for (; i < inline_c; ++i)
+                new (dst + i) clx::LValue(src[i]);
             overflow = other.overflow;
         }
         return *this;
     }
 
+    //------------------ In-place assign from an array: reuses already-constructed inline slots (assign)
+    //------------------ and placement-news only the growth. Saves one full set of constructions versus
+    //------------------ `m = MultiValue(arr, c, L)` (temp constructs c, then move-assigns c again). Overflow
+    //------------------ beyond INLINE_CAP is freshly bump-allocated; stale bump pointers die at GC reset.
+    CLX_INLINE_HOT void assign(const clx::LValue *arr, size_t c, LState *L = nullptr) {
+        size_t old_live = (count < INLINE_CAP) ? count : INLINE_CAP;
+        count = c;
+        alloc_L = L;
+        clx::LValue *dst = inline_ptr();
+        size_t inline_c = (c < INLINE_CAP) ? c : INLINE_CAP;
+        size_t i = 0;
+        for (; i < inline_c && i < old_live; ++i)
+            dst[i] = arr[i];
+        for (; i < inline_c; ++i)
+            new (dst + i) clx::LValue(arr[i]);
+        if (c <= INLINE_CAP) {
+            overflow = nullptr;
+        } else {
+            overflow_init(arr, c);
+        }
+    }
+
     ~MultiValue() = default;
 
-    clx::LValue &operator[](size_t i) { return (i < INLINE_CAP) ? inline_vals[i] : overflow[i - INLINE_CAP]; }
+    clx::LValue &operator[](size_t i) { return (i < INLINE_CAP) ? inline_ptr()[i] : overflow[i - INLINE_CAP]; }
 
     const clx::LValue &operator[](size_t i) const {
-        return (i < INLINE_CAP) ? inline_vals[i] : overflow[i - INLINE_CAP];
+        return (i < INLINE_CAP) ? inline_ptr()[i] : overflow[i - INLINE_CAP];
     }
 
     void overflow_init(const clx::LValue *arr, size_t c);
@@ -1986,6 +2076,22 @@ inline void MultiValue::overflow_init(const clx::LValue *arr, size_t c) {
     overflow = alloc_L->alloc_overflow(c - INLINE_CAP);
     for (size_t i = INLINE_CAP; i < c; ++i)
         overflow[i - INLINE_CAP] = arr[i];
+}
+
+inline clx::LValue *MultiValue::push_grow() {
+    if (!alloc_L)
+        throw std::runtime_error(
+            "clx: MultiValue overflow requires an LState; pass L when returning more than 4 values");
+    size_t have = count - INLINE_CAP;
+    std::vector<clx::LValue> tmp;
+    tmp.reserve(have);
+    for (size_t i = 0; i < have; ++i)
+        tmp.push_back(overflow[i]);
+    LValue *nb = alloc_L->alloc_overflow(have + 1);
+    for (size_t i = 0; i < have; ++i)
+        nb[i] = tmp[i];
+    overflow = nb;
+    return nb + (count++ - INLINE_CAP);
 }
 
 //------------------ String builder (part list)
