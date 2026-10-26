@@ -38,7 +38,8 @@ void pass_node_func_owner(const ASTContext &ctx, AnalysisState &state, uint32_t 
             if (owner != 0xFFFFFFFFu)
                 state.node_func_owner[ni] = owner;
             const auto &nn = ctx.nodes[ni];
-            auto push = [&](uint32_t idx) { stk.emplace_back(idx, owner); };
+            uint32_t own = owner;
+            auto push = [&](uint32_t idx) { stk.emplace_back(idx, own); };
             switch (nn.type) {
             case NodeType::Block:
                 for (uint32_t bi = 0; bi < nn.as.block.count; ++bi)
