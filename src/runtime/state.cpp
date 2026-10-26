@@ -488,7 +488,11 @@ LValue get_global(LState *L, const char *name) {
 
 //------------------ set_global — set global variable
 void set_global(LState *L, const char *name, const LValue &val) {
-    L->_G->settable(LValue(L->intern_string(name)), val);
+    LValue key = LValue(L->intern_string(name));
+    gc_barrier_table(L, L->_G, val);
+    if (key.is_gc_obj())
+        gc_barrier_table(L, L->_G, key);
+    L->_G->settable(key, val);
 }
 
 //------------------ open — create Lua state
