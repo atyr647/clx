@@ -51,15 +51,23 @@ MultiValue call_function(LState *L, const LValue &func, const LValue *args, size
             if (m.type != Nil) {
                 size_t nargs = count + 1;
                 LValue *new_args;
-                LValue stack_buf[16];
+                alignas(LValue) unsigned char stack_buf[16 * sizeof(LValue)];
                 bool heap = nargs > 16;
                 if (heap)
                     new_args = new LValue[nargs];
                 else
-                    new_args = stack_buf;
-                new_args[0] = func;
-                for (size_t i = 0; i < count; ++i)
-                    new_args[i + 1] = args[i];
+                    new_args = reinterpret_cast<LValue *>(stack_buf);
+                //------------------ Placement-new only the slots used (was: 16 default ctors + assigns).
+                //------------------ Heap path keeps default-new (cold; delete[] needs live objects).
+                if (heap) {
+                    new_args[0] = func;
+                    for (size_t i = 0; i < count; ++i)
+                        new_args[i + 1] = args[i];
+                } else {
+                    new (new_args) LValue(func);
+                    for (size_t i = 0; i < count; ++i)
+                        new (new_args + i + 1) LValue(args[i]);
+                }
 
                 MultiValue ret = call_function_rooted(L, m, new_args, nargs, file, line);
                 if (heap)
@@ -93,23 +101,23 @@ MultiValue pcall_function(LState *L, const LValue &func, const LValue *args, siz
         }
         MultiValue ret = call_function(L, func, args, count, L->current_file, 0);
         if (ret.count == 0)
-            return MultiValue({ LValue(true) });
+            return MultiValue(true);
         if (ret.count == 1)
-            return MultiValue({ LValue(true), ret[0] });
-        std::vector<LValue> results;
-        results.reserve(ret.count + 1);
-        results.push_back(LValue(true));
+            return MultiValue(true, ret[0]);
+        MultiValue out;
+        out.alloc_L = L;
+        out.push_back(true);
         for (size_t i = 0; i < ret.count; ++i)
-            results.push_back(ret[i]);
-        return MultiValue(results, L);
+            out.push_back(ret[i]);
+        return out;
     } catch (const LRuntimeException &e) {
         LValue err_val = e.error_obj;
         if (err_val.type != String) {
             err_val = LValue(L->intern_string(e.what()));
         }
-        return MultiValue({ LValue(false), err_val });
+        return MultiValue(false, err_val);
     } catch (const std::exception &e) {
-        return MultiValue({ LValue(false), LValue(L->intern_string(e.what())) });
+        return MultiValue(false, LValue(L->intern_string(e.what())));
     }
 }
 
