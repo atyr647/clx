@@ -709,7 +709,12 @@ void LTable::bind(LState *L, const char *name, CFunctionType func) {
     f->next = L->allocated_objects;
     L->allocated_objects = f;
     L->gc_recent.push(f);
-    settable(LValue(L->intern_string(name)), LValue(Function, f));
+    LValue key = LValue(L->intern_string(name));
+    LValue cfn = LValue(Function, f);
+    gc_barrier_table(L, this, cfn);
+    if (key.is_gc_obj())
+        gc_barrier_table(L, this, key);
+    settable(key, cfn);
 }
 
 //------------------ LTable::bind_all — bind multiple C functions
