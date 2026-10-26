@@ -6,44 +6,7 @@ The format is loosely based on Keep a Changelog and the project follows Semantic
 
 ---
 
-## [0.5.0] - 2026-10-25
-
-### Added
-
-* Centralized std builtin registry (`src/builtins.h`): the single source of truth for parser intrinsic rewrites, alias registration, direct-call lowering and hoisted cfunc selection, with per-entry intrinsic names, runtime symbols, arity floors and numeric-result flags
-* `string.dump()` now works: under `--dynamic`, VM-loaded functions dump to stock-identical bytecode that `load()` reads back (byte-for-byte parity with Lua 5.5, including strip mode, text-mode rejection and upvalue behavior); compiled or C functions dump to a callable snapshot in every build mode instead of throwing
-* Allocation and GC stat counters in the runtime, with a one-line summary report covering table closures, interning, GC and mark/sweep phases
-* New Speed Tips guide (`doc/speedtips.md`, linked from README and docs index) listing the patterns that unlock native fast paths, plus a FAQ entry explaining why the backend is C++20 and not C
-
-### Changed
-
-* Numeric-`for` loops dispatch on the runtime control types like stock `OP_FORPREP`: integer controls keep an integer loop variable, so `math.type(i)` and `tostring(i)` match Lua where the old `double` counter did not
-* Multi-file `--cpp` emits one translation unit per input module instead of only the entry chunk
-* String escapes decode once at parse time with `file:line` errors, and the parser resolves captures/globals/symbols while parsing
-* Builtin and intrinsic calls lower through one shared path: alias call sites synthesize temp nodes, tail calls emit raw calls before generic dispatch, and direct module calls qualified by the builtin registry prove numeric
-* Smarter numeric inference: function parameters used in arithmetic and loop/array bounds are detected as numeric, and integer classification is re-validated at declaration sites
-* `math.*` runtime entries have external linkage so per-function registrar tables can reference them
-* Struct promotion rejects non-identifier field names outright instead of mangling them with a suffix
-* Repo hygiene: `article.md` and `deviations.md` are excluded via `.git/info/exclude` (local-only) instead of `.gitignore`
-
-### Fixed
-
-* `utf8` now matches stock byte-for-byte: `len`/`codepoint`/`offset`/`codes` errors carry the `file:line:` prefix, `codes` uses the `bad argument #1` shape for leading continuations and errors with zero yields on stray continuations, and `offset(s, 0, i)` returns the correct end position
-* `get_string` coerces numbers like `luaL_checklstring`, with stock `string expected, got <type>` errors otherwise; `%q` escaping and `find`/`match` edge semantics fixed
-* Float-typed locals shadowed by an earlier integer of the same name are no longer misdeclared `int64_t`, so `a // 0` yields `inf` via the float path like stock
-* `load()` without a chunkname now defaults to the source string like stock (was `"[chunk]"`); loading a chunk with no upvalues no longer refs the environment table instead of the function (was `attempt to call a table value` on dumped zero-upvalue functions)
-* Promoted structs are emitted in an anonymous namespace (internal linkage), so same-named shapes in different translation units cannot violate ODR
-* `table.insert`/`table.remove` aliases count as length-changing in table analysis
-* Silenced the Apple Clang deprecated-enum warning coming from upstream sokol headers
-
-### Tests
-
-* New cross-TU struct-collision regression test (`struct_odr_main` + `struct_odr_a`/`struct_odr_b`, wired into `run.sh` and `run.bat`): two modules emitting the same struct name with different layouts must link and run correctly
-* New `string_dump` conformance test (bare + `--dynamic` AOT, wired into `run.sh` and `test-load.sh`/`test-load.bat`): snapshot calls, upvalue sharing, multi-returns, strip mode, C-function snapshots, stock error text, and the full bytecode round trip
-
----
-
-## [0.5.0] - 2026-10-19
+## [Work in progress]
 
 ### Added
 
@@ -54,6 +17,8 @@ The format is loosely based on Keep a Changelog and the project follows Semantic
 * New ray tracer benchmark source, a Windows x86-64 MSVC benchmark table, and refreshed Linux (GCC 15.2) and macOS ARM64 numbers
 * New C API test module with continuation idioms and call counters, `lua_callk`/`lua_pcallk` conformance tests, a rooting-across-collection regression test, and a metamethod-cache test
 * MinGW and clang-cl toolchain support on Windows, with `CLX_CXX` dialect selection documented in the CLI reference
+* `MultiValue` primitive constructors (`int64_t`/`bool`, `(bool, LValue)`, 3x`int64_t`) and in-place `push_back` overloads: single-value returns construct directly with no `LValue` temporary, and result lists grow in the inline slots instead of detouring through a `std::vector`
+* `MultiValue::assign()`: reuses already-constructed inline slots when refilling a value (used for coroutine `resume_args`/`yield_args`)
 
 ### Changed
 
@@ -68,6 +33,9 @@ The format is loosely based on Keep a Changelog and the project follows Semantic
 * Hardened call dispatch. Call-site flags live on a frame stack preserved across metamethod dispatch, guarded dispatch paths reset them, and `pcall` clears them, closing several rare state-corruption windows
 * Friendlier module UX. `--modules` tries both `.a` and `.lib`, missing modules and `/link` flags on GCC produce clear errors instead of cryptic failures, and the sokol bindings log initialization failures instead of dying silently
 * Quieter, more portable Windows builds. MSVC UTF-8 source handling, `/EHs` so `extern "C"` Lua functions may throw, GCC-only section flags kept off clang-cl, and Windows path lookup plus stack options in the driver
+* `resume()` builds `(ok, yields...)` directly in the return slot instead of filling a temp buffer and re-copying; `pcall`/`xpcall` and the `coroutine.wrap` trampoline build results in place. The 5M coroutine probe went 0.28s to 0.25s
+* The three copy-pasted platform context switches (fiber end, `resume`, `yield`) are folded into one `coro_switch_to()` helper with identical platform conditions
+* C++17 conformance: `using enum` in the lexer/parser is replaced by qualified enumerators, and two lambdas no longer capture structured bindings. The build is warning-free under the pinned C++17 standard
 
 ### Fixed
 
@@ -78,6 +46,7 @@ The format is loosely based on Keep a Changelog and the project follows Semantic
 * Fixed Windows file-readability checks in `package`, and table `next()` bitmap scanning
 * Fixed MSVC warnings on UTF-8 encoded files
 * Fixed coroutine yield bookkeeping overtaking rooted-call error handling
+* A trailing call returning zero values (`local v = f()`) now assigns nil instead of reading a stale inline slot. An exhausted `coroutine.wrap` closure returned its last value again instead of ending the loop
 
 ### Tests
 
