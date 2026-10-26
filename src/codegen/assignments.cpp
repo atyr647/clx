@@ -1613,7 +1613,12 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
         if (tuple_here) {
         } else if (i < v_count) {
             if (i == v_count - 1 && last_is_call) {
-                val_str = "_mret_" + std::to_string(node_idx) + "[0]";
+                //------------------ A trailing call may return 0 values (e.g. a dead coroutine.wrap
+                //------------------ falling off its end): guard the first-slot read so the target gets
+                //------------------ nil instead of a stale slot. Raw inline storage (no nil defaults)
+                //------------------ makes the unguarded read observable; the branch predicts perfectly.
+                val_str = "((0 < _mret_" + std::to_string(node_idx) + ".count) ? _mret_"
+                    + std::to_string(node_idx) + "[0] : clx::LValue())";
                 num_str = val_str + ".as_number()";
             } else {
                 if (tmp_is_native[i]) {
