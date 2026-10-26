@@ -363,6 +363,9 @@ CLX_INLINE LValue raw_get(LState* L, const LValue& table, const LValue& key)
 CLX_INLINE void raw_set(LState* L, const LValue& table, const LValue& key, const LValue& val)
 {
     LTable* t = check_table(L, table);
+    gc_barrier_table(L, t, val);
+    if (key.is_gc_obj())
+        gc_barrier_table(L, t, key);
     t->settable(key, val);
 }
 
@@ -383,12 +386,14 @@ CLX_INLINE void raw_set_i(LState* L, const LValue& table, int64_t idx, const LVa
                 t->array_types[j] = Nil;
             }
         }
+        gc_barrier_table(L, t, val);
         t->array[idx - 1] = val.val;
         t->array_types[idx - 1] = val.type;
         if (static_cast<size_t>(idx) > t->array_size)
             t->array_size = static_cast<size_t>(idx);
         table_hint_on_array_write(t, static_cast<size_t>(idx) - 1, val.type);
     } else {
+        gc_barrier_table(L, t, val);
         t->settable(LValue(static_cast<int64_t>(idx)), val);
     }
 }
@@ -406,7 +411,12 @@ CLX_INLINE void set_value(LState* L, const LValue& table, const char* name, cons
 {
     if (table.type != ValueType::Table)
         return;
-    static_cast<LTable*>(table.as_pointer())->settable(LValue(L->intern_string(name)), val);
+    LTable* t = static_cast<LTable*>(table.as_pointer());
+    LValue key = LValue(L->intern_string(name));
+    gc_barrier_table(L, t, val);
+    if (key.is_gc_obj())
+        gc_barrier_table(L, t, key);
+    t->settable(key, val);
 }
 
 //------------------ Binds multiple C functions (via LReg*)
