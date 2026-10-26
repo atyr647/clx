@@ -67,8 +67,13 @@ static clx::MultiValue coroutine_wrap(clx::LState *L, const clx::LValue *args, s
         clx::error(L, "bad argument #1 to 'wrap' (function expected)");
     }
     clx::LValue thread = clx::create_thread(L, args[0]);
+    // A C++ lambda capture is invisible to the GC, so the thread also lives in a traced gc_cells entry
+    // (as generated closures do). Root it meanwhile: create_closure() allocates.
+    clx::RootRange thread_root(L, &thread, 1);
+    auto cell = std::make_shared<clx::LValue>(thread);
     return clx::MultiValue(
-        clx::cfunction(L, [thread](LState *L2, const LValue *call_args, size_t call_arg_count) -> clx::MultiValue {
+        L->create_closure([cell](LState *L2, const LValue *call_args, size_t call_arg_count) -> clx::MultiValue {
+            const clx::LValue thread = *cell;
             LThread *t = static_cast<LThread *>(thread.as_pointer());
             if (t->status == THREAD_DEAD)
                 clx::error(L2, "cannot resume dead coroutine");
@@ -80,12 +85,12 @@ static clx::MultiValue coroutine_wrap(clx::LState *L, const clx::LValue *args, s
             }
             if (result.count <= 1)
                 return MultiValue();
-            std::vector<LValue> ret;
-            ret.reserve(result.count - 1);
+            MultiValue out;
+            out.alloc_L = L2;
             for (size_t i = 1; i < result.count; ++i)
-                ret.push_back(result[i]);
-            return MultiValue(ret);
-        }));
+                out.push_back(result[i]);
+            return out;
+        }, nullptr, std::vector<clx::LUpValue>{ cell }));
 }
 
 //------------------ coroutine_running: returns the running thread
