@@ -39,6 +39,8 @@ LThread::LThread()
 
 //------------------ LThread::~LThread — thread destructor
 LThread::~LThread() {
+    if (co_root && state)
+        co_release(state, this);   // a stackless thread still suspended: destroy its coroutine frames
 #if defined(_WIN32)
     if (fiber && !is_main)
         DeleteFiber(fiber);
@@ -179,6 +181,9 @@ LValue create_thread(LState *L, const LValue &func, double stack_size) {
     t->started = false;
     t->marked = 0;
     t->age = AGE_YOUNG;
+    if (t->co_root)
+        co_release(L, t);
+    co_choose_kind(t, func);   // stackless (the body is a coroutine, or runs to completion) or a stack of its own
     if (t->luaapi && L->luaapi_thread_reset)
         L->luaapi_thread_reset(L, t->luaapi);
     if (recycled && prev_age_th != AGE_YOUNG && (L->gc_phase == LState::GCPhase::Sweeping || L->gc_minor_active)) {
@@ -187,6 +192,7 @@ LValue create_thread(LState *L, const LValue &func, double stack_size) {
         L->gc_pinned.push(t);
     }
 
+    if (!t->co_kind) {
 #if defined(_WIN32)
     if (recycled) {
         if (t->fiber) {
@@ -225,19 +231,24 @@ LValue create_thread(LState *L, const LValue &func, double stack_size) {
     t->ctx.uc_link = nullptr;
     makecontext(&t->ctx, fiber_trampoline, 0);
 #endif
+    }   // !co_kind
 
     t->next = L->allocated_objects;
     L->allocated_objects = t;
     L->gc_recent.push(t);
     if (!recycled)
         L->object_count++;
-    L->allocated_bytes += sizeof(LThread) + t->stack_bytes;
+    L->allocated_bytes += sizeof(LThread) + (t->co_kind ? 0 : t->stack_bytes);
     return LValue(Thread, t);
 }
 
 //------------------ resume: resumes a suspended coroutine (public API)
 MultiValue resume(LState *L, const LValue &thread, const LValue *args, size_t count) {
     LThread *t = static_cast<LThread *>(thread.as_pointer());
+    if (t->co_kind && t->status == THREAD_DEAD) {   // a finished stackless thread has no frame to continue (coroutine.resume checks this too)
+        LValue r[2] = { LValue(false), LValue(L->intern_string("cannot resume dead coroutine")) };
+        return MultiValue(r, 2, L);
+    }
     //------------------ assign() reuses the thread's already-constructed inline slots: no temp
     //------------------ MultiValue + move-assign copy chain on every resume.
     t->resume_args.assign(args, count, L);
@@ -259,7 +270,10 @@ MultiValue resume(LState *L, const LValue &thread, const LValue *args, size_t co
     root_load(L, t);
     L->running_thread = t;
 
-    coro_switch_to(t->caller, t);
+    if (t->co_kind)
+        co_run(L, t);   // stackless: continues the saved coroutine frame, and hands the root chains and the running thread back itself
+    else
+        coro_switch_to(t->caller, t);
 
     //------------------ Build (ok, yield_args...) directly in the return slot: one placement-new per
     //------------------ value, no temp buffer + re-copy (was: fill buf[total], then MultiValue(buf)
@@ -288,6 +302,8 @@ MultiValue yield(LState *L, const LValue *args, size_t count) {
     LThread *t = L->running_thread;
     if (t->is_main)
         clx::error(L, "attempt to yield from outside a coroutine");
+    if (t->co_kind)   // a stackless thread yields only from its coroutine forms (co_yield_), never through a call that cannot suspend
+        clx::error(L, "attempt to yield across a C-call boundary");
     t->yield_args.assign(args, count, L);
     if (L->gc_mode == LState::GCMode::Generational && t->age == AGE_OLD) {
         for (size_t i = 0; i < t->yield_args.count; ++i)

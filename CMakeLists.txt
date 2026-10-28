@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.15)
 project(clx VERSION 0.4.0 LANGUAGES C CXX ASM)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)   # costack.cpp (stackless coroutines) needs C++20
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -70,6 +70,7 @@ endif()
 # because LState::open() opens base + package on every state.
 set(RUNTIME_SOURCES
     src/runtime/threads.cpp
+    src/runtime/costack.cpp
     src/runtime/values.cpp
     src/runtime/tables.cpp
     src/runtime/state.cpp
