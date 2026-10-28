@@ -29,7 +29,9 @@ static CLX_INLINE_COLD size_t next_pow2(size_t n) {
     n |= n >> 4;
     n |= n >> 8;
     n |= n >> 16;
-    n |= n >> 32;
+    //------------------ a shift by 32 of a 32-bit size_t (wasm32) is undefined behaviour; clang folded the function into a bad hash size
+    if constexpr (sizeof(size_t) > 4)
+        n |= static_cast<size_t>(static_cast<uint64_t>(n) >> 32);
     return n + 1;
 }
 

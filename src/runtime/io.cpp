@@ -27,6 +27,12 @@
 #else
 #include <unistd.h>
 #endif
+#if defined(__wasi__)
+//------------------ WASI has no processes: io.popen fails like a popen that cannot start the shell
+#include <cerrno>
+static FILE *popen(const char *, const char *) { errno = ENOSYS; return nullptr; }
+static int pclose(FILE *) { errno = ENOSYS; return -1; }
+#endif
 
 namespace clx {
 
