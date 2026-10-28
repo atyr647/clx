@@ -68,6 +68,15 @@ static inline void coro_switch_to(LThread *from, LThread *to) {
     SwitchToFiber(to->fiber);
 #elif ((defined(__APPLE__) || defined(__linux__)) && defined(__aarch64__)) || (defined(__linux__) && defined(__x86_64__))
     clx_coro_switch(&from->ctx, &to->ctx);
+#elif defined(__wasi__) && defined(__wasi_cooperative_threads__)
+    pthread_mutex_lock(&to->ctx.mu); to->ctx.go = true; pthread_cond_signal(&to->ctx.cv); pthread_mutex_unlock(&to->ctx.mu);
+    pthread_mutex_lock(&from->ctx.mu);
+    while (!from->ctx.go) pthread_cond_wait(&from->ctx.cv, &from->ctx.mu);
+    from->ctx.go = false;
+    pthread_mutex_unlock(&from->ctx.mu);
+#elif defined(__wasi__)
+    (void)from; (void)to;
+    throw_runtime_error("coroutines are not available on this WebAssembly target (no stack switching)");
 #else
     swapcontext(&from->ctx, &to->ctx);
 #endif
@@ -121,6 +130,18 @@ static void WINAPI fiber_trampoline(LPVOID param) {
     for (;;) {
         fiber_entry_impl(t);
     }
+}
+#elif defined(__wasi__) && defined(__wasi_cooperative_threads__)
+//------------------ one green thread per LThread for its whole life: it waits for its first switch, runs the body, and after the body's final
+//------------------ switch back to the caller waits again, so a recycled LThread (free_threads) reuses its green thread
+static void *fiber_trampoline(void *param) {
+    LThread *t = static_cast<LThread *>(param);
+    pthread_mutex_lock(&t->ctx.mu);
+    while (!t->ctx.go) pthread_cond_wait(&t->ctx.cv, &t->ctx.mu);
+    t->ctx.go = false;
+    pthread_mutex_unlock(&t->ctx.mu);
+    for (;;) fiber_entry_impl(t);
+    return nullptr;
 }
 #else
 static thread_local LThread *g_starting_thread = nullptr;
@@ -185,6 +206,16 @@ LValue create_thread(LState *L, const LValue &func, double stack_size) {
     if (!t->stack_memory)
         t->stack_memory = new char[t->stack_bytes];
     clx_coro_init(&t->ctx, t->stack_memory + t->stack_bytes, (void *)fiber_trampoline);
+#elif defined(__wasi__) && defined(__wasi_cooperative_threads__)
+    if (!t->ctx.has_thread) {
+        pthread_attr_t attr; pthread_attr_init(&attr); pthread_attr_setstacksize(&attr, t->stack_bytes);
+        if (pthread_create(&t->ctx.th, &attr, fiber_trampoline, t) != 0) throw_runtime_error("cannot create coroutine (green thread)");
+        pthread_attr_destroy(&attr);
+        pthread_detach(t->ctx.th);
+        t->ctx.has_thread = true;
+    }
+#elif defined(__wasi__)
+    throw_runtime_error("coroutines are not available on this WebAssembly target (no stack switching)");
 #else
     getcontext(&t->ctx);
     if (!t->stack_memory)
@@ -211,7 +242,7 @@ MultiValue resume(LState *L, const LValue &thread, const LValue *args, size_t co
     //------------------ MultiValue + move-assign copy chain on every resume.
     t->resume_args.assign(args, count, L);
     t->has_error = false;
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !(defined(__wasi__) && defined(__wasi_cooperative_threads__))
     // fiber_trampoline() reads g_starting_thread on the thread's first entry. create_thread() also sets it,
     // but with several coroutines created before the first resume it would point at the last one created.
     if (!t->started) g_starting_thread = t;

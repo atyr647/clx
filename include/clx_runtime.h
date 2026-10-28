@@ -54,6 +54,22 @@ void clx_coro_save(CoroutineContext *ctx);
 void clx_coro_switch(CoroutineContext *from, CoroutineContext *to);
 void clx_coro_init(CoroutineContext *ctx, void *stack_top, void *entry);
 }
+#elif defined(__wasi__)
+//------------------ WASI: WebAssembly has no stack switching and wasi-libc no ucontext. With the SDK's cooperative-threads sysroot
+//------------------ (__wasi_cooperative_threads__) each coroutine is a green thread handed control by a binary semaphore; without it,
+//------------------ coroutine.create/wrap raise a Lua error.
+#if defined(__wasi_cooperative_threads__)
+#include <pthread.h>
+struct CoroutineContext {
+    pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
+    bool go = false;
+    bool has_thread = false;
+    pthread_t th;
+};
+#else
+struct CoroutineContext { };
+#endif
 #else
 #if defined(__APPLE__)
 #define _XOPEN_SOURCE
@@ -245,7 +261,9 @@ struct TValue {
 
     CLX_INLINE_HOT TValue(double d) { payload.f64 = d; }
 
-    CLX_INLINE_HOT TValue(void *p) { payload.ptr = p; }
+    //------------------ through uintptr_t: on a 32-bit target (wasm32) writing .ptr leaves the payload's upper half uninitialised, and hashing,
+    //------------------ equality and the HASH_EMPTY/HASH_TOMBSTONE tests all read the whole u64
+    CLX_INLINE_HOT TValue(void *p) { payload.u64 = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p)); }
 
     CLX_INLINE_HOT TValue(uint64_t u) { payload.u64 = u; }
 };
@@ -279,9 +297,8 @@ struct LValue {
         , type(ValueType::Int64) { }
 
     CLX_INLINE_HOT explicit LValue(const char *s)
-        : type(ValueType::String) {
-        val.payload.ptr = const_cast<char *>(s);
-    }
+        : val(static_cast<void *>(const_cast<char *>(s)))
+        , type(ValueType::String) { }
 
     CLX_INLINE_HOT LValue(const TValue &v, ValueType t)
         : val(v)
@@ -1385,6 +1402,9 @@ struct LThread : public LHeader {
 #if defined(_WIN32)
     LPVOID fiber;
 #elif (defined(__APPLE__) || defined(__linux__)) && (defined(__aarch64__) || defined(__x86_64__))
+    CoroutineContext ctx;
+    char *stack_memory;
+#elif defined(__wasi__)
     CoroutineContext ctx;
     char *stack_memory;
 #else

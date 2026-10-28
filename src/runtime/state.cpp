@@ -514,6 +514,8 @@ LState *open_bare(int argc, char *argv[]) {
     main_th->fiber = ConvertThreadToFiber(nullptr);
 #elif (defined(__APPLE__) || defined(__linux__)) && (defined(__aarch64__) || defined(__x86_64__))
     clx_coro_save(&main_th->ctx);
+#elif defined(__wasi__)
+    // the main thread is the WASI guest's own thread: nothing to capture (see CoroutineContext in clx_runtime.h)
 #else
     getcontext(&main_th->ctx);
 #endif
