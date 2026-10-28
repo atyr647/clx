@@ -30,7 +30,10 @@ assert_eq(t1 == "s", false, "table-vs-string-false")
 assert_eq(false == nil, false, "bool-vs-nil")
 assert_eq("x" == 5, false, "string-vs-number")
 assert_eq(t3 == t4, true, "other-mt-eq")
-assert_eq(t3 == t1, false, "cross-mt-false")
+-- Lua 5.3+ (5.5's luaV_equalobj, vendored in src/runtime/vm/lua/src/lvm.c): the first operand's __eq, else the second's; the metatables
+-- need not be the same (that was the 5.2 rule). t3's __eq returns "other", which is true. Lua 5.4.9 prints true for both orders.
+assert_eq(t3 == t1, true, "cross-mt-uses-first-operand-eq")
+assert_eq(t1 == t3, true, "cross-mt-uses-first-operand-eq-reversed")
 assert_eq(t1 ~= nil, true, "ne-table-nil")
 
 local n, f = 1, 1.0

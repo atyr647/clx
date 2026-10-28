@@ -190,6 +190,12 @@ std::string CodeEmitter::int_flag_expr(uint32_t expr_idx, int depth) {
             if (tn == "math" && (mk == "maxinteger" || mk == "mininteger"))
                 return "true";
         }
+        //------------------ an element of a promoted int array (a native vector<int64_t>) is always an integer
+        if (tbl_idx < ctx.nodes.size() && ctx.nodes[tbl_idx].type == NodeType::Identifier && !ctx.nodes[tbl_idx].as.ident.is_global) {
+            std::string_view tn(ctx.nodes[tbl_idx].as.ident.name, ctx.nodes[tbl_idx].as.ident.length);
+            if (state.pure_numeric_arrays.count(tn) && state.int_numeric_arrays.count(tn))
+                return "true";
+        }
     }
     return "false";
 }
@@ -282,6 +288,12 @@ std::string CodeEmitter::int_value_expr(uint32_t expr_idx, int depth) {
                 return "INT64_MAX";
             if (tn == "math" && mk == "mininteger")
                 return "INT64_MIN";
+        }
+        //------------------ the element itself (bounds were proven by pass_array_safety, as for the vector read path)
+        if (tbl_idx < ctx.nodes.size() && ctx.nodes[tbl_idx].type == NodeType::Identifier && !ctx.nodes[tbl_idx].as.ident.is_global) {
+            std::string_view tn(ctx.nodes[tbl_idx].as.ident.name, ctx.nodes[tbl_idx].as.ident.length);
+            if (state.pure_numeric_arrays.count(tn) && state.int_numeric_arrays.count(tn))
+                return "l_" + std::string(tn) + "[static_cast<size_t>(" + int_value_expr(key_idx, depth + 1) + ") - 1]";
         }
     }
     if (n.type == NodeType::CallExpression) {
@@ -567,6 +579,16 @@ void CodeEmitter::emit(uint32_t root_node, std::string_view module_name) {
 
     out << "#include <clx.h>\n";
     out << "#include <atomic>\n\n";
+    if (!native_registry().empty()) {   // the natives manifest's C functions (clx --natives)
+        for (const auto &ne : native_registry()) {
+            auto ct = [](const std::string &ty) { return ty == "int64" ? std::string("int64_t") : ty == "int32" ? std::string("int") : ty; };
+            out << "extern \"C\" " << ct(ne.ret) << " " << ne.cname << "(";
+            for (size_t i = 0; i < ne.params.size(); ++i)
+                out << (i ? ", " : "") << ct(ne.params[i]);
+            out << ");\n";
+        }
+        out << "\n";
+    }
 
     if (!state.string_pool.empty()) {
         out << "static clx::LValue cstr_[" << state.string_pool.size() << "];\n";

@@ -200,10 +200,11 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
         if (is_local) {
             bool init_is_int_single = v_count == 0
                 || clx::is_purely_integer_expr(ctx, state, ctx.block_statements[first_v]);
-            if (!init_is_int_single)
+            //------------------ a hoisted local (declared after a goto) was declared as a double with integer flags: it keeps that form
+            if (!init_is_int_single || state.hoisted_locals.count(single_name))
                 state.native_integers.erase(std::string(single_name));
             bool is_int_single = init_is_int_single && state.native_integers.count(single_name) > 0;
-            if (!is_int_single && v_count > 0) {
+            if (!is_int_single && v_count > 0 && !state.hoisted_locals.count(single_name)) {
                 uint32_t v_idx_single = ctx.block_statements[first_v];
                 bool redecl_of_native = false;
                 for (auto it = locals.rbegin(); it != locals.rend(); ++it) {
@@ -441,7 +442,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                         << "(_fr";
                                 }
                                 for (uint32_t a = 0; a < state.func_param_counts[name]; ++a) {
-                                    out << ", (" << a << " < arg_count ? args[" << a << "].as_number() : 0.0)";
+                                    out << ", clx::coerce_number(L, " << a << " < arg_count ? args[" << a << "] : clx::LValue())";
                                 }
                                 if (state.int_returning_funcs.count(name))
                                     out << "))));\n";
@@ -794,7 +795,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                         << "(_fr";
                                 }
                                 for (uint32_t a = 0; a < state.func_param_counts[name]; ++a) {
-                                    out << ", (" << a << " < arg_count ? args[" << a << "].as_number() : 0.0)";
+                                    out << ", clx::coerce_number(L, " << a << " < arg_count ? args[" << a << "] : clx::LValue())";
                                 }
                                 if (state.int_returning_funcs.count(name))
                                     out << "))));\n";
@@ -1379,7 +1380,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                     << "(_fr";
                             }
                             for (uint32_t a = 0; a < state.func_param_counts[fname]; ++a) {
-                                out << ", (" << a << " < arg_count ? args[" << a << "].as_number() : 0.0)";
+                                out << ", clx::coerce_number(L, " << a << " < arg_count ? args[" << a << "] : clx::LValue())";
                             }
                             if (state.int_returning_funcs.count(fname))
                                 out << "))));\n";

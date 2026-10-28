@@ -33,6 +33,9 @@ struct PassScratch {
     std::set<std::string_view> disqualified_arrays;
     std::set<std::string_view> empty_array_candidates;
     std::set<std::string_view> param_names;
+    //------------------ array_value_deps: arrays whose stored values are numeric provided the arrays they read are numeric too
+    //------------------ (xs[i] = xs[i] + vx[i] * dt); pass_array_safety keeps an array only if every array it reads stays numeric
+    std::map<std::string_view, std::set<std::string_view>> array_value_deps;
 };
 
 //------------------ get_ast_string: convert AST node to string for analysis

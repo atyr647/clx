@@ -222,6 +222,7 @@ private:
     void emitFalseLiteral(const ASTNode &node, uint32_t node_idx);
     void emitNilLiteral(const ASTNode &node, uint32_t node_idx);
     void emitTableOp(int bin_op, uint32_t lhs_tbl, uint32_t lhs_key, uint32_t const_idx, bool nil_ok);
+    void emit_native_entry_call(const NativeEntry &ne, const ASTNode &node);
     void emitNumber(const ASTNode &node, uint32_t node_idx);
     void emitInteger(const ASTNode &node, uint32_t node_idx);
     void emitIdentifier(const ASTNode &node, uint32_t node_idx);

@@ -8,6 +8,7 @@
 #ifndef CLX_H
 #define CLX_H
 
+#include <string>
 #include "clx_simd.h"
 #include <clx_runtime.h>
 
@@ -286,6 +287,45 @@ CLX_INLINE_COLD int64_t check_integer(LState* L, const LValue& v)
     if (to_integer(v, out))
         return out;
     std::string msg = std::string("integer expected, got ") + VALUE_TYPE_NAMES[static_cast<size_t>(v.type)];
+    throw LRuntimeException(LValue(L->intern_string(msg)));
+}
+
+//------------------ Argument conversion for natives-manifest calls (clx --natives): the luaL_checknumber / luaL_checkinteger rules,
+//------------------ with Lua's messages ("bad argument #2 to 'set_xy' (number expected, got nil)")
+CLX_INLINE_COLD double native_arg_double(LState* L, const LValue& v, const char* fn, int argn)
+{
+    double out;
+    if (v.to_number(out))
+        return out;
+    std::string msg = std::string("bad argument #") + std::to_string(argn) + " to '" + fn + "' (number expected, got "
+        + VALUE_TYPE_NAMES[static_cast<size_t>(v.type)] + ")";
+    throw LRuntimeException(LValue(L->intern_string(msg)));
+}
+CLX_INLINE_COLD int64_t native_arg_int(LState* L, const LValue& v, const char* fn, int argn)
+{
+    int64_t out;
+    if (to_integer(v, out))
+        return out;
+    double d;
+    std::string why = v.to_number(d) ? std::string("number has no integer representation")
+                                     : std::string("number expected, got ") + VALUE_TYPE_NAMES[static_cast<size_t>(v.type)];
+    std::string msg = std::string("bad argument #") + std::to_string(argn) + " to '" + fn + "' (" + why + ")";
+    throw LRuntimeException(LValue(L->intern_string(msg)));
+}
+//------------------ an int32 parameter: the converted integer must fit a C int (Lua integers are 64-bit; no silent truncation)
+CLX_INLINE_HOT int64_t native_arg_int32(LState* L, int64_t v, const char* fn, int argn)
+{
+    if (v >= -2147483648LL && v <= 2147483647LL)
+        return v;
+    std::string msg = std::string("bad argument #") + std::to_string(argn) + " to '" + fn + "' (integer out of range)";
+    throw LRuntimeException(LValue(L->intern_string(msg)));
+}
+//------------------ the same for an argument already proven numeric (a raw double): only the integer check remains
+CLX_INLINE_HOT int64_t native_arg_int(LState* L, double d, const char* fn, int argn)
+{
+    if (d >= -9223372036854775808.0 && d < 9223372036854775808.0 && static_cast<double>(static_cast<int64_t>(d)) == d)
+        return static_cast<int64_t>(d);
+    std::string msg = std::string("bad argument #") + std::to_string(argn) + " to '" + fn + "' (number has no integer representation)";
     throw LRuntimeException(LValue(L->intern_string(msg)));
 }
 

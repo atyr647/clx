@@ -16,6 +16,15 @@ set(CLX_LTO_FLAG -flto=auto)
 if(MINGW)
     set(CLX_LTO_FLAG "")
 endif()
+# GCC miscompiles the runtime under LTO with identical code folding (seen with GCC 13.3, -Os and -O3): ICF merges functions whose
+# code is identical but whose types differ (std::deque iterator copy constructors over different element types), the merged
+# function keeps one type-based mod/ref summary, and stores through the other type are then treated as dead -- in luaapi.cpp a
+# std::vector built from a deque range read its size from uninitialised stack (tests/run.sh capi_mod: SIGSEGV or length_error).
+# -fno-ipa-icf (or -fno-ipa-modref, or -fno-tree-dse) avoids it; the flag must be given when compiling, it is recorded in the LTO
+# bytecode. The clx driver passes it for programs it builds with GCC (src/clx.cpp).
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CLX_LTO_FLAG)
+    add_compile_options(-fno-ipa-icf)
+endif()
 
 set(MI_BUILD_SHARED OFF CACHE INTERNAL "")
 set(MI_BUILD_STATIC OFF CACHE INTERNAL "")

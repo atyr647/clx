@@ -340,6 +340,10 @@ void pass_callables(const ASTContext &ctx, AnalysisState &state, PassScratch &sk
     } while (params_changed);
 
     for (const auto &fdef : func_defs) {
+        //------------------ a vararg function never qualifies: its native ("fast") form takes only the named parameters, so a body
+        //------------------ reading ... would reference varargs that form does not have (local function g(...) return math.max(...) end)
+        if (ctx.nodes[fdef.second].type == NodeType::FunctionDef && ctx.nodes[fdef.second].as.func_def.is_vararg)
+            continue;
         if (function_returns_native(ctx, state, fdef.second, fdef.first, &known_numbers)) {
             state.native_return_funcs.insert(fdef.first);
         }
