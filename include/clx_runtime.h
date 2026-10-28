@@ -732,8 +732,15 @@ private:
     }
 };
 
+//------------------ Coroutine form of a function that can yield (stackless coroutines, include/clx_co.h): creates the function's C++20
+//------------------ coroutine, suspended at its start, and returns the address of its frame (ownership passes to the caller)
+using CoInvokeFn = void *(*)(void *box, LState *L, const LValue *args, size_t count);
+
 struct LCFunction : public LHeader {
     CFunctionType func;
+    //---------- co_box/co_invoke: the coroutine form (null when the function cannot yield); the plain form above stays valid
+    std::shared_ptr<void> co_box;
+    CoInvokeFn co_invoke = nullptr;
     MultiValue (*direct)(LState *, const LValue *, size_t) = nullptr;
     LTable *env = nullptr;
     LValue self_ref;
@@ -1399,6 +1406,12 @@ struct LThread : public LHeader {
     void *luaapi = nullptr;
     //---------- top_root: this thread's root-frame chain head; empty while the thread is running (the head lives in LState)
     RootRange *top_root = nullptr;
+    //---------- co_kind: 0 = runs on its own stack (fiber / green thread); 1 = stackless, the body has a coroutine form; 2 = stackless
+    //---------- but the body has none, so it runs to completion at its first resume and cannot yield (a yield raises Lua's C-boundary error)
+    uint8_t co_kind = 0;
+    //---------- co_root/co_leaf: frame addresses of the root coroutine and of the innermost suspended one (where the next resume continues)
+    void *co_root = nullptr;
+    void *co_leaf = nullptr;
 #if defined(_WIN32)
     LPVOID fiber;
 #elif (defined(__APPLE__) || defined(__linux__)) && (defined(__aarch64__) || defined(__x86_64__))
@@ -3802,6 +3815,14 @@ LValue create_thread(LState *L, const LValue &func, double stack_size = 262144.0
 LValue newuserdata(LState *L, size_t size);
 //------------------ Resumes a coroutine
 MultiValue resume(LState *L, const LValue &thread, const LValue *args, size_t count);
+//------------------ Stackless coroutines (src/runtime/costack.cpp, C++20): continue a stackless thread until it yields or ends (resume() has
+//------------------ already switched the root chains and the running thread), and release a stackless thread's frames (close / collection)
+void co_run(LState *L, LThread *t);
+void co_release(LState *L, LThread *t);
+//------------------ Chooses how a new thread runs: sets t->co_kind from the body (a function with a coroutine form, or none)
+void co_choose_kind(LThread *t, const LValue &func);
+//------------------ True when a body without a coroutine form cannot yield (no stack to switch); false when such bodies get a fiber
+bool co_stackless_only();
 //------------------ Yields from a coroutine
 MultiValue yield(LState *L, const LValue *args, size_t count);
 //------------------ Closes a coroutine
