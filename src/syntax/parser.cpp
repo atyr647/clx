@@ -61,16 +61,37 @@ void Parser::leave_scope() {
 }
 
 //------------------ PARSER: add_symbol - registers a symbol in the active scope
+//------------------ A local whose name was already declared earlier in the chunk is given a unique internal name (name__clx2, ...):
+//------------------ the optimizer and code generator key their facts (native number, pure array, int-typed, ...) by name, so a shadowing
+//------------------ local would otherwise inherit the outer one's (local x = 5; do local x = {} print(type(x)) end printed "number").
+//------------------ References resolve through the scope chain as before and take the alias of the symbol they resolve to.
 void Parser::add_symbol(std::string_view name, SymbolType type, uint32_t decl_idx) {
-    active_symbols.push_back({ name, type, current_depth, current_function_depth, decl_idx });
+    std::string_view alias;
+    bool local_kind = type == SymbolType::Local || type == SymbolType::Const || type == SymbolType::Close;
+    if (local_kind && name != "_ENV") {
+        int &n = decl_counts_[std::string(name)];
+        if (n++ > 0) {
+            ctx.string_storage.push_back(std::string(name) + "__clx" + std::to_string(n));   // owned by the AST context
+            alias = ctx.string_storage.back();
+            if (decl_idx < ctx.nodes.size() && ctx.nodes[decl_idx].type == NodeType::Identifier) {
+                ctx.nodes[decl_idx].as.ident.name = alias.data();
+                ctx.nodes[decl_idx].as.ident.length = alias.size();
+            }
+        }
+    }
+    Symbol s { name, type, current_depth, current_function_depth, decl_idx };
+    s.alias = alias;
+    active_symbols.push_back(s);
 }
 
 //------------------ PARSER: resolve_symbol - looks up a symbol in scope chain, returns its type and flags
 SymbolType Parser::resolve_symbol(std::string_view name, int line, bool &out_is_captured, bool &out_is_global) {
     out_is_captured = false;
     out_is_global = false;
+    resolved_alias_ = {};
     for (auto it = active_symbols.rbegin(); it != active_symbols.rend(); ++it) {
-        if (it->name == name) {
+        if (it->name == name || (!it->alias.empty() && it->alias == name)) {
+            resolved_alias_ = it->alias;
             if (it->function_depth > current_function_depth)
                 continue;
             if (it->type == SymbolType::ExplicitGlobal || it->type == SymbolType::ConstGlobal) {
@@ -258,6 +279,10 @@ uint32_t Parser::parse_primary() {
         resolve_symbol(current_token.text, current_token.line, is_cap, is_glob);
         ctx.nodes[node_idx].as.ident.is_captured = is_cap;
         ctx.nodes[node_idx].as.ident.is_global = is_glob;
+        if (!is_glob && !resolved_alias_.empty()) {
+            ctx.nodes[node_idx].as.ident.name = resolved_alias_.data();
+            ctx.nodes[node_idx].as.ident.length = resolved_alias_.size();
+        }
 
         advance();
         return node_idx;
@@ -681,6 +706,8 @@ uint32_t Parser::parse_expression() {
 
 //------------------ PARSER: parse_statement - dispatches on current token to parse a single statement
 uint32_t Parser::parse_statement() {
+    bool split_ok = split_ok_;   // only for this statement, never for statements parsed inside it
+    split_ok_ = false;
     //------------------ PARSE: stmt - end of file, return invalid
     if (current_token.type == TokenType::TokEof)
         return INVALID_NODE;
@@ -901,6 +928,10 @@ uint32_t Parser::parse_statement() {
             resolve_symbol(current_token.text, current_token.line, is_cap, is_glob);
             ctx.nodes[target].as.ident.is_captured = is_cap;
             ctx.nodes[target].as.ident.is_global = is_glob;
+            if (!is_glob && !resolved_alias_.empty()) {
+                ctx.nodes[target].as.ident.name = resolved_alias_.data();
+                ctx.nodes[target].as.ident.length = resolved_alias_.size();
+            }
 
             advance();
 
@@ -1050,6 +1081,14 @@ uint32_t Parser::parse_statement() {
         advance();
 
         std::vector<uint32_t> vars;
+        //------------------ the loop variables are in scope in the body only (Lua 5.4 manual §3.3.5): registered after the loop's own
+        //------------------ expressions (for n = n, n + 1 reads the outer n) in a scope that ends with the loop
+        std::vector<std::string_view> var_names;
+        auto open_loop_scope = [&] {
+            enter_scope();
+            for (size_t k = 0; k < vars.size(); ++k)
+                add_symbol(var_names[k], SymbolType::Local, vars[k]);
+        };
         if (current_token.type != TokenType::TokIdent)
             throw std::runtime_error(
                 "Error: " + ctx.filename + ":" + std::to_string(current_token.line) + ": Expected identifier");
@@ -1065,7 +1104,7 @@ uint32_t Parser::parse_statement() {
             ident_node.as.ident.attr = Attribute::None;
             uint32_t var_id = add_node(ident_node);
             vars.push_back(var_id);
-            add_symbol(current_token.text, SymbolType::Local, var_id);
+            var_names.push_back(current_token.text);
             advance();
         } while (current_token.type == TokenType::TokComma && (advance(), true));
 
@@ -1085,7 +1124,9 @@ uint32_t Parser::parse_statement() {
             }
             if (current_token.type == TokenType::TokDo)
                 advance();
+            open_loop_scope();
             uint32_t body_block = parse_block(false);
+            leave_scope();
             if (current_token.type == TokenType::TokEnd)
                 advance();
 
@@ -1106,7 +1147,9 @@ uint32_t Parser::parse_statement() {
             } while (current_token.type == TokenType::TokComma && (advance(), true));
             if (current_token.type == TokenType::TokDo)
                 advance();
+            open_loop_scope();
             uint32_t body_block = parse_block(false);
+            leave_scope();
             if (current_token.type == TokenType::TokEnd)
                 advance();
 
@@ -1222,6 +1265,8 @@ uint32_t Parser::parse_statement() {
         }
 
         std::vector<uint32_t> idents;
+        struct PendingLocal { std::string_view name; SymbolType type; uint32_t idx; };
+        std::vector<PendingLocal> pending;
         do {
             if (current_token.type != TokenType::TokIdent) {
                 throw std::runtime_error(
@@ -1265,7 +1310,7 @@ uint32_t Parser::parse_statement() {
             ident_node.as.ident.attr = attr;
             uint32_t id_idx = add_node(ident_node);
             idents.push_back(id_idx);
-            add_symbol(name, sym_type, id_idx);
+            pending.push_back({ name, sym_type, id_idx });
 
         } while (current_token.type == TokenType::TokComma && (advance(), true));
 
@@ -1276,6 +1321,10 @@ uint32_t Parser::parse_statement() {
                 values.push_back(parse_expression());
             } while (current_token.type == TokenType::TokComma && (advance(), true));
         }
+        //------------------ the new locals are in scope only after the whole declaration (Lua 5.4 manual §3.5): local x = 1; local x, y = 2, x
+        //------------------ gives y == 1, so the names are registered after the values have been parsed and resolved
+        for (auto &d : pending)
+            add_symbol(d.name, d.type, d.idx);
 
         uint32_t first_id = ctx.block_statements.size();
         for (auto id : idents)
@@ -1283,6 +1332,47 @@ uint32_t Parser::parse_statement() {
         uint32_t first_val = ctx.block_statements.size();
         for (auto v : values)
             ctx.block_statements.push_back(v);
+
+        //------------------ local a, b = {}, {1, 2}: one declaration per name when every value is a table constructor made only of
+        //------------------ literals (it cannot read any of the names being declared, nor have side effects), which makes it exactly
+        //------------------ the sequence of single declarations -- the form the array optimisations recognise
+        auto literal_ctor = [&](uint32_t v) {
+            if (v >= ctx.nodes.size() || ctx.nodes[v].type != NodeType::TableConstructor)
+                return false;
+            const auto &tc = ctx.nodes[v].as.table_cons;
+            auto lit = [&](uint32_t e) {
+                if (e == 0xFFFFFFFF)
+                    return true;
+                NodeType ty = ctx.nodes[e].type;
+                return ty == NodeType::Number || ty == NodeType::Integer || ty == NodeType::String || ty == NodeType::TrueLiteral
+                    || ty == NodeType::FalseLiteral || ty == NodeType::NilLiteral;
+            };
+            for (uint32_t ei = 0; ei < tc.count; ++ei)
+                if (!lit(ctx.block_statements[tc.first_item + ei * 2]) || !lit(ctx.block_statements[tc.first_item + ei * 2 + 1]))
+                    return false;
+            return true;
+        };
+        bool split = split_ok && idents.size() > 1 && values.size() == idents.size();
+        for (size_t k = 0; split && k < idents.size(); ++k)
+            split = literal_ctor(values[k]) && ctx.nodes[idents[k]].as.ident.attr == Attribute::None;
+        if (split) {
+            uint32_t first = INVALID_NODE;
+            for (size_t k = 0; k < idents.size(); ++k) {
+                ASTNode one;
+                one.type = NodeType::LocalDecl;
+                one.line = line;
+                one.as.local_decl.first_ident = first_id + static_cast<uint32_t>(k);
+                one.as.local_decl.ident_count = 1;
+                one.as.local_decl.first_value = first_val + static_cast<uint32_t>(k);
+                one.as.local_decl.value_count = 1;
+                uint32_t idx = add_node(one);
+                if (k == 0)
+                    first = idx;
+                else
+                    split_extra_.push_back(idx);
+            }
+            return first;
+        }
 
         ASTNode node;
         node.type = NodeType::LocalDecl;
@@ -1366,9 +1456,13 @@ uint32_t Parser::parse_block(bool is_main, bool keep_scope_open) {
                 || current_token.type == TokenType::TokUntil)) {
             break;
         }
+        split_ok_ = true;
         uint32_t stmt = parse_statement();
         if (stmt != INVALID_NODE)
             statements.push_back(stmt);
+        for (uint32_t extra : split_extra_)
+            statements.push_back(extra);
+        split_extra_.clear();
     }
 
     if (!is_main && !keep_scope_open)
@@ -1460,9 +1554,13 @@ uint32_t Parser::parse_funcbody(bool is_method) {
 
     std::vector<uint32_t> statements;
     while (current_token.type != TokenType::TokEof && current_token.type != TokenType::TokEnd) {
+        split_ok_ = true;
         uint32_t stmt = parse_statement();
         if (stmt != INVALID_NODE)
             statements.push_back(stmt);
+        for (uint32_t extra : split_extra_)
+            statements.push_back(extra);
+        split_extra_.clear();
     }
 
     leave_scope();

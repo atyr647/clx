@@ -60,6 +60,9 @@ struct Symbol {
     int depth;
     int function_depth;
     uint32_t decl_idx;
+    //------------------ alias: the declaration's unique internal name when it reuses a name declared earlier in the chunk (empty
+    //------------------ otherwise). The optimizer keys its facts by name, so shadowing locals must not share one (Parser::add_symbol).
+    std::string_view alias {};
 };
 
 //------------------ Attribute: variable attribute qualifiers
@@ -285,6 +288,34 @@ struct ASTContext {
     //------------------ string_storage: owning storage for decoded short-string literal bytes
     std::deque<std::string> string_storage;
 };
+
+//------------------ contains_goto: the statement is a goto or contains one in a nested block (not in a nested function). The code
+//------------------ generator hoists the locals declared after such a statement (until the next label) above it: C++ may not jump
+//------------------ over an initialisation, and the optimiser treats those locals as assigned twice
+inline bool contains_goto(const ASTContext &ctx, uint32_t si) {
+    if (si >= ctx.nodes.size())
+        return false;
+    const ASTNode &st = ctx.nodes[si];
+    auto block = [&](uint32_t bi) {
+        if (bi >= ctx.nodes.size() || ctx.nodes[bi].type != NodeType::Block)
+            return contains_goto(ctx, bi);
+        for (uint32_t i = 0; i < ctx.nodes[bi].as.block.count; ++i)
+            if (contains_goto(ctx, ctx.block_statements[ctx.nodes[bi].as.block.first_statement + i]))
+                return true;
+        return false;
+    };
+    switch (st.type) {
+    case NodeType::GotoStatement: return true;
+    case NodeType::Block: return block(si);
+    case NodeType::IfStatement: return block(st.as.if_stmt.then_block) || block(st.as.if_stmt.else_block);
+    case NodeType::WhileStatement: return block(st.as.while_stmt.body_block);
+    case NodeType::RepeatStatement: return block(st.as.repeat_stmt.body_block);
+    case NodeType::DoStatement: return block(st.as.do_stmt.body_block);
+    case NodeType::ForStatement: return block(st.as.for_stmt.body_block);
+    case NodeType::GenericForStatement: return block(st.as.generic_for.body_block);
+    default: return false;
+    }
+}
 
 //------------------ TokenType: all token kinds produced by the lexer
 enum class TokenType {
