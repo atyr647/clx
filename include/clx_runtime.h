@@ -2901,11 +2901,9 @@ CLX_INLINE_HOT LValue eq(LState *L, const LValue &a, const LValue &b) {
                                                       : static_cast<LUserdata *>(a.as_pointer())->metatable;
             LTable *mt_b = (b.type == ValueType::Table) ? tbl_metatable(static_cast<LTable *>(b.as_pointer()))
                                                         : static_cast<LUserdata *>(b.as_pointer())->metatable;
-            if (mt && mt == mt_b) {
-                LValue mm = mt->gettable(L->str_eq);
-                if (mm.type != ValueType::Nil)
-                    return LValue(call_bin_metamethod(L, a, b, L->str_eq, "__eq").as_bool());
-            }
+            //------------------ Lua 5.3+: the first operand's __eq, else the second's -- the metatables need not be the same (5.2 rule)
+            if ((mt && mt->gettable(L->str_eq).type != ValueType::Nil) || (mt_b && mt_b->gettable(L->str_eq).type != ValueType::Nil))
+                return LValue(call_bin_metamethod(L, a, b, L->str_eq, "__eq").as_bool());
         }
         return LValue(a.val.payload.ptr == b.val.payload.ptr);
     }

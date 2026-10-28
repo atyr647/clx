@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <cstdio>
 // ┌─────────────────────────────────────────────┐
 // │  clx — Lua to C++ Native Compiler           │
 // │  Copyright (c) 2026 Tine Samir. MIT License.│
@@ -20,6 +22,296 @@
 #include <vector>
 
 namespace clx {
+
+//------------------ single_init_of_local: the initialiser of a local that is declared exactly once in the chunk (names are matched
+//------------------ chunk-wide here), never reassigned and not captured -- so its value is that expression wherever it is read.
+static uint32_t single_init_of_local(const ASTContext &ctx, const AnalysisState &state, uint32_t idx) {
+    if (idx >= ctx.nodes.size() || ctx.nodes[idx].type != NodeType::Identifier || ctx.nodes[idx].as.ident.is_global
+        || ctx.nodes[idx].as.ident.is_captured)
+        return 0xFFFFFFFF;
+    std::string_view nm(ctx.nodes[idx].as.ident.name, ctx.nodes[idx].as.ident.length);
+    if (state.reassigned_vars.count(nm))
+        return 0xFFFFFFFF;
+    uint32_t init = 0xFFFFFFFF;
+    int decls = 0;
+    for (const auto &nd : ctx.nodes) {
+        if (nd.type == NodeType::ForStatement && nd.as.for_stmt.var_ident < ctx.nodes.size()
+            && std::string_view(ctx.nodes[nd.as.for_stmt.var_ident].as.ident.name, ctx.nodes[nd.as.for_stmt.var_ident].as.ident.length) == nm)
+            ++decls;
+        if (nd.type != NodeType::LocalDecl)
+            continue;
+        for (uint32_t ii = 0; ii < nd.as.local_decl.ident_count; ++ii) {
+            uint32_t idi = ctx.block_statements[nd.as.local_decl.first_ident + ii];
+            if (idi >= ctx.nodes.size() || ctx.nodes[idi].type != NodeType::Identifier
+                || std::string_view(ctx.nodes[idi].as.ident.name, ctx.nodes[idi].as.ident.length) != nm)
+                continue;
+            ++decls;
+            // one value per name; with fewer values than names, or a call as the last value, the binding is not a plain expression
+            if (ii < nd.as.local_decl.value_count && nd.as.local_decl.value_count == nd.as.local_decl.ident_count)
+                init = ctx.block_statements[nd.as.local_decl.first_value + ii];
+        }
+    }
+    return decls == 1 ? init : 0xFFFFFFFF;
+}
+
+//------------------ numeric_given_array_reads: true if expression `v` is a number whenever every integer-indexed array it reads
+//------------------ (`a[k]`, `a` a local identifier, `k` a name or integer literal) holds only numbers; those arrays are added to `reads`.
+//------------------ Arithmetic, unary minus, parentheses and anything yields_number already proves are accepted; everything else is not.
+static bool numeric_given_array_reads(const ASTContext &ctx, const AnalysisState &state, uint32_t v,
+    const std::set<std::string_view> &known_numbers, std::set<std::string_view> &reads, int depth = 0) {
+    if (v >= ctx.nodes.size() || depth > 64)
+        return false;
+    if (yields_number(ctx, state, v, &known_numbers))
+        return true;
+    const auto &n = ctx.nodes[v];
+    switch (n.type) {
+    case NodeType::ParenExpression:
+        return numeric_given_array_reads(ctx, state, n.as.paren_expr.expr, known_numbers, reads, depth + 1);
+    case NodeType::UnaryOp:
+        return n.as.unary_op.op == static_cast<int>(UnaryOp::Minus)
+            && numeric_given_array_reads(ctx, state, n.as.unary_op.expr, known_numbers, reads, depth + 1);
+    case NodeType::BinaryOp: {
+        int op = n.as.bin_op.op;
+        bool arith = (op >= static_cast<int>(BinaryOp::Add) && op <= static_cast<int>(BinaryOp::Div))
+            || (op >= static_cast<int>(BinaryOp::Mod) && op <= static_cast<int>(BinaryOp::Shr));
+        return arith && numeric_given_array_reads(ctx, state, n.as.bin_op.left, known_numbers, reads, depth + 1)
+            && numeric_given_array_reads(ctx, state, n.as.bin_op.right, known_numbers, reads, depth + 1);
+    }
+    case NodeType::TableAccess: {
+        uint32_t tb = n.as.table_access.table, k = n.as.table_access.key;
+        if (tb >= ctx.nodes.size() || k >= ctx.nodes.size() || ctx.nodes[tb].type != NodeType::Identifier
+            || ctx.nodes[tb].as.ident.is_global)
+            return false;
+        NodeType kt = ctx.nodes[k].type;
+        if (kt != NodeType::Identifier && kt != NodeType::Integer)
+            return false;
+        reads.insert(std::string_view(ctx.nodes[tb].as.ident.name, ctx.nodes[tb].as.ident.length));
+        return true;
+    }
+    case NodeType::Identifier: {   // local x = xs[i] + vx[i] * dt ... xs[i] = x
+        uint32_t init = single_init_of_local(ctx, state, v);
+        return init != 0xFFFFFFFF && numeric_given_array_reads(ctx, state, init, known_numbers, reads, depth + 1);
+    }
+    default:
+        return false;
+    }
+}
+
+//------------------ const_local_number: the value of `idx` if it is a numeric literal, or a local declared exactly once in the chunk
+//------------------ (this optimizer matches names chunk-wide, so a second declaration of the name could shadow it), initialised with
+//------------------ a numeric literal and never reassigned (`local n = 100`). Used to prove array bounds such as `for i = 1, n`.
+static std::optional<double> const_local_number(const ASTContext &ctx, const AnalysisState &state, uint32_t idx) {
+    double d = 0;
+    int64_t iv = 0;
+    bool isint = false;
+    if (idx >= ctx.nodes.size())
+        return std::nullopt;
+    if (is_literal_number(ctx, idx, d, iv, isint))
+        return isint ? static_cast<double>(iv) : d;
+    const auto &n = ctx.nodes[idx];
+    if (n.type != NodeType::Identifier || n.as.ident.is_global || n.as.ident.is_captured)
+        return std::nullopt;
+    std::string_view nm(n.as.ident.name, n.as.ident.length);
+    if (state.reassigned_vars.count(nm))   // assigned more than once (the declaration counts once)
+        return std::nullopt;
+    std::optional<double> found;
+    int decls = 0;
+    for (const auto &nd : ctx.nodes) {
+        if (nd.type == NodeType::ForStatement || nd.type == NodeType::GenericForStatement || nd.type == NodeType::FunctionDef) {
+            // a loop variable or parameter with the same name is another declaration
+            if (nd.type == NodeType::ForStatement && nd.as.for_stmt.var_ident < ctx.nodes.size()
+                && std::string_view(ctx.nodes[nd.as.for_stmt.var_ident].as.ident.name, ctx.nodes[nd.as.for_stmt.var_ident].as.ident.length) == nm)
+                ++decls;
+            continue;
+        }
+        if (nd.type != NodeType::LocalDecl)
+            continue;
+        for (uint32_t ii = 0; ii < nd.as.local_decl.ident_count; ++ii) {
+            uint32_t idi = ctx.block_statements[nd.as.local_decl.first_ident + ii];
+            if (idi >= ctx.nodes.size() || ctx.nodes[idi].type != NodeType::Identifier
+                || std::string_view(ctx.nodes[idi].as.ident.name, ctx.nodes[idi].as.ident.length) != nm)
+                continue;
+            ++decls;
+            if (ii < nd.as.local_decl.value_count && is_literal_number(ctx, ctx.block_statements[nd.as.local_decl.first_value + ii], d, iv, isint))
+                found = isint ? static_cast<double>(iv) : d;
+        }
+    }
+    return decls == 1 ? found : std::nullopt;
+}
+
+//------------------ classify_array_element_types: a promoted array is a native vector<int64_t> (int_numeric_arrays) or vector<double>,
+//------------------ so every value it can hold must be of that one subtype, or the vector changes Lua-visible results (math.type,
+//------------------ tostring: {1, 0.5} would read back 1.0). Collects every value stored into each promoted array (constructor items
+//------------------ and t[k] = v stores), then by fixpoint keeps an array as int if all its values are provably integers (reads of
+//------------------ arrays still in the int set count as integers), as double if all are provably floats (reads of arrays still in
+//------------------ the double set count as floats), and drops the promotion otherwise. Arrays that read a dropped array follow
+//------------------ through array_value_deps.
+static void classify_array_element_types(const ASTContext &ctx, AnalysisState &state, PassScratch &sk) {
+    if (state.pure_numeric_arrays.empty())
+        return;
+    auto ident = [&](uint32_t i) -> std::string_view {
+        while (i < ctx.nodes.size() && ctx.nodes[i].type == NodeType::ParenExpression)
+            i = ctx.nodes[i].as.paren_expr.expr;
+        if (i < ctx.nodes.size() && ctx.nodes[i].type == NodeType::Identifier)
+            return std::string_view(ctx.nodes[i].as.ident.name, ctx.nodes[i].as.ident.length);
+        return {};
+    };
+    std::map<std::string_view, std::vector<uint32_t>> values;   // every value stored into a promoted array
+    std::set<std::string_view> unknown;                       // arrays with a store whose value cannot be inspected
+    auto add_ctor = [&](std::string_view nm, uint32_t c) {
+        if (c >= ctx.nodes.size() || ctx.nodes[c].type != NodeType::TableConstructor)
+            return;
+        const auto &tc = ctx.nodes[c].as.table_cons;
+        for (uint32_t ei = 0; ei < tc.count; ++ei)
+            values[nm].push_back(ctx.block_statements[tc.first_item + ei * 2 + 1]);
+    };
+    for (uint32_t ni = 0; ni < ctx.nodes.size(); ++ni) {
+        const auto &n = ctx.nodes[ni];
+        if (n.type == NodeType::LocalDecl) {
+            for (uint32_t ii = 0; ii < n.as.local_decl.ident_count && ii < n.as.local_decl.value_count; ++ii) {
+                std::string_view nm = ident(ctx.block_statements[n.as.local_decl.first_ident + ii]);
+                if (!nm.empty() && state.pure_numeric_arrays.count(nm))
+                    add_ctor(nm, ctx.block_statements[n.as.local_decl.first_value + ii]);
+            }
+        } else if (n.type == NodeType::Assignment) {
+            for (uint32_t ti = 0; ti < n.as.assign.target_count; ++ti) {
+                uint32_t tg = ctx.block_statements[n.as.assign.first_target + ti];
+                uint32_t v = ti < n.as.assign.value_count ? ctx.block_statements[n.as.assign.first_value + ti] : 0xFFFFFFFF;
+                if (tg >= ctx.nodes.size())
+                    continue;
+                if (ctx.nodes[tg].type == NodeType::TableAccess) {
+                    std::string_view nm = ident(ctx.nodes[tg].as.table_access.table);
+                    if (nm.empty() || !state.pure_numeric_arrays.count(nm))
+                        continue;
+                    if (v == 0xFFFFFFFF || (ti + 1 == n.as.assign.value_count && n.as.assign.target_count > n.as.assign.value_count))
+                        unknown.insert(nm);
+                    else
+                        values[nm].push_back(v);
+                } else if (ctx.nodes[tg].type == NodeType::Identifier) {
+                    std::string_view nm = ident(tg);
+                    if (state.pure_numeric_arrays.count(nm) && v != 0xFFFFFFFF)
+                        add_ctor(nm, v);
+                }
+            }
+        }
+    }
+    std::set<std::string_view> ints, dbls;
+    auto table_read = [&](uint32_t i, const std::set<std::string_view> &in) -> bool {
+        const auto &n = ctx.nodes[i];
+        std::string_view nm = ident(n.as.table_access.table);
+        return !nm.empty() && in.count(nm) && is_purely_integer_expr(ctx, state, n.as.table_access.key);
+    };
+    std::function<bool(uint32_t)> int_expr = [&](uint32_t i) -> bool {
+        if (i >= ctx.nodes.size())
+            return false;
+        if (is_purely_integer_expr(ctx, state, i))
+            return true;
+        const auto &n = ctx.nodes[i];
+        switch (n.type) {
+        case NodeType::ParenExpression: return int_expr(n.as.paren_expr.expr);
+        case NodeType::UnaryOp:
+            return (n.as.unary_op.op == static_cast<int>(UnaryOp::Minus) || n.as.unary_op.op == static_cast<int>(UnaryOp::BNot))
+                && int_expr(n.as.unary_op.expr);
+        case NodeType::BinaryOp: {
+            int op = n.as.bin_op.op;
+            bool int_op = (op >= static_cast<int>(BinaryOp::Add) && op <= static_cast<int>(BinaryOp::Mul))
+                || op == static_cast<int>(BinaryOp::Mod) || op == static_cast<int>(BinaryOp::FloorDiv);
+            return int_op && int_expr(n.as.bin_op.left) && int_expr(n.as.bin_op.right);
+        }
+        case NodeType::TableAccess: return table_read(i, ints);
+        case NodeType::Identifier: { uint32_t init = single_init_of_local(ctx, state, i); return init != 0xFFFFFFFF && int_expr(init); }
+        default: return false;
+        }
+    };
+    std::function<bool(uint32_t)> float_expr;
+    auto numeric = [&](uint32_t i) -> bool {
+        if (int_expr(i) || float_expr(i) || yields_number(ctx, state, i, &sk.known_numbers))
+            return true;
+        std::set<std::string_view> reads;
+        if (!numeric_given_array_reads(ctx, state, i, sk.known_numbers, reads))
+            return false;
+        for (auto r : reads)
+            if (!ints.count(r) && !dbls.count(r))
+                return false;
+        return true;
+    };
+    float_expr = [&](uint32_t i) -> bool {
+        if (i >= ctx.nodes.size())
+            return false;
+        const auto &n = ctx.nodes[i];
+        switch (n.type) {
+        case NodeType::Number: return true;
+        case NodeType::ParenExpression: return float_expr(n.as.paren_expr.expr);
+        case NodeType::UnaryOp: return n.as.unary_op.op == static_cast<int>(UnaryOp::Minus) && float_expr(n.as.unary_op.expr);
+        case NodeType::BinaryOp: {
+            int op = n.as.bin_op.op;
+            if (op == static_cast<int>(BinaryOp::Div) || op == static_cast<int>(BinaryOp::Pow))
+                return numeric(n.as.bin_op.left) && numeric(n.as.bin_op.right);
+            bool arith = (op >= static_cast<int>(BinaryOp::Add) && op <= static_cast<int>(BinaryOp::Mul))
+                || op == static_cast<int>(BinaryOp::Mod) || op == static_cast<int>(BinaryOp::FloorDiv);
+            return arith && ((float_expr(n.as.bin_op.left) && numeric(n.as.bin_op.right))
+                || (float_expr(n.as.bin_op.right) && numeric(n.as.bin_op.left)));
+        }
+        case NodeType::TableAccess: return table_read(i, dbls);
+        case NodeType::Identifier: { uint32_t init = single_init_of_local(ctx, state, i); return init != 0xFFFFFFFF && float_expr(init); }
+        default: return false;
+        }
+    };
+    // ints: optimistic start from every promoted array, shrink to the arrays whose values are all integers
+    for (auto nm : state.pure_numeric_arrays)
+        if (!unknown.count(nm))
+            ints.insert(nm);
+    for (bool ch = true; ch;) {
+        ch = false;
+        for (auto it = ints.begin(); it != ints.end();) {
+            bool ok = true;
+            for (uint32_t v : values[*it])
+                if (!int_expr(v)) { ok = false; break; }
+            if (ok) { ++it; continue; }
+            it = ints.erase(it);
+            ch = true;
+        }
+    }
+    for (auto nm : state.pure_numeric_arrays)
+        if (!ints.count(nm) && !unknown.count(nm))
+            dbls.insert(nm);
+    for (bool ch = true; ch;) {
+        ch = false;
+        for (auto it = dbls.begin(); it != dbls.end();) {
+            bool ok = true;
+            for (uint32_t v : values[*it])
+                if (!float_expr(v)) { ok = false; break; }
+            if (ok) { ++it; continue; }
+            it = dbls.erase(it);
+            ch = true;
+        }
+    }
+    for (auto it = state.pure_numeric_arrays.begin(); it != state.pure_numeric_arrays.end();) {
+        if (ints.count(*it) || dbls.count(*it)) { ++it; continue; }
+        if (std::getenv("CLX_DEBUG_ARRAYS"))
+            std::fprintf(stderr, "[arrays] %.*s: mixed or unprovable element subtype, not promoted\n", (int)it->size(), it->data());
+        state.int_numeric_arrays.erase(*it);
+        it = state.pure_numeric_arrays.erase(it);
+    }
+    state.int_numeric_arrays.clear();
+    for (auto nm : ints)
+        if (state.pure_numeric_arrays.count(nm))
+            state.int_numeric_arrays.insert(nm);   // the AST's own view: the set holds string_views
+    for (bool changed = true; changed;) {   // arrays that read a dropped array lose their promotion too
+        changed = false;
+        for (auto it = state.pure_numeric_arrays.begin(); it != state.pure_numeric_arrays.end();) {
+            auto d = sk.array_value_deps.find(*it);
+            bool ok = true;
+            if (d != sk.array_value_deps.end())
+                for (auto dep : d->second)
+                    if (!state.pure_numeric_arrays.count(dep)) { ok = false; break; }
+            if (ok) { ++it; continue; }
+            state.int_numeric_arrays.erase(*it);
+            it = state.pure_numeric_arrays.erase(it);
+            changed = true;
+        }
+    }
+}
 
 //------------------ pass_pure_arrays: pure numeric array detection and disqualification
 void pass_pure_arrays(const ASTContext &ctx, AnalysisState &state, PassScratch &sk, uint32_t root_node) {
@@ -251,11 +543,15 @@ void pass_pure_arrays(const ASTContext &ctx, AnalysisState &state, PassScratch &
                                 }
                             }
                             uint32_t v_idx = ctx.block_statements[n.as.assign.first_value];
+                            std::set<std::string_view> _reads;
                             if (!yields_number(ctx, state, v_idx, &known_numbers)
                                 && ctx.nodes[v_idx].type != NodeType::TrueLiteral
                                 && ctx.nodes[v_idx].type != NodeType::FalseLiteral
                                 && ctx.nodes[v_idx].type != NodeType::TableAccess) {
-                                disqualified_arrays.insert(tname);
+                                if (numeric_given_array_reads(ctx, state, v_idx, known_numbers, _reads))
+                                    sk.array_value_deps[tname].insert(_reads.begin(), _reads.end());
+                                else
+                                    disqualified_arrays.insert(tname);
                             }
                         }
                     }
@@ -379,6 +675,26 @@ void pass_pure_arrays(const ASTContext &ctx, AnalysisState &state, PassScratch &
         }
     };
     traverse_node(ctx, root_node, purity_cb);
+
+    //------------------ a local declared between a goto and the next label of its block is hoisted by the code generator (declared
+    //------------------ before the goto, boxed, assigned at its declaration): it cannot also be a native vector
+    for (const auto &b : ctx.nodes) {
+        if (b.type != NodeType::Block)
+            continue;
+        bool after_goto = false;
+        for (uint32_t i = 0; i < b.as.block.count; ++i) {
+            const auto &st = ctx.nodes[ctx.block_statements[b.as.block.first_statement + i]];
+            if (contains_goto(ctx, ctx.block_statements[b.as.block.first_statement + i]))
+                after_goto = true;
+            else if (st.type == NodeType::LabelStatement)
+                after_goto = false;
+            else if (after_goto && st.type == NodeType::LocalDecl)
+                for (uint32_t j = 0; j < st.as.local_decl.ident_count; ++j) {
+                    const auto &id = ctx.nodes[ctx.block_statements[st.as.local_decl.first_ident + j]];
+                    disqualified_arrays.insert(std::string_view(id.as.ident.name, id.as.ident.length));
+                }
+        }
+    }
 
     for (auto name : pure_candidates) {
         if (disqualified_arrays.find(name) == disqualified_arrays.end()) {
@@ -898,12 +1214,7 @@ void pass_array_safety(const ASTContext &ctx, AnalysisState &state, PassScratch 
                         }
                         if (stepv <= 0.0)
                             continue;
-                        double ld = 0;
-                        int64_t li = 0;
-                        bool lint = false;
-                        if (!is_literal_number(ctx, nd.as.for_stmt.limit_expr, ld, li, lint))
-                            return std::nullopt;
-                        return std::optional<double>(ld);
+                        return const_local_number(ctx, state, nd.as.for_stmt.limit_expr);
                     }
                     return std::nullopt;
                 }
@@ -953,9 +1264,8 @@ void pass_array_safety(const ASTContext &ctx, AnalysisState &state, PassScratch 
                                     auto ab = array_bounds.find(std::string(tn));
                                     if (ab != array_bounds.end()) {
                                         if (auto mx = key_max_value2(key_max_value2, k)) {
-                                            double bd;
-                                            if (literal_int2(ab->second, bd))
-                                                bounded = (*mx <= bd);
+                                            if (auto bd = const_local_number(ctx, state, ab->second))
+                                                bounded = (*mx <= *bd);
                                         }
                                     }
                                 }
@@ -1070,6 +1380,22 @@ void pass_array_safety(const ASTContext &ctx, AnalysisState &state, PassScratch 
             walk2(walk2, root_node);
             for (auto tn : violate2)
                 state.pure_numeric_arrays.erase(tn);
+        }
+    }
+
+    //------------------ resolve array_value_deps: an array kept on the assumption that the arrays it reads hold numbers loses its
+    //------------------ promotion when any of them is not (or no longer) promoted; repeated until nothing changes
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (auto it = state.pure_numeric_arrays.begin(); it != state.pure_numeric_arrays.end();) {
+            auto d = sk.array_value_deps.find(*it);
+            bool ok = true;
+            if (d != sk.array_value_deps.end())
+                for (auto dep : d->second)
+                    if (!state.pure_numeric_arrays.count(dep)) { ok = false; break; }
+            if (ok) { ++it; continue; }
+            it = state.pure_numeric_arrays.erase(it);
+            changed = true;
         }
     }
 
@@ -1234,6 +1560,8 @@ void pass_array_safety(const ASTContext &ctx, AnalysisState &state, PassScratch 
         for (const auto &nm : int_arrays)
             state.int_numeric_arrays.insert(nm);
     }
+
+    classify_array_element_types(ctx, state, sk);
 }
 
 //------------------ write_stores_non_number: true if an assignment value statically must hold a

@@ -537,6 +537,55 @@ void pass_numeric_params(const ASTContext &ctx, AnalysisState &state, PassScratc
         }
     }
 
+    //------------------ parameters that may legitimately hold nil (or a non-number) are never inferred numeric from arithmetic: a
+    //------------------ parameter compared with nil, tested for truth (not x, if x, x and/or y) or assigned in its function -- the
+    //------------------ default-argument idiom (if x == nil then x = 100 end; YueScript's (x = 100) ->) read a missing argument as 0
+    std::map<uint32_t, std::set<std::string_view>> nil_tested;
+    for (const auto &fp : func_def_params) {
+        auto &out = nil_tested[fp.first];
+        auto param = [&](uint32_t e) -> std::string_view {
+            while (e < ctx.nodes.size() && ctx.nodes[e].type == NodeType::ParenExpression)
+                e = ctx.nodes[e].as.paren_expr.expr;
+            if (e >= ctx.nodes.size() || ctx.nodes[e].type != NodeType::Identifier)
+                return {};
+            std::string_view nm(ctx.nodes[e].as.ident.name, ctx.nodes[e].as.ident.length);
+            return std::find(fp.second.begin(), fp.second.end(), nm) != fp.second.end() ? nm : std::string_view {};
+        };
+        auto mark = [&](uint32_t e) {
+            std::string_view nm = param(e);
+            if (!nm.empty())
+                out.insert(nm);
+        };
+        auto is_nil = [&](uint32_t e) { return e < ctx.nodes.size() && ctx.nodes[e].type == NodeType::NilLiteral; };
+        auto cb = [&](uint32_t ni) {
+            const auto &n = ctx.nodes[ni];
+            if (n.type == NodeType::BinaryOp) {
+                int op = n.as.bin_op.op;
+                if ((op == static_cast<int>(BinaryOp::Eq) || op == static_cast<int>(BinaryOp::Ne))
+                    && (is_nil(n.as.bin_op.left) || is_nil(n.as.bin_op.right))) {
+                    mark(n.as.bin_op.left);
+                    mark(n.as.bin_op.right);
+                }
+                if (op == static_cast<int>(BinaryOp::And) || op == static_cast<int>(BinaryOp::Or)) {
+                    mark(n.as.bin_op.left);
+                    mark(n.as.bin_op.right);
+                }
+            } else if (n.type == NodeType::UnaryOp && n.as.unary_op.op == static_cast<int>(UnaryOp::Not)) {
+                mark(n.as.unary_op.expr);
+            } else if (n.type == NodeType::IfStatement) {
+                mark(n.as.if_stmt.condition);
+            } else if (n.type == NodeType::WhileStatement) {
+                mark(n.as.while_stmt.condition);
+            } else if (n.type == NodeType::RepeatStatement) {
+                mark(n.as.repeat_stmt.condition);
+            } else if (n.type == NodeType::Assignment) {
+                for (uint32_t ti = 0; ti < n.as.assign.target_count; ++ti)
+                    mark(ctx.block_statements[n.as.assign.first_target + ti]);
+            }
+        };
+        traverse_node(ctx, ctx.nodes[fp.first].as.func_def.body_block, cb);
+    }
+
     bool np_changed = true;
     for (int iter = 0; iter < 10 && np_changed; ++iter) {
         np_changed = false;
@@ -614,7 +663,7 @@ void pass_numeric_params(const ASTContext &ctx, AnalysisState &state, PassScratc
                             if (idx < ctx.nodes.size() && ctx.nodes[idx].type == NodeType::Identifier) {
                                 std::string_view nm(ctx.nodes[idx].as.ident.name, ctx.nodes[idx].as.ident.length);
                                 for (auto &fp : fparams) {
-                                    if (fp == nm) {
+                                    if (fp == nm && !nil_tested[ni].count(nm)) {
                                         if (!state.param_numbers[ni].count(std::string(nm))) {
                                             state.param_numbers[ni].insert(std::string(nm));
                                             np_changed = true;
@@ -644,7 +693,7 @@ void pass_numeric_params(const ASTContext &ctx, AnalysisState &state, PassScratc
                                         if (state.param_numbers[ci].count(callee_pn)
                                             && !state.param_numbers[ni].count(std::string(arg_nm))) {
                                             for (auto &fp : fparams) {
-                                                if (fp == arg_nm) {
+                                                if (fp == arg_nm && !nil_tested[ni].count(arg_nm)) {
                                                     state.param_numbers[ni].insert(std::string(arg_nm));
                                                     np_changed = true;
                                                 }
@@ -1044,7 +1093,9 @@ void pass_int_returns_masks(const ASTContext &ctx, AnalysisState &state, PassScr
                 if (!all_native || pn.at(fdef.first).empty())
                     continue;
                 uint32_t mask = (fn.param_count == 32) ? 0xFFFFFFFFu : ((1u << fn.param_count) - 1u);
-                std::map<std::string_view, uint32_t> masks;
+                //------------------ the masks of functions already analysed (callees defined earlier: local function idn(x) return x end
+                //------------------ local function addone(x) return idn(x) + 1 end) so a call to one propagates its integer subtype
+                std::map<std::string_view, uint32_t> masks(state.int_preserving_masks.begin(), state.int_preserving_masks.end());
                 masks[fdef.first] = mask;
                 uint32_t cur = masks[fdef.first];
                 bool impossible = false;

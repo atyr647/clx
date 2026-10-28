@@ -368,8 +368,7 @@ void CodeEmitter::emitBlock(const ASTNode &node, uint32_t node_idx, DeferredBloc
     bool has_goto = false;
     for (uint32_t i = 0; i < node.as.block.count; ++i) {
         uint32_t stmt_idx = ctx.block_statements[node.as.block.first_statement + i];
-        auto t = ctx.nodes[stmt_idx].type;
-        if (t == NodeType::GotoStatement) {
+        if (contains_goto(ctx, stmt_idx)) {
             has_goto = true;
             break;
         }
@@ -379,7 +378,7 @@ void CodeEmitter::emitBlock(const ASTNode &node, uint32_t node_idx, DeferredBloc
         for (uint32_t i = 0; i < node.as.block.count; ++i) {
             uint32_t stmt_idx = ctx.block_statements[node.as.block.first_statement + i];
             const auto &st = ctx.nodes[stmt_idx];
-            if (st.type == NodeType::GotoStatement)
+            if (contains_goto(ctx, stmt_idx))
                 after_goto = true;
             if (st.type == NodeType::LabelStatement)
                 after_goto = false;
@@ -512,6 +511,12 @@ void CodeEmitter::emitBlock(const ASTNode &node, uint32_t node_idx, DeferredBloc
         }
         if (stmt.line > 0)
             out << "L->current_line = " << stmt.line << ";\n";
+        //------------------ in a block with a goto, an assignment or call gets its own C++ scope: the temporaries it declares
+        //------------------ (multiple assignment, argument buffers) must not lie between a goto and its label (C++ may not jump
+        //------------------ over an initialisation); locals are hoisted instead (above)
+        bool own_scope = has_goto && (stmt.type == NodeType::Assignment || stmt.type == NodeType::CallExpression);
+        if (own_scope)
+            out << "{\n";
         emit_node(stmt_idx);
         if (stmt.type != NodeType::Block && stmt.type != NodeType::Assignment
             && stmt.type != NodeType::GlobalDeclStatement && stmt.type != NodeType::LocalDecl
@@ -522,6 +527,8 @@ void CodeEmitter::emitBlock(const ASTNode &node, uint32_t node_idx, DeferredBloc
             && stmt.type != NodeType::LabelStatement && stmt.type != NodeType::DoStatement) {
             out << ";\n";
         }
+        if (own_scope)
+            out << "}\n";
     }
 
     if (def) {
@@ -949,7 +956,7 @@ void CodeEmitter::emitFunctionDef(const ASTNode &node, uint32_t node_idx) {
                 out << "_fr.push(*l_" << cpp_name << ");\n";
             }
         } else if (is_native) {
-            out << "double l_" << cpp_name << " = (" << i << " < arg_count) ? args[" << i << "].as_number() : 0.0;\n";
+            out << "double l_" << cpp_name << " = clx::coerce_number(L, (" << i << " < arg_count) ? args[" << i << "] : clx::LValue());\n";
             out << "bool _intf_l_" << cpp_name << " = (" << i << " < arg_count) && args[" << i
                 << "].type == clx::ValueType::Int64;\n";
             out << "int64_t _ii_l_" << cpp_name << " = (" << i << " < arg_count) ? args[" << i
