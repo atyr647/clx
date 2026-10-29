@@ -264,9 +264,11 @@ static LValue read_all(LState *L, FILE *fp) {
     std::string content;
     if (hint > 0)
         content.reserve(std::min(hint, SINGLE_SHOT_LIMIT));
-    char buf[CHUNK];
+    //------------------ on the heap: a 64 KiB array on the stack is the whole default wasm stack (64 KiB), and read("a") of an existing file overflowed it (memory fault in ftell)
+    std::unique_ptr<char[]> bufp(new char[CHUNK]);
+    char *buf = bufp.get();
     size_t r;
-    while ((r = std::fread(buf, 1, sizeof(buf), fp)) > 0)
+    while ((r = std::fread(buf, 1, CHUNK, fp)) > 0)
         content.append(buf, r);
     if (content.empty())
         return LValue(L->intern_string("", 0));
