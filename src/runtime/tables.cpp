@@ -86,13 +86,8 @@ LValue table_get_slow(LState *L, const LValue &obj, const LValue &key) {
             return table_get(L, index, key);
         if (index.type == ValueType::Function) {
             LValue args[2] = { obj, key };
-            //------------------ Lazy materialization (__index) is not a user-level call: it must not consume the
-            //------------------ pending call-site name/method flags destined for the real callee. Preserve them.
-            bool _pm = L->pending_call_is_method;
-            bool _ps = L->pending_call_name_short;
-            MultiValue mv = call_function_rooted(L, index, args, 2, "__index", 0);
-            L->pending_call_is_method = _pm;
-            L->pending_call_name_short = _ps;
+            static constexpr CallSite index_site = { "__index", 0, false, false };
+            MultiValue mv = call_function_rooted(L, index, args, 2, &index_site);
             return mv.count > 0 ? mv[0] : LValue();
         }
         return LValue();
@@ -107,11 +102,8 @@ LValue table_get_slow(LState *L, const LValue &obj, const LValue &key) {
         return LValue();
     if (index.type == ValueType::Function) {
         LValue args[2] = { obj, key };
-        bool _pm = L->pending_call_is_method;
-        bool _ps = L->pending_call_name_short;
-        MultiValue mv = call_function_rooted(L, index, args, 2, "__index", 0);
-        L->pending_call_is_method = _pm;
-        L->pending_call_name_short = _ps;
+        static constexpr CallSite index_site = { "__index", 0, false, false };
+        MultiValue mv = call_function_rooted(L, index, args, 2, &index_site);
         return mv.count > 0 ? mv[0] : LValue();
     }
     if (index.type == ValueType::Table)
@@ -147,7 +139,6 @@ LTable::~LTable() {
 
 //------------------ LTable::resize_hash — allocate/rehash to new_size (power of 2)
 void LTable::resize_hash(size_t new_size) {
-    g_alloc_census.hash_resize++;
     new_size = next_pow2(new_size);
 
     const size_t hb_before = table_heap_bytes(this);
@@ -274,7 +265,6 @@ void LTable::settable(const LValue &key, const LValue &val) {
             const size_t hb_grow = table_heap_bytes(this);
             TValue *new_arr = nullptr;
             ValueType *new_types = nullptr;
-            g_alloc_census.array_grow++;
             table_alloc_array(new_arr, new_types, new_cap);
             if (array_cap) {
                 std::memcpy(new_arr, array, array_cap * sizeof(TValue));
@@ -659,7 +649,8 @@ LValue LTable::get_value(LState *L, const LValue &key) {
                 args[0] = LValue(this);
                 args[1] = key;
 
-                MultiValue ret = call_function_rooted(L, index_ptr, args, 2, __FILE__, __LINE__);
+                static constexpr CallSite index_ptr_site = { __FILE__, __LINE__, false, false };
+                MultiValue ret = call_function_rooted(L, index_ptr, args, 2, &index_ptr_site);
                 return ret.count > 0 ? ret[0] : LValue();
             }
         }
@@ -690,7 +681,8 @@ void LTable::set_value(LState *L, const LValue &key, const LValue &val) {
                 args[1] = key;
                 args[2] = val;
 
-                call_function_rooted(L, newindex_ptr, args, 3, __FILE__, __LINE__);
+                static constexpr CallSite newindex_ptr_site = { __FILE__, __LINE__, false, false };
+                call_function_rooted(L, newindex_ptr, args, 3, &newindex_ptr_site);
                 return;
             }
         }
