@@ -17,7 +17,6 @@
 #include <mutex>
 #include <string>
 #include <string_view>
-#include <time.h>
 #include <vector>
 
 namespace clx {
@@ -35,7 +34,8 @@ static void clx_trigger_gc(LState *L, LTable *t) {
 
     LValue args[1] = { LValue(Table, t) };
     try {
-        call_function_rooted(L, gc_func, args, 1, "GC_Finalizer", 0);
+        static constexpr CallSite finalizer_site = { "GC_Finalizer", 0, false, false };
+        call_function_rooted(L, gc_func, args, 1, &finalizer_site);
     } catch (const LRuntimeException &e) {
         std::cerr << "error in __gc metamethod: " << e.what() << "\n";
     } catch (std::exception &e) {
@@ -466,8 +466,6 @@ void LState::gc_minor() {
     //------------------ and re-enter through gc_maybe_collect().
     if (gc_minor_active)
         return;
-    struct timespec _gt0, _gt1;
-    clock_gettime(CLOCK_MONOTONIC, &_gt0);
     ++gc_stats_minors;
     gc_minor_active = true;
     if (gc_stats_remembered_high < gc_remembered.size())
@@ -671,18 +669,13 @@ void LState::gc_minor() {
 
     //------------------ single walk over the allocation chain: age/promote,
 
-    struct timespec _gs0, _gs1;
-    clock_gettime(CLOCK_MONOTONIC, &_gs0);
-    g_alloc_census.gc_minor_mark_us += (uint64_t)(_gs0.tv_sec - _gt0.tv_sec) * 1000000ULL
-        + ((int64_t)_gs0.tv_nsec - (int64_t)_gt0.tv_nsec) / 1000;
     size_t before_sweep = allocated_bytes;
     LHeader **link = &allocated_objects;
     while (*link) {
         LHeader *o = *link;
         if (o->age == AGE_OLD) {
             //------------------ Should not happen (promotions move to old_objects below, majors
-            //------------------ re-partition); kept as a counted safety net, not a fast path.
-            g_alloc_census.gc_old_skipped++;
+            //------------------ re-partition); kept as a safety net, not a fast path.
             *link = o->next;
             o->next = old_objects;
             old_objects = o;
@@ -767,11 +760,6 @@ void LState::gc_minor() {
     if (gc_finalizable || gc_finalizable_ud)
         gc_drain_finalizables(this);
 
-    clock_gettime(CLOCK_MONOTONIC, &_gs1);
-    g_alloc_census.gc_minor_sweep_us += (uint64_t)(_gs1.tv_sec - _gs0.tv_sec) * 1000000ULL
-        + ((int64_t)_gs1.tv_nsec - (int64_t)_gs0.tv_nsec) / 1000;
-    ++g_alloc_census.gc_minors;
-
     gc_bytes_at_minor = allocated_bytes;
     gc_minor_active = false;
 
@@ -798,9 +786,6 @@ void LState::gc_minor() {
     gc_major_pending = (gc_old_bytes >= gc_major_threshold);
 
     wl.clear();
-    clock_gettime(CLOCK_MONOTONIC, &_gt1);
-    g_alloc_census.gc_minor_us += (uint64_t)(_gt1.tv_sec - _gt0.tv_sec) * 1000000ULL
-        + (uint64_t)(_gt1.tv_nsec - _gt0.tv_nsec) / 1000ULL;
 }
 
 //------------------ LState::gc_step — incremental GC sweep step
@@ -904,12 +889,7 @@ void LState::collect_garbage() {
     if (gc_mode == GCMode::Generational && !gc_draining && gc_phase == GCPhase::Idle)
         gc_minor();
     size_t before = allocated_bytes;
-    struct timespec _M0, _M1;
-    clock_gettime(CLOCK_MONOTONIC, &_M0);
     collect_garbage_full();
-    clock_gettime(CLOCK_MONOTONIC, &_M1);
-    g_alloc_census.gc_major_us += (uint64_t)(_M1.tv_sec - _M0.tv_sec) * 1000000ULL
-        + (uint64_t)(_M1.tv_nsec - _M0.tv_nsec) / 1000ULL;
     gc_stats_major_freed += (before > allocated_bytes) ? (before - allocated_bytes) : 0;
     if (gc_mode == GCMode::Generational)
         gc_major_pending = false;
