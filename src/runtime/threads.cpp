@@ -73,7 +73,9 @@ static inline void root_load(LState *L, LThread *t) {
 #define CLX_CO_STUB __attribute__((noinline, optnone))
 extern "C" {
 CLX_CO_STUB __attribute__((export_name("celori_coro_new"))) void celori_coro_new(uint32_t slot, void (*entry)(void)) { __asm__ volatile("" ::"r"(slot), "r"(entry) : "memory"); }
-CLX_CO_STUB __attribute__((export_name("celori_coro_resume"))) uint32_t celori_coro_resume(uint32_t slot, uint32_t sp) { __asm__ volatile("" ::"r"(slot), "r"(sp) : "memory"); return slot ^ sp; }
+// unspliced, resume returns kCoroUnspliced; the real body returns the worker's stack pointer (a linear-memory address, never this value)
+static constexpr uint32_t kCoroUnspliced = 0xDEADBEEFu;
+CLX_CO_STUB __attribute__((export_name("celori_coro_resume"))) uint32_t celori_coro_resume(uint32_t slot, uint32_t sp) { __asm__ volatile("" ::"r"(slot), "r"(sp) : "memory"); return kCoroUnspliced; }
 CLX_CO_STUB __attribute__((export_name("celori_coro_suspend"))) void celori_coro_suspend(void) { __asm__ volatile("" ::: "memory"); }
 }
 
@@ -157,8 +159,13 @@ static void wasm_co_switch(LThread *from, LThread *to) {
     uint32_t sp = celori_coro_resume(w->slot, w->sp);
     g_co_cur = prev_cur;
     L->stack_limit = prev_limit;
+    if (sp == kCoroUnspliced) {
+        // the stub body is still there: nothing was switched and the coroutine did not run. Undo the acquire and say what is missing.
+        to->ctx.worker = nullptr; w->job = nullptr; w->next_free = g_co_free; g_co_free = w;
+        throw_runtime_error("coroutines need tools/wasm_costack_splice.py applied to the linked module (stack-switching splice missing)");
+    }
     if (!sp)
-        std::abort();   // a worker never finishes; reaching here means the splice was not applied or the continuation table is corrupt
+        std::abort();   // a worker never finishes; reaching here means the continuation table is corrupt
     w->sp = sp;
     if (reinterpret_cast<uint32_t *>(w->mem)[0] != kCoCanary || reinterpret_cast<uint32_t *>(w->mem)[3] != kCoCanary) {
         std::fprintf(stderr, "clx: coroutine stack overflow clobbered the memory below its stack; aborting\n");
