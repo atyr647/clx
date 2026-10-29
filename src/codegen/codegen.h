@@ -73,6 +73,7 @@ private:
 
     //------------------ gc_cells_arg: initializer list of in-scope upvalue cells for GC rooting of escaped closures
     std::string gc_cells_arg(const std::string &exclude = "");
+    uint32_t next_site_id = 0;
     bool is_local(std::string_view name, bool &out_is_boxed, std::string_view &out_cpp_name);
 
     //------------------ note_global_ref: records a global read for filtered std registration.
@@ -91,6 +92,9 @@ private:
 
     //------------------ var_reassigned_non_int: checks if a variable receives any new non-integer value
     bool var_reassigned_non_int(std::string_view name, uint32_t block_idx, uint32_t exclude_value_node = 0xFFFFFFFF);
+
+    //------------------ emit_call_site: emits one static CallSite descriptor and returns its address expression
+    std::string emit_call_site(int line, bool is_method, bool name_short);
 
     //------------------ emit_node: dispatches to the emitXxx method matching node's type
     void emit_node(uint32_t node_idx);
@@ -180,6 +184,8 @@ private:
     void emitBlock(const ASTNode &node, uint32_t node_idx, DeferredBlockScope *defer = nullptr);
     void emitFunctionDef(const ASTNode &node, uint32_t node_idx);
     void emit_native_impl_def(std::string_view name, uint32_t v_idx);
+    //------------------ emit_fast_variant: emits the `_fast_<name>_impl` body and `_fast_<name>` wrapper
+    void emit_fast_variant(std::string_view name, uint32_t v_idx);
     //------------------ emit_dbl_impl_def: triple-bound (double, int-flag, int-shadow) overload of a
     //------------------ native-direct single-return function; call sites with double-ready args bypass boxing.
     void emit_dbl_impl_def(std::string_view name, uint32_t v_idx);
