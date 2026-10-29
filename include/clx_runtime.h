@@ -659,6 +659,32 @@ struct MultiValue {
     void overflow_init(const clx::LValue *arr, size_t c);
 };
 
+//------------------ DynArgs: the argument buffer of a call whose last argument expands to several values (`f(a, g())`). The generated code used a fixed
+//------------------ `LValue[16]`, so g() returning more than 15 values wrote past it (stack smashing). Sixteen slots inline, the heap beyond that.
+struct DynArgs {
+    LValue small_[16];
+    LValue *data_ = small_;
+    size_t cap_ = 16;
+    std::unique_ptr<LValue[]> heap_;
+    DynArgs() = default;
+    explicit DynArgs(size_t n) { reserve(n); }
+    DynArgs(const DynArgs &) = delete;
+    DynArgs &operator=(const DynArgs &) = delete;
+    void reserve(size_t n) {
+        if (n <= cap_)
+            return;
+        std::unique_ptr<LValue[]> bigger(new LValue[n]);
+        for (size_t i = 0; i < cap_; ++i)
+            bigger[i] = data_[i];
+        heap_ = std::move(bigger);
+        data_ = heap_.get();
+        cap_ = n;
+    }
+    LValue &operator[](size_t i) { return data_[i]; }
+    operator LValue *() { return data_; }
+    operator const LValue *() const { return data_; }
+};
+
 struct LState;
 struct LTable;
 struct RootRange;
@@ -3254,23 +3280,6 @@ CLX_INLINE_COLD LValue len(LState *L, const LValue &a) {
     return LValue(lo);
 }
 
-//------------------ `#x` is an integer unless a __len metamethod (which may return anything) or a non-string/table operand is involved;
-//------------------ these two never call a metamethod, so the codegen can evaluate them once for the flag and once for the value
-CLX_INLINE bool len_is_int(LState *L, const LValue &a) {
-    if (a.type == ValueType::String)
-        return true;
-    if (a.type != ValueType::Table)
-        return false;
-    LTable *mt = tbl_metatable(static_cast<LTable *>(a.as_pointer()));
-    return mt == nullptr || mt->gettable(L->str_len).type == ValueType::Nil;
-}
-
-CLX_INLINE int64_t len_int(LState *L, const LValue &a) {
-    if (!len_is_int(L, a))
-        return 0;
-    return len(L, a).as_integer();
-}
-
 //------------------ Modulo with metamethod fallback (stock errors for integer b == 0)
 CLX_INLINE LValue mod(LState *L, const LValue &a, const LValue &b) {
     if (a.type == ValueType::Int64 && b.type == ValueType::Int64) [[likely]]
@@ -3878,7 +3887,7 @@ MultiValue close_thread(LState *L, const LValue &thread);
 //------------------ Opens CLX state
 LState *open(int argc = 0, char *argv[] = nullptr);
 //------------------ Opens CLX state without registering any std library (driver-emitted filtered open
-//------------------ sequences register only the referenced base functions afterwards)
+//------------------ sequences register only the referenced base functions afterwards). Returns with collection off (gc_running = false): set it to true after registering.
 LState *open_bare(int argc = 0, char *argv[] = nullptr);
 //------------------ Opens all standard libraries
 void openlibs(LState *L);

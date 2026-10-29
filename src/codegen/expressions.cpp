@@ -70,6 +70,10 @@ void CodeEmitter::emit_intrinsic_native_body(const ASTNode &n) {
 
 //------------------ emit_native: emits an expression coerced to a raw C++ double
 void CodeEmitter::emit_native(uint32_t n_idx) {
+    if (auto bx = boxed_rhs.find(n_idx); bx != boxed_rhs.end()) {
+        out << bx->second << ".as_number()";
+        return;
+    }
 
     if (yields_number(ctx, state, n_idx, nullptr, state.current_fast_func)) {
         const auto &n = ctx.nodes[n_idx];
@@ -782,7 +786,7 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
     }
 
     if (last_expands) {
-        out << "    clx::LValue _dyn_buf[16];\n    size_t _dyn_count = 0;\n";
+        out << "    clx::DynArgs _dyn_buf(" << node.as.call_expr.arg_count << ");\n    size_t _dyn_count = 0;\n";
         if (node.as.call_expr.arg_count > 1) {
             for (uint32_t i = 0; i < node.as.call_expr.arg_count - 1; ++i) {
                 if (i > 0)
@@ -808,6 +812,7 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
             out << ";\n";
             state.expect_multivalue = false;
 
+            out << "    _dyn_buf.reserve(_dyn_count + _mret.count);\n";
             out << "    for (size_t _mi = 0; _mi < _mret.count; ++_mi) _dyn_buf[_dyn_count++] = _mret[_mi];\n";
         }
         out << "    for (size_t _mi = 0; _mi < _dyn_count; ++_mi) _fr.push(_dyn_buf[_mi]);\n";

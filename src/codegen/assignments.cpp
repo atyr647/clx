@@ -229,6 +229,10 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
             }
             bool use_rhs_tmp = is_shadow_decl && (v_count > 0)
                 && yields_number(ctx, state, ctx.block_statements[first_v], nullptr, state.current_fast_func);
+            //------------------ a double-tracked variable initialised from an expression with a run-time-typed `#x`: evaluate it once, boxed (box_rhs_if_dynamic_len)
+            BoxedRhsGuard bx_decl;
+            if (v_count > 0 && !is_int_single)
+                bx_decl = box_rhs_if_dynamic_len(ctx.block_statements[first_v]);
             std::string rhs_flag_text;
             if (v_count > 0)
                 rhs_flag_text = int_flag_expr(ctx.block_statements[first_v], 1);
@@ -343,6 +347,16 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                     }
                 }
                 if (!handled_compound) {
+                    BoxedRhsGuard bx_asg;
+                    if (is_loc && v_count > 0) {
+                        for (auto it = locals.rbegin(); it != locals.rend(); ++it) {
+                            if (it->name == single_name) {
+                                if (it->has_intf)
+                                    bx_asg = box_rhs_if_dynamic_len(ctx.block_statements[first_v]);
+                                break;
+                            }
+                        }
+                    }
                     out << "l_" << single_name << " = ";
                     if (v_count > 0) {
                         uint32_t v_idx = ctx.block_statements[first_v];
@@ -612,9 +626,15 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                     } else {
                         if (state.hoisted_locals.count(name)) {
                             if (v_count > 0) {
+                                //------------------ the value is evaluated once into l_name (a boxed value); the flag and exact value read it back instead of re-evaluating the expression
                                 out << "l_" << name << " = ";
                                 emit_node(ctx.block_statements[first_v]);
                                 out << ";\n";
+                                BoxedRhsGuard hv_guard;
+                                if (rhs_has_dynamic_len(ctx.block_statements[first_v], 0)) {
+                                    boxed_rhs[ctx.block_statements[first_v]] = "l_" + std::string(name);
+                                    hv_guard = BoxedRhsGuard(this, ctx.block_statements[first_v]);
+                                }
                                 bool hv_native
                                     = std::find(state.native_numbers.begin(), state.native_numbers.end(), name)
                                     != state.native_numbers.end();
@@ -908,6 +928,18 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                     }
                 }
                 if (!intercepted) {
+                    BoxedRhsGuard bx_asg2;
+                    if (v_count > 0 && !is_boxed
+                        && std::find(state.native_numbers.begin(), state.native_numbers.end(), name)
+                            != state.native_numbers.end()) {
+                        for (auto it = locals.rbegin(); it != locals.rend(); ++it) {
+                            if (it->name == name) {
+                                if (it->has_intf)
+                                    bx_asg2 = box_rhs_if_dynamic_len(ctx.block_statements[first_v]);
+                                break;
+                            }
+                        }
+                    }
                     if (is_boxed)
                         out << "clx::upval_store(l_" << name << ", ";
                     else
@@ -1310,6 +1342,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
 
     std::vector<bool> tmp_is_native(v_count, false);
     std::vector<bool> tmp_is_integer(v_count, false);
+    std::vector<BoxedRhsGuard> bx_tmps;   // run-time-typed `#x` values evaluated once and boxed; they stay registered until the flags below are emitted
     if (v_count > 0) {
         out << "size_t _rg_base_" << node_idx << " = _fr.mark();\n";
         for (size_t i = 0; i < v_count; ++i) {
@@ -1488,6 +1521,8 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                         is_int_tmp = clx::is_purely_integer_expr(ctx, state, v_idx)
                             && !var_reassigned_non_int(tname, state.current_func_body, v_idx);
                     }
+                    if (!is_int_tmp)
+                        bx_tmps.push_back(box_rhs_if_dynamic_len(v_idx));
                     if (is_int_tmp) {
                         tmp_is_integer[i] = true;
                         out << "int64_t _tmp_" << node_idx << "_" << i << " = ";
@@ -1943,11 +1978,13 @@ void CodeEmitter::emitTableConstructor(const ASTNode &node, uint32_t node_idx) {
     } else {
         out << implicit_count;
     }
+    //------------------ the table is rooted while it is built, arena or not: an arena table is never freed, but the values stored into it so far are
+    //------------------ reachable only through it, and a collection while a later item is built (`{ a = {..}, b = {..} }`) freed them
     if (_is_arena) {
         size_t hsize_pow2 = 8;
         while (hsize_pow2 < explicit_count)
             hsize_pow2 <<= 1;
-        out << ", " << hsize_pow2 << ");\n";
+        out << ", " << hsize_pow2 << ");\n_fr.push(_t);\n";
     } else {
         out << ", " << explicit_count << ");\n_fr.push(_t);\n";
     }
@@ -2000,8 +2037,7 @@ void CodeEmitter::emitTableConstructor(const ASTNode &node, uint32_t node_idx) {
             out << "}\n";
         }
     }
-    if (!_is_arena)
-        out << "_fr.pop();\n";
+    out << "_fr.pop();\n";
     out << "return _t;\n}())";
 }
 

@@ -30,6 +30,7 @@ int main(int argc, char **argv) {
     LState *L = open_bare(argc, argv);
     luastd_base_print(L); luastd_base_error(L); luastd_base_pcall(L);
     openlibs(L);
+    L->gc_running = true;   // open_bare returns with collection off
 
     // wait(n): yields n times, yielding i each time; returns "waited"
     LValue wait_fn = co_function(L, [](LState *L, const LValue *args, size_t n) -> CoResult {

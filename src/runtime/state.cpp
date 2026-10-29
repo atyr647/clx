@@ -502,8 +502,12 @@ thread_local LState *clx_current_L = nullptr;
 //------------------ open_bare — create Lua state without registering any std library. Generated
 //------------------ executables use this plus a filtered registration sequence so the linker strips
 //------------------ unreferenced base functions; open() below preserves the legacy all-registered behavior.
+//------------------ It returns with collection OFF (gc_running = false): the std registrars create objects that nothing roots yet, so a collection
+//------------------ during registration (reachable with a small CLX_GC_MINOR_KB) freed them and left io.open, os.tmpname... nil. The caller sets
+//------------------ gc_running = true once registration is done (open() and the generated main do).
 LState *open_bare(int argc, char *argv[]) {
     LState *L = new LState();
+    L->gc_running = false;
     clx_current_L = L;
 
     LThread *main_th = new LThread();
@@ -539,6 +543,7 @@ LState *open(int argc, char *argv[]) {
     LState *L = open_bare(argc, argv);
     luastd_base(L);
     luastd_package(L);
+    L->gc_running = true;
     return L;
 }
 

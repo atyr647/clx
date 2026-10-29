@@ -1237,7 +1237,7 @@ void CodeEmitter::emitReturnStatement(const ASTNode &node, uint32_t node_idx) {
 
         if (last_expands) {
             out << "    size_t _ssave_dyn = _fr.mark();\n";
-            out << "    clx::LValue _dyn_buf[16];\n    size_t _dyn_count = 0;\n";
+            out << "    clx::DynArgs _dyn_buf(" << call_node.as.call_expr.arg_count << ");\n    size_t _dyn_count = 0;\n";
             for (uint32_t a = 0; a < call_node.as.call_expr.arg_count - 1; ++a) {
                 if (a > 0)
                     out << "    _fr.push(_dyn_buf[" << (a - 1) << "]);\n";
@@ -1250,6 +1250,7 @@ void CodeEmitter::emitReturnStatement(const ASTNode &node, uint32_t node_idx) {
             emit_node(last_arg);
             out << ";\n";
             state.expect_multivalue = false;
+            out << "    _dyn_buf.reserve(_dyn_count + _mret.count);\n";
             out << "    for (size_t _mi = 0; _mi < _mret.count; ++_mi) _dyn_buf[_dyn_count++] = _mret[_mi];\n";
             if (is_direct) {
                 if (state.in_function_def) {

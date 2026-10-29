@@ -837,7 +837,10 @@ int main(int argc, char* argv[])
                 need_base.insert("next"); //------------------ pairs() returns the global next iterator
         }
         if (need_full) {
-            appender << "    clx::LState* L = clx::open(argc, argv);\n";
+            //------------------ what clx::open() does, spelled out: open() returns with collection on, and registration must finish before it is
+            appender << "    clx::LState* L = clx::open_bare(argc, argv);\n";
+            appender << "    clx::luastd_base(L);\n";
+            appender << "    clx::luastd_package(L);\n";
         } else {
             appender << "    clx::LState* L = clx::open_bare(argc, argv);\n";
             for (const char** f = kBaseFns; *f; ++f) {
@@ -864,6 +867,8 @@ int main(int argc, char* argv[])
             appender << "    //   Installed: <libdir>/libclx_lua.a (or <ProgramFiles>/clx/lib/clx_lua.lib)\n";
             appender << "    clx_register_load_builtins(L);\n";
         }
+        //------------------ open_bare returns with collection off (see state.cpp): the registration above ran without it, user code runs with it
+        appender << "    L->gc_running = true;\n";
         appender << "    try {\n";
 
         for (size_t i = 1; i < input_files.size(); ++i) {
