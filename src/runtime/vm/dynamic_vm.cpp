@@ -22,6 +22,7 @@ int clx_vm_env_newindex(lua_State* L);
 int clx_vm_env_pairs(lua_State* L);
 int clx_vm_env_pairs_iter(lua_State* L);
 int clx_vm_env_collectgarbage(lua_State* L);
+int clx_vm_env_require(lua_State* L);
 }
 
 namespace clx {
@@ -136,8 +137,10 @@ int DynamicVM::build_default_env()
 
     lua_setmetatable(L_, -2);
 
+    // require: clx's own loader serves every module, so the compiled and the interpreted code share one instance of each (clx_vm_env_require)
     lua_pushstring(L_, "require");
-    lua_getglobal(L_, "require");
+    lua_pushlightuserdata(L_, static_cast<void*>(clx_L_));
+    lua_pushcclosure(L_, clx_vm_env_require, 1);
     lua_rawset(L_, -3);
     lua_pushstring(L_, "package");
     lua_getglobal(L_, "package");
@@ -411,6 +414,48 @@ void clx_mark_vm_proxies_(LState* clx_L, LState::GCStack& wl)
     if (!vm)
         return;
     vm->mark_proxy_roots(wl);
+}
+
+//------------------ clx_vm_env_require - require for code the embedded VM runs. A library the VM itself holds (string, table, ...) comes from its package.loaded;
+//------------------ every other module goes through clx's require, which prefers the compiled module while its source is unchanged (tiered loading) and otherwise
+//------------------ loads the file into this VM, and which caches the result in clx's package.loaded. So an interpreted module that requires a compiled one
+//------------------ gets the compiled instance (not a second, interpreted copy with its own state), and two interpreted modules share one instance too.
+extern "C" int clx_vm_env_require(lua_State* L)
+{
+    size_t len = 0;
+    const char* name = luaL_checklstring(L, 1, &len);
+    clx::LState* clx_L = static_cast<clx::LState*>(lua_touserdata(L, lua_upvalueindex(1)));
+
+    lua_getglobal(L, "package");
+    lua_getfield(L, -1, "loaded");
+    lua_getfield(L, -1, name);
+    if (!lua_isnil(L, -1))
+        return 1;   // the VM's own library: the value is on top of the stack
+    lua_settop(L, 1);
+
+    clx::LValue req = clx::get_global(clx_L, "require");
+    if (req.type != clx::ValueType::Function)
+        return luaL_error(L, "module '%s' not found: clx's require is not available", name);
+    clx::LValue arg = clx::LValue(clx_L->intern_string(name, len));
+    clx::MultiValue r;
+    std::string msg;
+    bool failed = false;
+    try {
+        r = clx::call_function(clx_L, req, &arg, 1, "require", 0);
+    } catch (const clx::LRuntimeException& e) {
+        failed = true;
+        msg = e.what();
+    } catch (const std::exception& e) {
+        failed = true;
+        msg = e.what();
+    }
+    if (failed) {
+        lua_pushlstring(L, msg.data(), msg.size());
+        std::string().swap(msg);   // release before lua_error, which does not return through this frame's destructors
+        return lua_error(L);
+    }
+    clx::clx_to_vm_value_(clx_L, L, r.count > 0 ? r[0] : clx::LValue());
+    return 1;
 }
 
 //------------------ clx_vm_env_collectgarbage - collectgarbage wrapper
