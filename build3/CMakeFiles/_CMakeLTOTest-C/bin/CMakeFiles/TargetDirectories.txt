@@ -1,4 +1,0 @@
-/home/user/clx/build3/CMakeFiles/_CMakeLTOTest-C/bin/CMakeFiles/foo.dir
-/home/user/clx/build3/CMakeFiles/_CMakeLTOTest-C/bin/CMakeFiles/boo.dir
-/home/user/clx/build3/CMakeFiles/_CMakeLTOTest-C/bin/CMakeFiles/edit_cache.dir
-/home/user/clx/build3/CMakeFiles/_CMakeLTOTest-C/bin/CMakeFiles/rebuild_cache.dir
