@@ -150,6 +150,12 @@ MultiValue collectgarbage(LState *L, const LValue *args, size_t arg_count) {
             L->collect_garbage();
         return MultiValue(clx::number(0.0));
     }
+    if (opt == "minor") {
+        //------------------ one young-generation collection now (a program that stops the collector can run these at frame boundaries)
+        if (L->gc_mode == LState::GCMode::Generational && !L->gc_minor_active)
+            L->gc_minor();
+        return MultiValue(clx::number(0.0));
+    }
     if (opt == "count") {
         double mem_kb = static_cast<double>(L->get_memory_usage()) / 1024.0;
         return MultiValue(clx::number(mem_kb));
