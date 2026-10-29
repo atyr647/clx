@@ -169,7 +169,8 @@ static MultiValue clx_dofile(LState *L, const LValue *args, size_t count) {
         return MultiValue(LValue(false), loaded.count > 1 ? loaded[1] : LValue());
 
     LValue func = loaded[0];
-    return call_function_rooted(L, func, nullptr, 0, __FILE__, __LINE__);
+    static constexpr CallSite builtin_site = { __FILE__, __LINE__, false, false };
+    return call_function_rooted(L, func, nullptr, 0, &builtin_site);
 }
 
 }

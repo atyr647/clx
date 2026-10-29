@@ -83,7 +83,8 @@ static void fiber_entry_impl(LThread *t) {
                 args[i] = t->resume_args[i];
             t->resume_args = MultiValue();
 
-            t->yield_args = call_function_rooted(L, t->function, args, argc, "coroutine", 0);
+            static constexpr CallSite coroutine_site = { "coroutine", 0, false, false };
+            t->yield_args = call_function_rooted(L, t->function, args, argc, &coroutine_site);
             t->status = THREAD_DEAD;
         } catch (const LRuntimeException &e) {
 

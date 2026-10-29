@@ -360,8 +360,18 @@ bool CodeEmitter::unboxed_arg_ok(uint32_t arg_idx, int depth) {
     return false;
 }
 
+//------------------ emit_call_site: emits one static CallSite descriptor and returns its address expression
+std::string CodeEmitter::emit_call_site(int line, bool is_method, bool name_short) {
+    uint32_t id = next_site_id++;
+    out << "[[maybe_unused]] static constexpr clx::CallSite _cs_" << id << " = { \"" << ctx.filename << "\", " << line
+        << ", "
+        << (is_method ? "true" : "false") << ", " << (name_short ? "true" : "false") << " };\n";
+    return "&_cs_" + std::to_string(id);
+}
+
 //------------------ emit: generates C++ code for the AST rooted at root_node
 void CodeEmitter::emit(uint32_t root_node, std::string_view module_name) {
+    next_site_id = 0;
     state.native_numbers.clear();
     state.string_pool.clear();
     state.table_presize.clear();
@@ -377,6 +387,11 @@ void CodeEmitter::emit(uint32_t root_node, std::string_view module_name) {
     state.param_numbers.clear();
     state.param_names.clear();
     state.func_param_native.clear();
+    state.func_param_body.clear();
+    state.fast_body_funcs.clear();
+    state.fast_call_sites.clear();
+    state.slow_call_funcs.clear();
+    state.generic_body_func = 0xFFFFFFFF;
     state.reassigned_vars.clear();
     state.constant_upvalues.clear();
     state.const_snapshot_cells.clear();
@@ -615,8 +630,9 @@ void CodeEmitter::emit(uint32_t root_node, std::string_view module_name) {
     out << "CLX_API clx::LValue luaopen_" << module_name << "(clx::LState* L) {\n";
     out << "    clx::Frame<16> _fr(L);\n";
     out << "    clx::LValue _ENV(clx::ValueType::Table, L->_G);\n";
-    out << "    L->current_file = \"" << ctx.filename << "\";\n";
-    out << "    L->current_line = 0;\n";
+    out << "    static constexpr clx::CallSite _module_site = { \"" << ctx.filename
+        << "\", 0, false, false };\n";
+    out << "    L->current_site = &_module_site;\n";
 
     for (const auto &sb_name : state.global_string_builders) {
         out << "    clx::StringBuilder sb_" << sb_name << ";\n";

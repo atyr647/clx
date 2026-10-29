@@ -20,9 +20,8 @@
 namespace clx {
 
 //------------------ call_function — call a value as function
-MultiValue call_function(LState *L, const LValue &func, const LValue *args, size_t count, const char *file, int line) {
-    L->current_file = file;
-    L->current_line = line;
+MultiValue call_function(LState *L, const LValue &func, const LValue *args, size_t count, const CallSite *cs) {
+    L->current_site = cs;
 
     LValue *func_ind[1] = { const_cast<LValue *>(&func) };
 
@@ -33,12 +32,10 @@ MultiValue call_function(LState *L, const LValue &func, const LValue *args, size
         LCFunction *saved_func = L->current_func;
         L->current_func = f;
         if (f->direct) {
-            CallCtxGuard cg(L);
             MultiValue ret = f->direct(L, args, count);
             L->current_func = saved_func;
             return ret;
         }
-        CallCtxGuard cg(L);
         MultiValue ret = f->func(L, args, count);
         L->current_func = saved_func;
         return ret;
@@ -69,7 +66,7 @@ MultiValue call_function(LState *L, const LValue &func, const LValue *args, size
                         new (new_args + i + 1) LValue(args[i]);
                 }
 
-                MultiValue ret = call_function_rooted(L, m, new_args, nargs, file, line);
+                MultiValue ret = call_function_rooted(L, m, new_args, nargs, cs);
                 if (heap)
                     delete[] new_args;
                 return ret;
@@ -78,8 +75,8 @@ MultiValue call_function(LState *L, const LValue &func, const LValue *args, size
     }
 
     std::string prefix = "";
-    if (file && file[0] != '\0') {
-        prefix = std::string(file) + ":" + std::to_string(line) + ": ";
+    if (cs && cs->file && cs->file[0] != '\0') {
+        prefix = std::string(cs->file) + ":" + std::to_string(cs->line) + ": ";
     }
 
     std::string err_msg = prefix + "attempt to call a " + VALUE_TYPE_NAMES[static_cast<size_t>(func.type)] + " value";
@@ -93,13 +90,11 @@ MultiValue pcall_function(LState *L, const LValue &func, const LValue *args, siz
         //------------------ raised directly under pcall carry no file:line prefix (keep the source name).
         //------------------ The callee is passed as a value (not a field/method access at this call site), so
         //------------------ clear the name/method flags: a forwarded call falls back to the full function name.
-        L->pending_call_is_method = false;
-        L->pending_call_name_short = false;
-        if (L->pending_ctx_depth > 0) {
-            L->pending_ctx_bottom_is_method = false;
-            L->pending_ctx_bottom_name_short = false;
-        }
-        MultiValue ret = call_function(L, func, args, count, L->current_file, 0);
+        L->pcall_site.file = L->current_site ? L->current_site->file : "";
+        L->pcall_site.line = 0;
+        L->pcall_site.is_method = false;
+        L->pcall_site.name_short = false;
+        MultiValue ret = call_function(L, func, args, count, &L->pcall_site);
         if (ret.count == 0)
             return MultiValue(true);
         if (ret.count == 1)
@@ -122,7 +117,7 @@ MultiValue pcall_function(LState *L, const LValue &func, const LValue *args, siz
 }
 
 //------------------ call_direct — fast path for LCFunction direct calls
-MultiValue call_direct(LState *L, const LValue &func, const LValue *args, size_t count, const char *file, int line) {
+MultiValue call_direct(LState *L, const LValue &func, const LValue *args, size_t count, const CallSite *cs) {
     if (func.type == ValueType::Function) {
         LCFunction *f = static_cast<LCFunction *>(func.as_pointer());
         if (f->direct) {
@@ -130,17 +125,14 @@ MultiValue call_direct(LState *L, const LValue &func, const LValue *args, size_t
             RootRange rr(L, const_cast<LValue *>(args), args ? count : 0, func_ind, 1);
             LCFunction *saved = L->current_func;
             L->current_func = f;
-            if (line > 0) {
-                L->current_file = file;
-                L->current_line = line;
-            }
-            CallCtxGuard cg(L);
+            if (cs && cs->line > 0)
+                L->current_site = cs;
             MultiValue ret = f->direct(L, args, count);
             L->current_func = saved;
             return ret;
         }
     }
-    return call_function(L, func, args, count, file, line);
+    return call_function(L, func, args, count, cs);
 }
 
 //------------------ callmeta — call metamethod

@@ -56,7 +56,8 @@ std::string LValue::to_string(LState *L) const {
                 LValue args[1];
                 args[0] = *this;
 
-                MultiValue ret = call_function_rooted(L, meta_func, args, 1, __FILE__, __LINE__);
+                static constexpr CallSite meta_site = { __FILE__, __LINE__, false, false };
+                MultiValue ret = call_function_rooted(L, meta_func, args, 1, &meta_site);
 
                 if (ret.count > 0 && ret[0].type == String) {
                     return std::string(ret[0].as_string(), ret[0].string_len());
@@ -186,7 +187,8 @@ LValue call_bin_metamethod(LState *L, const LValue &a, const LValue &b, const LV
     LValue method = find_bin_metamethod(L, a, b, key);
     if (method.type == Function) {
         LValue args[2] = { a, b };
-        MultiValue res = call_function_rooted(L, method, args, 2, __FILE__, __LINE__);
+        static constexpr CallSite method_site = { __FILE__, __LINE__, false, false };
+        MultiValue res = call_function_rooted(L, method, args, 2, &method_site);
         return res[0];
     }
 

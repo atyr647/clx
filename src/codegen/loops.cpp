@@ -623,6 +623,7 @@ void CodeEmitter::emitGenericForStatement(const ASTNode &node, uint32_t node_idx
                 out << "        _triplet_" << node_idx << " = " << impl_call(fname) << "(L, nullptr, 0);\n";
             }
         } else {
+            std::string _cs_iter = emit_call_site(call_node.line, false, false);
             if (call_node.as.call_expr.arg_count > 0) {
                 out << "        _triplet_" << node_idx << " = clx::call_function_rooted(L, ";
             } else {
@@ -630,8 +631,7 @@ void CodeEmitter::emitGenericForStatement(const ASTNode &node, uint32_t node_idx
             }
             emit_node(tgt);
             out << ", " << (call_node.as.call_expr.arg_count > 0 ? "args_" + std::to_string(iter_node) : "nullptr")
-                << ", " << call_node.as.call_expr.arg_count << ", \"" << ctx.filename << "\", " << call_node.line
-                << ");\n";
+                << ", " << call_node.as.call_expr.arg_count << ", " << _cs_iter << ");\n";
         }
         out << "        _fr.restore(_ssave_iter);\n    }\n";
     } else if (loop.iter_count > 0) {
@@ -672,8 +672,9 @@ void CodeEmitter::emitGenericForStatement(const ASTNode &node, uint32_t node_idx
         << "->direct(L, _args_" << node_idx << ", 2) : _lcf_" << node_idx << "->func(L, _args_" << node_idx
         << ", 2);\n";
     out << "        } else {\n";
+    std::string _cs_gf = emit_call_site(node.line, false, false);
     out << "            _res_" << node_idx << " = clx::call_function(L, _f_" << node_idx << ", _args_" << node_idx
-        << ", 2, \"" << ctx.filename << "\", " << node.line << ");\n";
+        << ", 2, " << _cs_gf << ");\n";
     out << "        }\n";
     out << "        _fr.pop_n(2);\n";
     out << "        for (size_t m = 0; m < _res_" << node_idx << ".count; ++m)\n";

@@ -1176,7 +1176,8 @@ MultiValue str_gsub(LState *L, const LValue *args, size_t count) {
                     else
                         fargs[ci] = LValue(L->intern_string(cap, (size_t)capl));
                 }
-                MultiValue fret = call_function_rooted(L, args[2], fargs.data(), fargs.size(), "gsub", 0);
+                static constexpr CallSite gsub_site = { "gsub", 0, false, false };
+                MultiValue fret = call_function_rooted(L, args[2], fargs.data(), fargs.size(), &gsub_site);
                 if (fret.count > 0 && fret[0].type == String) {
 
                     result.append(L, fret[0]);

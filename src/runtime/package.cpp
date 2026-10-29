@@ -194,7 +194,8 @@ static MultiValue pack_require(LState *L, const LValue *args, size_t count) {
 
         //------------------ Searchers run with the real global table (they need package/preload access)
         LValue loader_args[1] = { mod_key };
-        MultiValue res = call_function_rooted(L, loader, loader_args, 1, __FILE__, __LINE__);
+        static constexpr CallSite loader_site = { __FILE__, __LINE__, false, false };
+        MultiValue res = call_function_rooted(L, loader, loader_args, 1, &loader_site);
 
         if (res.count > 1 && res[1].type == String)
             msgs.append(res[1].as_string(), res[1].string_len());
@@ -210,7 +211,8 @@ static MultiValue pack_require(LState *L, const LValue *args, size_t count) {
                 L->_G = static_cast<LTable *>(env.as_pointer());
             MultiValue mod;
             try {
-                mod = call_function(L, loader_fn, loader_args, 1, __FILE__, __LINE__);
+                static constexpr CallSite loader_fn_site = { __FILE__, __LINE__, false, false };
+                mod = call_function(L, loader_fn, loader_args, 1, &loader_fn_site);
             } catch (...) {
                 L->_G = saved_G;
                 throw;

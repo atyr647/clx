@@ -611,7 +611,8 @@ extern "C" int clx_vm_proxy_call(lua_State* L)
 
     clx::MultiValue ret;
     try {
-        ret = clx::call_function(clx_L, call_func, clx_args, clx_nargs, "__call", 0);
+        static constexpr clx::CallSite call_site = { "__call", 0, false, false };
+        ret = clx::call_function(clx_L, call_func, clx_args, clx_nargs, &call_site);
     } catch (const clx::LRuntimeException& e) {
         if (heap)
             delete[] clx_args;
@@ -659,7 +660,8 @@ extern "C" int clx_vm_proxy_close(lua_State* L)
     clx::LValue args[2] = { clx::LValue(clx::Table, tbl), clx::LValue() };
     clx::RootRange close_rr(clx_L, args, 2);
     try {
-        clx::call_function(clx_L, close_func, args, 2, "__close", 0);
+        static constexpr clx::CallSite close_site = { "__close", 0, false, false };
+        clx::call_function(clx_L, close_func, args, 2, &close_site);
     } catch (const clx::LRuntimeException& e) {
         std::fprintf(stderr, "error in __close metamethod: %s\n", e.what());
     } catch (const std::exception& e) {

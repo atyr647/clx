@@ -1582,7 +1582,8 @@ static int luaapi_call(lua_State *L, int nargs, int nresults, int errfunc, bool 
         if (errf.type == clx::ValueType::Function) {
             try {
                 clx::LValue call_args[2] = { errf, errv };
-                clx::MultiValue r2 = clx::call_function_rooted(S, errf, call_args, 2, "C API", 0);
+                static constexpr clx::CallSite errf_site = { "C API", 0, false, false };
+                clx::MultiValue r2 = clx::call_function_rooted(S, errf, call_args, 2, &errf_site);
                 luaapi_truncate(L, func_i);
                 if (r2.count > 0)
                     luaapi_push(L, r2[0]);
@@ -1601,7 +1602,8 @@ static int luaapi_call(lua_State *L, int nargs, int nresults, int errfunc, bool 
     };
 
     try {
-        clx::MultiValue ret = clx::call_function_rooted(S, fn, args.data(), args.size(), "C API", 0);
+        static constexpr clx::CallSite cfunc_site = { "C API", 0, false, false };
+        clx::MultiValue ret = clx::call_function_rooted(S, fn, args.data(), args.size(), &cfunc_site);
         S->unroot_value(errf);
         luaapi_truncate(L, func_i);
         push_results(ret);
@@ -2289,9 +2291,10 @@ void *luaL_checkudata(lua_State *L, int ud, const char *tname) {
 
 void luaL_where(lua_State *L, int level) {
     clx::LState *S = L->L;
-    if (level > 0 && S->current_file && S->current_file[0] != '\0' && S->current_line > 0) {
+    const clx::CallSite *cs = S->current_site;
+    if (level > 0 && cs && cs->file && cs->file[0] != '\0' && cs->line > 0) {
         char buf[LUA_IDSIZE + 32];
-        std::snprintf(buf, sizeof(buf), "%s:%d: ", S->current_file, S->current_line);
+        std::snprintf(buf, sizeof(buf), "%s:%d: ", cs->file, cs->line);
         lua_pushstring(L, buf);
         return;
     }

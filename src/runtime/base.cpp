@@ -59,7 +59,8 @@ clx::MultiValue lua_xpcall(clx::LState *L, const clx::LValue *args, size_t count
 
     try {
         clx::MultiValue ret
-            = clx::call_function_rooted(L, func, func_args, arg_count, L->current_file, L->current_line);
+            = clx::call_function_rooted(
+                L, func, func_args, arg_count, L->current_site ? L->current_site : clx::default_call_site());
 
         if (ret.count == 0)
             return clx::MultiValue(true);
@@ -78,7 +79,8 @@ clx::MultiValue lua_xpcall(clx::LState *L, const clx::LValue *args, size_t count
         clx::MultiValue msgh_ret;
 
         try {
-            msgh_ret = clx::call_function_rooted(L, msgh, &err_obj, 1, L->current_file, L->current_line);
+            msgh_ret = clx::call_function_rooted(
+                L, msgh, &err_obj, 1, L->current_site ? L->current_site : clx::default_call_site());
         } catch (...) {
             return clx::MultiValue(false, clx::string(L, "error in error handling"));
         }
@@ -90,7 +92,8 @@ clx::MultiValue lua_xpcall(clx::LState *L, const clx::LValue *args, size_t count
         clx::MultiValue msgh_ret;
 
         try {
-            msgh_ret = clx::call_function_rooted(L, msgh, &err_obj, 1, L->current_file, L->current_line);
+            msgh_ret = clx::call_function_rooted(
+                L, msgh, &err_obj, 1, L->current_site ? L->current_site : clx::default_call_site());
         } catch (...) {
             return clx::MultiValue(false, clx::string(L, "error in error handling"));
         }
@@ -416,7 +419,8 @@ static MultiValue pairs(LState *L, const LValue *args, size_t count) {
         if (LTable *mt = tbl_metatable(tbl)) {
             LValue mt_pairs = mt->gettable(L->str_pairs);
             if (mt_pairs.type == Function) {
-                MultiValue ret = call_function_rooted(L, mt_pairs, &t, 1, __FILE__, __LINE__);
+                static constexpr CallSite pairs_site = { __FILE__, __LINE__, false, false };
+                MultiValue ret = call_function_rooted(L, mt_pairs, &t, 1, &pairs_site);
                 return ret;
             }
         }
@@ -502,7 +506,8 @@ static MultiValue ipairs(LState *L, const LValue *args, size_t count) {
         if (LTable *mt = tbl_metatable(tbl)) {
             LValue mt_ipairs = mt->gettable(L->str_ipairs);
             if (mt_ipairs.type == Function) {
-                MultiValue ret = call_function_rooted(L, mt_ipairs, &t, 1, __FILE__, __LINE__);
+                static constexpr CallSite ipairs_site = { __FILE__, __LINE__, false, false };
+                MultiValue ret = call_function_rooted(L, mt_ipairs, &t, 1, &ipairs_site);
                 return ret;
             }
         }

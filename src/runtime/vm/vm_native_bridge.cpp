@@ -147,7 +147,9 @@ extern "C" int clx_vm_native_bridge_call(lua_State *L) {
     RootRange cv_rr(clx_L, cv_args.data(), cv_args.size());
 
     try {
-        MultiValue mv = call_function(clx_L, nb->clx_callable, cv_args.data(), cv_args.size(), __FILE__, __LINE__);
+        static constexpr CallSite bridge_site = { __FILE__, __LINE__, false, false };
+        MultiValue mv
+            = call_function(clx_L, nb->clx_callable, cv_args.data(), cv_args.size(), &bridge_site);
 
         //------------------ Phase 2 - write back modified tables
         for (size_t t = 0; t < table_tracks.size(); ++t) {
