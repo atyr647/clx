@@ -40,7 +40,7 @@ if not exist "%MODULE%" (
 )
 
 :: Compile mandelbrot
-%CLX% mandelbrot.lua --modules sokol_clx --output mandelbrot.exe %GUIFLAGS%
+%CLX% mandelbrot.lua --minimal --modules sokol_clx,math,os --output mandelbrot.exe %GUIFLAGS%
 set ERR=!errorlevel!
 if exist "%MODULE%" del "%MODULE%"
 if not "!ERR!"=="0" exit /b !ERR!

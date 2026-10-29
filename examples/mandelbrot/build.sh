@@ -23,6 +23,6 @@ case "$(uname -s)" in
     *) echo "Unknown platform: $(uname -s)"; exit 1 ;;
 esac
 
-../../build/clx mandelbrot.lua --size --modules sokol_clx -L../sokol --output mandelbrot $PLATFORM_LIBS
+../../build/clx mandelbrot.lua --minimal --size --modules sokol_clx,math,os -L../sokol --output mandelbrot $PLATFORM_LIBS
 
 echo "Done. Run ./mandelbrot to explore."

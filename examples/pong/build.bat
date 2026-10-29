@@ -40,7 +40,7 @@ if not exist "%MODULE%" (
 )
 
 :: Compile pong
-%CLX% pong.lua --modules sokol_clx --output pong.exe %GUIFLAGS%
+%CLX% pong.lua --minimal --modules sokol_clx,math,os --output pong.exe %GUIFLAGS%
 set ERR=!errorlevel!
 if exist "%MODULE%" del "%MODULE%"
 if not "!ERR!"=="0" exit /b !ERR!

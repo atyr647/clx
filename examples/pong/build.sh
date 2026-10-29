@@ -24,6 +24,6 @@ case "$(uname -s)" in
 esac
 
 # Compile pong (--size shrinks the final binary)
-../../build/clx pong.lua --size --modules sokol_clx -L../sokol --output pong $PLATFORM_LIBS
+../../build/clx pong.lua --minimal --size --modules sokol_clx,math,os -L../sokol --output pong $PLATFORM_LIBS
 
 echo "Done. Run ./pong to play."
