@@ -331,8 +331,12 @@ void CodeEmitter::emit_native(uint32_t n_idx) {
             uint32_t tgt = n.as.call_expr.target;
             if (ctx.nodes[tgt].type == NodeType::Identifier && !ctx.nodes[tgt].as.ident.is_global) {
                 fname = std::string_view(ctx.nodes[tgt].as.ident.name, ctx.nodes[tgt].as.ident.length);
-                if (state.fast_callables.count(fname)
-                    || (!state.current_fast_func.empty() && fname == state.current_fast_func))
+                bool fast_ok = state.fast_callables.count(fname) > 0
+                    || (!state.current_fast_func.empty() && fname == state.current_fast_func);
+                if (fast_ok && state.slow_call_funcs.count(fname) > 0
+                    && state.fast_call_sites.count(n_idx) == 0)
+                    fast_ok = false;
+                if (fast_ok)
                     is_fast = true;
             }
             if (is_fast) {
@@ -567,7 +571,11 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
 
     if (ctx.nodes[tgt].type == NodeType::Identifier && !ctx.nodes[tgt].as.ident.is_global) {
         fname = std::string_view(ctx.nodes[tgt].as.ident.name, ctx.nodes[tgt].as.ident.length);
-        if (state.fast_callables.count(fname) || (!state.current_fast_func.empty() && fname == state.current_fast_func))
+        bool fast_ok = state.fast_callables.count(fname) > 0
+            || (!state.current_fast_func.empty() && fname == state.current_fast_func);
+        if (fast_ok && state.slow_call_funcs.count(fname) > 0 && state.fast_call_sites.count(node_idx) == 0)
+            fast_ok = false;
+        if (fast_ok)
             is_fast = true;
         else if (state.direct_callables.count(fname))
             is_direct = true;
@@ -679,12 +687,7 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
 
     out << "([&]() {\n";
     out << "    size_t _ssave_call = _fr.mark();\n";
-    out << "    bool _psm_call = L->pending_call_is_method;\n";
-    out << "    bool _pns_call = L->pending_call_name_short;\n";
-    out << "    L->pending_call_is_method = " << (is_method_call ? "true" : "false") << ";\n";
-    out << "    L->pending_call_name_short = " << (call_name_short ? "true" : "false") << ";\n";
-    out << "    clx::call_ctx_push(L, " << (is_method_call ? "true" : "false") << ", "
-        << (call_name_short ? "true" : "false") << ");\n";
+    std::string _cs = emit_call_site(node.line, is_method_call, call_name_short);
 
     if (is_method_call) {
         out << "    clx::LValue _m_self = ";
@@ -747,8 +750,8 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
 
         if (is_direct) {
             out << "    const clx::CFunctionType &_gc_self = " << impl_call(fname) << ";\n";
-            out << "    clx::MultiValue _main_ret = clx::call_cfunc_direct(L, _gc_self, _dyn_buf, _dyn_count, \""
-                << ctx.filename << "\", " << node.line << ");\n";
+            out << "    clx::MultiValue _main_ret = clx::call_cfunc_direct(L, _gc_self, _dyn_buf, _dyn_count, "
+                << _cs << ");\n";
         } else if (!is_method_call && node.as.call_expr.target < ctx.nodes.size()
             && ctx.nodes[node.as.call_expr.target].type == NodeType::TableAccess) {
             const char *_dcf = nullptr;
@@ -762,7 +765,7 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
                 _dcf = builtin_cfunc_target(ctx, state, node.as.call_expr.target);
             if (_dcf) {
                 out << "    clx::MultiValue _main_ret = clx::call_cfunc_rooted(L, clx::" << _dcf
-                    << ", _dyn_buf, _dyn_count, \"" << ctx.filename << "\", " << node.line << ");\n";
+                    << ", _dyn_buf, _dyn_count, " << _cs << ");\n";
             } else {
                 goto _call_direct_dyn;
             }
@@ -774,7 +777,7 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
             auto _alias_it = state.builtin_aliases.find(std::string(_alias_nm));
             if (_alias_it != state.builtin_aliases.end() && state.reassigned_vars.count(std::string(_alias_nm)) == 0) {
                 out << "    clx::MultiValue _main_ret = clx::call_cfunc_rooted(L, clx::" << _alias_it->second
-                    << ", _dyn_buf, _dyn_count, \"" << ctx.filename << "\", " << node.line << ");\n";
+                    << ", _dyn_buf, _dyn_count, " << _cs << ");\n";
             } else {
                 goto _call_direct_dyn;
             }
@@ -785,13 +788,10 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
                 out << "_m_func";
             else
                 emit_node(node.as.call_expr.target);
-            out << ", _dyn_buf, _dyn_count, \"" << ctx.filename << "\", " << node.line << ");\n";
+            out << ", _dyn_buf, _dyn_count, " << _cs << ");\n";
         }
 
         out << "    _fr.restore(_ssave_call);\n";
-        out << "    clx::call_ctx_pop(L);\n";
-        out << "    L->pending_call_is_method = _psm_call;\n";
-        out << "    L->pending_call_name_short = _pns_call;\n";
 
         if (want_multi)
             out << "    return _main_ret;\n";
@@ -891,13 +891,13 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
                 out << "        }\n";
                 out << "    } else {\n";
                 out << "        _main_ret = clx::call_cfunc_rooted(L, clx::str_sub, args, "
-                    << node.as.call_expr.arg_count << ", \"" << ctx.filename << "\", " << node.line << ");\n";
+                    << node.as.call_expr.arg_count << ", " << _cs << ");\n";
                 out << "    }\n";
                 out << "    _fr.restore(_ssaved);\n";
             } else if (is_direct) {
                 out << "    const clx::CFunctionType &_gc_self = " << impl_call(fname) << ";\n";
                 out << "    clx::MultiValue _main_ret = clx::call_cfunc_direct(L, _gc_self, args, "
-                    << node.as.call_expr.arg_count << ", \"" << ctx.filename << "\", " << node.line << ");\n";
+                    << node.as.call_expr.arg_count << ", " << _cs << ");\n";
             } else if (!is_method_call && node.as.call_expr.target < ctx.nodes.size()
                 && ctx.nodes[node.as.call_expr.target].type == NodeType::TableAccess) {
                 const char *_dcf = nullptr;
@@ -911,7 +911,7 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
                     _dcf = builtin_cfunc_target(ctx, state, node.as.call_expr.target);
                 if (_dcf) {
                     out << "    clx::MultiValue _main_ret = clx::call_cfunc_rooted(L, clx::" << _dcf << ", args, "
-                        << node.as.call_expr.arg_count << ", \"" << ctx.filename << "\", " << node.line << ");\n";
+                        << node.as.call_expr.arg_count << ", " << _cs << ");\n";
                 } else {
                     goto _call_direct_normal;
                 }
@@ -924,8 +924,7 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
                 if (_alias_it != state.builtin_aliases.end()
                     && state.reassigned_vars.count(std::string(_alias_nm)) == 0) {
                     out << "    clx::MultiValue _main_ret = clx::call_cfunc_rooted(L, clx::" << _alias_it->second
-                        << ", args, " << node.as.call_expr.arg_count << ", \"" << ctx.filename << "\", " << node.line
-                        << ");\n";
+                        << ", args, " << node.as.call_expr.arg_count << ", " << _cs << ");\n";
                 } else {
                     goto _call_direct_normal;
                 }
@@ -936,14 +935,13 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
                     out << "_m_func";
                 else
                     emit_node(node.as.call_expr.target);
-                out << ", args, " << node.as.call_expr.arg_count << ", \"" << ctx.filename << "\", " << node.line
-                    << ");\n";
+                out << ", args, " << node.as.call_expr.arg_count << ", " << _cs << ");\n";
             }
         } else {
             if (is_direct) {
                 out << "    const clx::CFunctionType &_gc_self = " << impl_call(fname) << ";\n";
-                out << "    clx::MultiValue _main_ret = clx::call_cfunc_rooted(L, _gc_self, nullptr, 0, \""
-                    << ctx.filename << "\", " << node.line << ");\n";
+                out << "    clx::MultiValue _main_ret = clx::call_cfunc_rooted(L, _gc_self, nullptr, 0, "
+                    << _cs << ");\n";
             } else if (!is_method_call && node.as.call_expr.target < ctx.nodes.size()
                 && ctx.nodes[node.as.call_expr.target].type == NodeType::TableAccess) {
                 const char *_dcf = nullptr;
@@ -957,7 +955,7 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
                     _dcf = builtin_cfunc_target(ctx, state, node.as.call_expr.target);
                 if (_dcf) {
                     out << "    clx::MultiValue _main_ret = clx::call_cfunc_rooted(L, clx::" << _dcf
-                        << ", nullptr, 0, \"" << ctx.filename << "\", " << node.line << ");\n";
+                        << ", nullptr, 0, " << _cs << ");\n";
                 } else {
                     goto _call_direct_normal2;
                 }
@@ -970,7 +968,7 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
                 if (_alias_it != state.builtin_aliases.end()
                     && state.reassigned_vars.count(std::string(_alias_nm)) == 0)
                     out << "    clx::MultiValue _main_ret = clx::call_cfunc_rooted(L, clx::" << _alias_it->second
-                        << ", nullptr, 0, \"" << ctx.filename << "\", " << node.line << ");\n";
+                        << ", nullptr, 0, " << _cs << ");\n";
                 else {
                     goto _call_direct_normal2;
                 }
@@ -981,14 +979,11 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
                     out << "_m_func";
                 else
                     emit_node(node.as.call_expr.target);
-                out << ", nullptr, 0, \"" << ctx.filename << "\", " << node.line << ");\n";
+                out << ", nullptr, 0, " << _cs << ");\n";
             }
         }
 
         out << "    _fr.restore(_ssave_call);\n";
-        out << "    clx::call_ctx_pop(L);\n";
-        out << "    L->pending_call_is_method = _psm_call;\n";
-        out << "    L->pending_call_name_short = _pns_call;\n";
 
         if (want_multi)
             out << "    return _main_ret;\n";
