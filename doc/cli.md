@@ -134,7 +134,6 @@ computations, and `--size` when binary size matters more.
 | `CLX_GC_MINOR_KB` | Pins the minor-collection threshold in kilobytes. Without it the threshold is adaptive: starts at 256 KB and re-paces each minor, capped at 8192 KB. |
 | `CLX_GC_MAJOR_KB` | Old-generation budget in kilobytes that triggers a full collection (default 32768). |
 | `CLX_IO_NOBUF` | Set to `1` to bypass the runtime's userspace io.write batching (escape hatch / A/B). |
-| `CLX_ALLOC_STATS` | Diagnostic: set to any value to dump an allocation census to stderr when the program exits. |
 
 ## Exit codes
 
