@@ -453,15 +453,7 @@ void CodeEmitter::emitBlock(const ASTNode &node, uint32_t node_idx, DeferredBloc
             std::string_view _pn(ctx.nodes[_pti].as.ident.name, ctx.nodes[_pti].as.ident.length);
             if (state.reassigned_vars.count(_pn))
                 continue;
-            bool _pf = false;
-            if (state.native_return_funcs.count(_pn) && state.func_param_native.count(_pn)) {
-                _pf = true;
-                for (bool _pp : state.func_param_native[_pn])
-                    if (!_pp) {
-                        _pf = false;
-                        break;
-                    }
-            }
+            bool _pf = state.fast_body_funcs.count(_pn) > 0 && state.slow_call_funcs.count(_pn) == 0;
             if (_pf)
                 state.fast_callables.insert(_pn);
             state.direct_callables.insert(_pn);
@@ -510,8 +502,10 @@ void CodeEmitter::emitBlock(const ASTNode &node, uint32_t node_idx, DeferredBloc
         if (stmt.type == NodeType::CallExpression) {
             out << "#line " << stmt.line << " \"" << ctx.filename << "\"\n";
         }
-        if (stmt.line > 0)
-            out << "L->current_line = " << stmt.line << ";\n";
+        if (stmt.line > 0 && !state.in_fast_function) {
+            std::string _ssite = emit_call_site(stmt.line, false, false);
+            out << "L->current_site = " << _ssite << ";\n";
+        }
         emit_node(stmt_idx);
         if (stmt.type != NodeType::Block && stmt.type != NodeType::Assignment
             && stmt.type != NodeType::GlobalDeclStatement && stmt.type != NodeType::LocalDecl
@@ -543,6 +537,34 @@ void CodeEmitter::emitBlock(const ASTNode &node, uint32_t node_idx, DeferredBloc
     state.skip_block_braces = prev_skip_braces;
     if (!prev_skip_braces)
         out << "}\n";
+}
+
+//------------------ emit_fast_variant: emits the `_fast_<name>_impl` Y-combinator body and the
+//------------------ `_fast_<name>` wrapper. Shared by all-fast functions and by mixed functions,
+//------------------ which keep a generic closure for call sites whose arguments are not proven numeric.
+
+void CodeEmitter::emit_fast_variant(std::string_view name, uint32_t v_idx) {
+    const auto &fn = ctx.nodes[v_idx];
+    out << "auto _fast_" << name << "_impl = ";
+    bool saved_emit_fast = state.emit_fast_lambda;
+    bool saved_in_fast = state.in_fast_function;
+    std::string_view saved_fast_func = state.current_fast_func;
+    state.emit_fast_lambda = true;
+    state.in_fast_function = true;
+    state.current_fast_func = name;
+    emit_node(v_idx);
+    state.emit_fast_lambda = saved_emit_fast;
+    state.in_fast_function = saved_in_fast;
+    state.current_fast_func = saved_fast_func;
+    out << ";\n";
+    out << "#line " << fn.line << " \"" << ctx.filename << "\"\n";
+    out << "auto _fast_" << name << " = [=](clx::FrameBase& _fr";
+    for (uint32_t a = 0; a < state.func_param_counts[name]; ++a)
+        out << ", double p" << a;
+    out << ") -> double { return _fast_" << name << "_impl(_fast_" << name << "_impl, _fr";
+    for (uint32_t a = 0; a < state.func_param_counts[name]; ++a)
+        out << ", p" << a;
+    out << "); };\n";
 }
 
 //------------------ emit_native_impl_def: Y-combinator native overload for a
@@ -770,9 +792,11 @@ void CodeEmitter::emitFunctionDef(const ASTNode &node, uint32_t node_idx) {
             int cnt = nparam_name_counts[pname]++;
             std::string cpp_name = (cnt == 0) ? std::string(pname) : std::string(pname) + std::to_string(cnt);
             bool is_cap = ctx.nodes[p_idx].as.ident.is_captured;
-            bool is_native_p = std::find(state.native_numbers.begin(), state.native_numbers.end(), pname)
-                    != state.native_numbers.end()
-                || (!is_cap && state.param_numbers[node_idx].count(std::string(pname)));
+            bool force_generic = state.generic_body_func == node_idx;
+            bool is_native_p = !force_generic
+                && (std::find(state.native_numbers.begin(), state.native_numbers.end(), pname)
+                        != state.native_numbers.end()
+                    || (!is_cap && state.param_numbers[node_idx].count(std::string(pname))));
             if (is_cap) {
                 if (state.constant_upvalues.count(pname)) {
                     out << "clx::LValue l_" << cpp_name << " = p" << i << ";\n";
@@ -870,8 +894,7 @@ void CodeEmitter::emitFunctionDef(const ASTNode &node, uint32_t node_idx) {
     }
     out << "clx::LValue _ENV = (L->current_func && L->current_func->env) ? clx::LValue(clx::ValueType::Table, "
            "L->current_func->env) : clx::LValue(clx::ValueType::Table, L->_G);\n";
-    out << "L->arg_is_method = false;\n";
-    out << "L->arg_name_short = false;\n";
+
     uint32_t saved_arena_func = state.current_arena_func;
     if (state.arena_table_sizes.count(node_idx)) {
         state.current_arena_func = node_idx;
@@ -929,9 +952,11 @@ void CodeEmitter::emitFunctionDef(const ASTNode &node, uint32_t node_idx) {
         std::string_view pname(ctx.nodes[p_idx].as.ident.name, ctx.nodes[p_idx].as.ident.length);
         const std::string &cpp_name = param_cpp_names[i];
         bool is_cap = ctx.nodes[p_idx].as.ident.is_captured;
-        bool is_native
-            = std::find(state.native_numbers.begin(), state.native_numbers.end(), pname) != state.native_numbers.end()
-            || (!is_cap && state.param_numbers[node_idx].count(std::string(pname)));
+        bool force_generic = state.generic_body_func == node_idx;
+        bool is_native = !force_generic
+            && (std::find(state.native_numbers.begin(), state.native_numbers.end(), pname)
+                    != state.native_numbers.end()
+                || (!is_cap && state.param_numbers[node_idx].count(std::string(pname))));
 
         if (is_cap) {
             if (state.constant_upvalues.count(pname)) {
@@ -1220,6 +1245,7 @@ void CodeEmitter::emitReturnStatement(const ASTNode &node, uint32_t node_idx) {
         }
 
         out << "{\n";
+        std::string _cs = emit_call_site(call_node.line, ret_is_method, ret_name_short);
         bool last_expands = false;
         uint32_t last_arg = 0xFFFFFFFF;
         if (call_node.as.call_expr.arg_count > 0) {
@@ -1274,26 +1300,14 @@ void CodeEmitter::emitReturnStatement(const ASTNode &node, uint32_t node_idx) {
             } else if (state.in_function_def) {
                 if (state.current_arena_func != 0xFFFFFFFF)
                     out << "    clx::arena_reset(&_arena);\n";
-                out << "    bool _rsm = L->pending_call_is_method; bool _rns = L->pending_call_name_short;\n";
-                out << "    L->pending_call_is_method = " << (ret_is_method ? "true" : "false")
-                    << "; L->pending_call_name_short = " << (ret_name_short ? "true" : "false") << ";\n";
-                out << "    clx::call_ctx_push(L, " << (ret_is_method ? "true" : "false") << ", "
-                    << (ret_name_short ? "true" : "false") << ");\n";
                 out << "    clx::MultiValue _res = clx::call_function_rooted(L, ";
                 emit_node(tgt);
-                out << ", _dyn_buf, _dyn_count, \"" << ctx.filename << "\", " << call_node.line << ");\n";
-                out << "    clx::call_ctx_pop(L);\n";
+                out << ", _dyn_buf, _dyn_count, " << _cs << ");\n";
                 out << "    return _res;\n";
             } else {
-                out << "    bool _rsm = L->pending_call_is_method; bool _rns = L->pending_call_name_short;\n";
-                out << "    L->pending_call_is_method = " << (ret_is_method ? "true" : "false")
-                    << "; L->pending_call_name_short = " << (ret_name_short ? "true" : "false") << ";\n";
-                out << "    clx::call_ctx_push(L, " << (ret_is_method ? "true" : "false") << ", "
-                    << (ret_name_short ? "true" : "false") << ");\n";
                 out << "    clx::MultiValue _res = clx::call_function_rooted(L, ";
                 emit_node(tgt);
-                out << ", _dyn_buf, _dyn_count, \"" << ctx.filename << "\", " << call_node.line << ");\n";
-                out << "    clx::call_ctx_pop(L);\n";
+                out << ", _dyn_buf, _dyn_count, " << _cs << ");\n";
                 out << "    _fr.restore(_ssave_dyn);\n";
                 out << "    return (_res.count > 0) ? _res[0] : clx::LValue();\n";
             }
@@ -1337,28 +1351,14 @@ void CodeEmitter::emitReturnStatement(const ASTNode &node, uint32_t node_idx) {
                 } else if (state.in_function_def) {
                     if (state.current_arena_func != 0xFFFFFFFF)
                         out << "    clx::arena_reset(&_arena);\n";
-                    out << "    bool _rsm = L->pending_call_is_method; bool _rns = L->pending_call_name_short;\n";
-                    out << "    L->pending_call_is_method = " << (ret_is_method ? "true" : "false")
-                        << "; L->pending_call_name_short = " << (ret_name_short ? "true" : "false") << ";\n";
-                    out << "    clx::call_ctx_push(L, " << (ret_is_method ? "true" : "false") << ", "
-                        << (ret_name_short ? "true" : "false") << ");\n";
                     out << "    clx::MultiValue _res = clx::call_function_rooted(L, ";
                     emit_node(tgt);
-                    out << ", args_" << last_v_idx << ", " << call_node.as.call_expr.arg_count << ", \"" << ctx.filename
-                        << "\", " << call_node.line << ");\n";
-                    out << "    clx::call_ctx_pop(L);\n";
+                    out << ", args_" << last_v_idx << ", " << call_node.as.call_expr.arg_count << ", " << _cs << ");\n";
                     out << "    return _res;\n";
                 } else {
-                    out << "    bool _rsm = L->pending_call_is_method; bool _rns = L->pending_call_name_short;\n";
-                    out << "    L->pending_call_is_method = " << (ret_is_method ? "true" : "false")
-                        << "; L->pending_call_name_short = " << (ret_name_short ? "true" : "false") << ";\n";
-                    out << "    clx::call_ctx_push(L, " << (ret_is_method ? "true" : "false") << ", "
-                        << (ret_name_short ? "true" : "false") << ");\n";
                     out << "    clx::MultiValue _res = clx::call_function_rooted(L, ";
                     emit_node(tgt);
-                    out << ", args_" << last_v_idx << ", " << call_node.as.call_expr.arg_count << ", \"" << ctx.filename
-                        << "\", " << call_node.line << ");\n";
-                    out << "    clx::call_ctx_pop(L);\n";
+                    out << ", args_" << last_v_idx << ", " << call_node.as.call_expr.arg_count << ", " << _cs << ");\n";
                     out << "    _fr.restore(_ssave_ret);\n";
                     out << "    return (_res.count > 0) ? _res[0] : clx::LValue();\n";
                 }
@@ -1385,26 +1385,14 @@ void CodeEmitter::emitReturnStatement(const ASTNode &node, uint32_t node_idx) {
                     if (state.in_function_def) {
                         if (state.current_arena_func != 0xFFFFFFFF)
                             out << "    clx::arena_reset(&_arena);\n";
-                        out << "    bool _rsm = L->pending_call_is_method; bool _rns = L->pending_call_name_short;\n";
-                        out << "    L->pending_call_is_method = " << (ret_is_method ? "true" : "false")
-                            << "; L->pending_call_name_short = " << (ret_name_short ? "true" : "false") << ";\n";
-                        out << "    clx::call_ctx_push(L, " << (ret_is_method ? "true" : "false") << ", "
-                            << (ret_name_short ? "true" : "false") << ");\n";
                         out << "    clx::MultiValue _res = clx::call_function(L, ";
                         emit_node(tgt);
-                        out << ", nullptr, 0, \"" << ctx.filename << "\", " << call_node.line << ");\n";
-                        out << "    clx::call_ctx_pop(L);\n";
+                        out << ", nullptr, 0, " << _cs << ");\n";
                         out << "    return _res;\n";
                     } else {
-                        out << "    bool _rsm = L->pending_call_is_method; bool _rns = L->pending_call_name_short;\n";
-                        out << "    L->pending_call_is_method = " << (ret_is_method ? "true" : "false")
-                            << "; L->pending_call_name_short = " << (ret_name_short ? "true" : "false") << ";\n";
-                        out << "    clx::call_ctx_push(L, " << (ret_is_method ? "true" : "false") << ", "
-                            << (ret_name_short ? "true" : "false") << ");\n";
                         out << "    clx::MultiValue _res = clx::call_function(L, ";
                         emit_node(tgt);
-                        out << ", nullptr, 0, \"" << ctx.filename << "\", " << call_node.line << ");\n";
-                        out << "    clx::call_ctx_pop(L);\n";
+                        out << ", nullptr, 0, " << _cs << ");\n";
                         out << "    return (_res.count > 0) ? _res[0] : clx::LValue();\n";
                     }
                 }
