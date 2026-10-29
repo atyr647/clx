@@ -7,6 +7,7 @@
 
 #include "clx.h"
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -226,7 +227,8 @@ MultiValue table_sort(LState *L, const LValue *args, size_t count) {
         LValue comp_func = args[1];
         auto cmp = [L, comp_func](const LValue &a, const LValue &b) mutable {
             LValue call_args[2] = { a, b };
-            MultiValue mr = call_function_rooted(L, comp_func, call_args, 2, "table.sort", 0);
+            static constexpr CallSite sort_site = { "table.sort", 0, false, false };
+            MultiValue mr = call_function_rooted(L, comp_func, call_args, 2, &sort_site);
             return mr.count >= 1 && mr[0].as_bool();
         };
         auto elems = extract_elems(list, len);
