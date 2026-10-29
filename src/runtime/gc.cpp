@@ -81,6 +81,14 @@ static void gc_dispose_swept(LState *L, LHeader *curr) {
             if (t->ext) {
                 t->ext->hash_count = 0;
                 t->ext->hash_tombs = 0;
+                //------------------ A pooled table keeps its hash buffer for reuse, but any table can be handed any creation: a 4096-entry set parked in the pool made every
+                //------------------ small table created from it clear 4096 entries, and each parked buffer stayed allocated for good (uncounted, since the bytes are subtracted
+                //------------------ above). Only small buffers are kept.
+                if (t->ext->entries && t->ext->hash_size > LState::kPooledHashMax) {
+                    table_free_hash(t->ext->entries, t->ext->hash_bitmap);
+                    t->ext->hash_size = 0;
+                    t->ext->hash_version++;
+                }
             }
             t->array_size = 0;
             t->array_lim = 0;
@@ -772,6 +780,7 @@ void LState::gc_minor() {
         + ((int64_t)_gs1.tv_nsec - (int64_t)_gs0.tv_nsec) / 1000;
     ++g_alloc_census.gc_minors;
 
+    const size_t prev_after = gc_bytes_at_minor;
     gc_bytes_at_minor = allocated_bytes;
     gc_minor_active = false;
 
@@ -781,7 +790,19 @@ void LState::gc_minor() {
     //------------------ workloads like binarytrees re-walk their whole live chain in mark+sweep on each of
     //------------------ those too-frequent minors. Growth stays immediate via allocated_bytes.
 
-    if (!gc_minor_threshold_env) {
+    if (!gc_minor_threshold_env && gc_policy == 1) {
+        //------------------ the window this minor closed: bytes allocated since the previous minor ended (before_sweep - prev_after); what survived it: the heap's growth over the sweep.
+        const size_t window = before_sweep > prev_after ? before_sweep - prev_after : 1;
+        const size_t survived = allocated_bytes > prev_after ? allocated_bytes - prev_after : 0;
+        size_t next = gc_minor_threshold;
+        if (survived * 100 > window * size_t(gc_policy_grow_pct))
+            next = gc_minor_threshold * 2;
+        else if (survived * 100 < window * size_t(gc_policy_shrink_pct))
+            next = gc_minor_threshold / 2;
+        if (next < gc_policy_min) next = gc_policy_min;
+        if (next > gc_policy_max) next = gc_policy_max;
+        gc_minor_threshold = next;
+    } else if (!gc_minor_threshold_env) {
         size_t next = allocated_bytes;
         size_t floor = gc_minor_threshold / 2;
         if (next < floor)
@@ -799,8 +820,8 @@ void LState::gc_minor() {
 
     wl.clear();
     clock_gettime(CLOCK_MONOTONIC, &_gt1);
-    g_alloc_census.gc_minor_us += (uint64_t)(_gt1.tv_sec - _gt0.tv_sec) * 1000000ULL
-        + (uint64_t)(_gt1.tv_nsec - _gt0.tv_nsec) / 1000ULL;
+    g_alloc_census.gc_minor_us += static_cast<uint64_t>(((int64_t)_gt1.tv_sec - (int64_t)_gt0.tv_sec) * 1000000
+        + ((int64_t)_gt1.tv_nsec - (int64_t)_gt0.tv_nsec) / 1000);
 }
 
 //------------------ LState::gc_step — incremental GC sweep step
@@ -887,6 +908,9 @@ bool LState::gc_step() {
 
         size_t headroom = std::clamp(live / 2, size_t(1 * 1024 * 1024), size_t(256 * 1024 * 1024));
         gc_bytes_threshold = live + headroom;
+        //------------------ the old set that survived this collection is live: the next major waits until it has grown by half, otherwise a live old set above the floor would re-trigger a full collection after every minor
+        if (gc_mode == GCMode::Generational)
+            gc_major_threshold = std::max(gc_major_floor, gc_old_bytes + gc_old_bytes / 2);
         gc_draining = false;
         return true;
     }
@@ -908,8 +932,8 @@ void LState::collect_garbage() {
     clock_gettime(CLOCK_MONOTONIC, &_M0);
     collect_garbage_full();
     clock_gettime(CLOCK_MONOTONIC, &_M1);
-    g_alloc_census.gc_major_us += (uint64_t)(_M1.tv_sec - _M0.tv_sec) * 1000000ULL
-        + (uint64_t)(_M1.tv_nsec - _M0.tv_nsec) / 1000ULL;
+    g_alloc_census.gc_major_us += static_cast<uint64_t>(((int64_t)_M1.tv_sec - (int64_t)_M0.tv_sec) * 1000000
+        + ((int64_t)_M1.tv_nsec - (int64_t)_M0.tv_nsec) / 1000);
     gc_stats_major_freed += (before > allocated_bytes) ? (before - allocated_bytes) : 0;
     if (gc_mode == GCMode::Generational)
         gc_major_pending = false;

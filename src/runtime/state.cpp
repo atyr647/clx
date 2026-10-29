@@ -91,10 +91,19 @@ LState::LState()
             gc_minor_threshold_env = true;
         }
     }
+    if (const char *e = getenv("CLX_GC_POLICY")) {
+        gc_policy = atoi(e);
+        if (gc_policy == 1 && !getenv("CLX_GC_MINOR_KB"))
+            gc_minor_threshold = gc_policy_min;
+    }
+    if (const char *e = getenv("CLX_GC_MIN_KB")) { long long v = atoll(e); if (v > 0) gc_policy_min = size_t(v) * 1024; }
+    if (const char *e = getenv("CLX_GC_MAX_KB")) { long long v = atoll(e); if (v > 0) gc_policy_max = size_t(v) * 1024; }
+    if (const char *e = getenv("CLX_GC_GROW_PCT")) { long long v = atoll(e); if (v > 0) gc_policy_grow_pct = int(v); }
+    if (const char *e = getenv("CLX_GC_SHRINK_PCT")) { long long v = atoll(e); if (v > 0) gc_policy_shrink_pct = int(v); }
     if (const char *e = getenv("CLX_GC_MAJOR_KB")) {
         long long v = atoll(e);
         if (v > 0)
-            gc_major_threshold = size_t(v) * 1024;
+            gc_major_threshold = gc_major_floor = size_t(v) * 1024;
     }
 }
 

@@ -508,7 +508,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                 out << "l_" << name << " = L->create_closure(*_impl_" << name
                                     << ", static_cast<clx::LTable*>(_ENV.as_pointer())"
                                     << (cells_c.empty() ? "" : ", " + cells_c) << ");\n";
-                                out << "clx::upval_store(l_" << name << "_cell, l_" << name << ");\n";
+                                out << "clx::upval_init(l_" << name << "_cell, l_" << name << ");\n";
                                 out << "_fr.push(l_" << name << ");\n";
                                 {
                                     size_t _sfi = state.string_pool_index.at(name);
@@ -597,7 +597,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                             }
                             locals.push_back({ name, true });
                             if (is_func) {
-                                out << "clx::upval_store(l_" << name << ", ";
+                                out << "clx::upval_init(l_" << name << ", ";
                                 emit_node(ctx.block_statements[first_v]);
                                 out << ");\n";
                             } else {
@@ -842,7 +842,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                             state.direct_callables.insert(name);
                             std::string _gc_cells_d = gc_cells_arg(std::string(name));
                             if (is_boxed)
-                                out << "clx::upval_store(l_" << name << ", L->create_closure(_impl_" << name
+                                out << "clx::upval_init(l_" << name << ", L->create_closure(_impl_" << name
                                     << ", static_cast<clx::LTable*>(_ENV.as_pointer())"
                                     << (_gc_cells_d.empty() ? "" : ", " + _gc_cells_d) << "));\n";
                             else

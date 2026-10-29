@@ -864,6 +864,8 @@ struct LTableExt {
     LTableInlineCache *ic = nullptr;
     LTable *metatable = nullptr;
     LTable *meta_next = nullptr;
+    //------------------ an arena table's hash entries as created (arena memory); a resize replaces them with a heap buffer, which the arena's reset must free
+    const void *arena_entries = nullptr;
 };
 
 struct LTable : public LHeader {
@@ -1488,6 +1490,7 @@ struct LState {
     //------------------ chains before sweeping and re-partition after; close/membership walks cover both.
     LHeader *old_objects = nullptr;
     LTable *free_tables;
+    static constexpr size_t kPooledHashMax = 64;   // hash entries a pooled (dead, reusable) table may keep
     //------------------ Big-buffer free list: tables retaining a heap array park here so size-unknown
     //------------------ creations ({}) never inherit a 90KB array they will not use while the table that
     //------------------ needs it allocates another (linear pool growth wave-over-wave; see create_table).
@@ -1697,7 +1700,12 @@ struct LState {
     bool gc_minor_threshold_env = false;
     static constexpr size_t kMinorThresholdMin = 256 * 1024;
     static constexpr size_t kMinorThresholdMax = 8 * 1024 * 1024;
+    //------------------ Survival-based pacing (gc_policy 1): the nursery is sized by what survives it, not by the heap size.
+    int gc_policy = 0;
+    size_t gc_policy_min = 128 * 1024, gc_policy_max = 8 * 1024 * 1024;
+    int gc_policy_grow_pct = 25, gc_policy_shrink_pct = 8;
     size_t gc_major_threshold = 32 * 1024 * 1024;
+    size_t gc_major_floor = 32 * 1024 * 1024;   //------------------ the major threshold never drops below this; after each full collection it is max(floor, 1.5 x the live old set)
     size_t gc_old_bytes = 0;
     size_t gc_bytes_at_minor = 0;
     bool gc_major_pending = false;
@@ -1720,7 +1728,8 @@ struct LState {
     CLX_INLINE size_t gc_heap_object_size(const LHeader *h) const {
         switch (h->type) {
         case static_cast<uint8_t>(Table):
-            return sizeof(LTable);
+            //------------------ the same bytes allocated_bytes counts for it (header + side buffers), so the major trigger measures the real old set
+            return sizeof(LTable) + table_heap_bytes(static_cast<const LTable *>(h));
         case static_cast<uint8_t>(Function):
             return sizeof(LCFunction);
         case static_cast<uint8_t>(Thread): {
@@ -2536,6 +2545,16 @@ struct FuncArena {
     ~FuncArena();
 };
 
+//------------------ Ownership of an arena table's buffers. LFLAG_ARENA stays set for the table's life; a buffer is the arena's own only while it is the one the table was created with
+//------------------ (the array sits right after the header, the hash entries are recorded in the ext). A grown or resized buffer is heap memory that nothing but the arena's reset can free.
+CLX_INLINE bool arena_owns_array(const LTable *t) {
+    return (t->flags & LFLAG_ARENA)
+        && t->array == reinterpret_cast<const TValue *>(reinterpret_cast<const char *>(t) + ((sizeof(LTable) + 7) & ~static_cast<size_t>(7)));
+}
+CLX_INLINE bool arena_owns_entries(const LTable *t) {
+    return (t->flags & LFLAG_ARENA) && t->ext && t->ext->entries == t->ext->arena_entries;
+}
+
 //------------------ Unlink an arena from the state's active-arena registry.
 CLX_INLINE void arena_unregister(FuncArena *a) {
     LState *L = a->owner;
@@ -2579,6 +2598,17 @@ CLX_INLINE_HOT void *arena_alloc(FuncArena *a, size_t bytes, size_t align = 8) {
 }
 
 CLX_INLINE_HOT void arena_reset(FuncArena *a) {
+    //------------------ the tables live in the blocks freed below, but not everything they point to: grown arrays, resized hashes and inline caches are heap memory
+    for (LTable *t = a->tables; t; t = static_cast<LTable *>(t->next)) {
+        if (t->array && !arena_owns_array(t))
+            table_free_array(t->array, t->array_types, t->small_array);
+        if (t->ext) {
+            if (t->ext->entries && !arena_owns_entries(t))
+                table_free_hash(t->ext->entries, t->ext->hash_bitmap);
+            delete[] t->ext->ic;
+            t->ext->ic = nullptr;
+        }
+    }
     arena_unregister(a);
     FuncArenaBlock *b = a->blocks;
     while (b) {
@@ -2633,6 +2663,7 @@ CLX_INLINE_HOT LValue arena_create_table(LState *L, FuncArena *a, size_t asize, 
         LTableExt *ex = static_cast<LTableExt *>(arena_alloc(a, sizeof(LTableExt)));
         t->ext = ex;
         ex->entries = reinterpret_cast<HashEntry *>(mem + header_sz + array_sz + types_sz);
+        ex->arena_entries = ex->entries;
         ex->hash_size = hsize;
         ex->hash_count = 0;
         ex->hash_tombs = 0;
@@ -3545,6 +3576,13 @@ CLX_INLINE_HOT void gc_barrier_cell(const LUpValue &cell, const LValue &newval) 
 CLX_INLINE_HOT void upval_store(const LUpValue &cell, const LValue &v) {
     *cell = v;
     gc_barrier_cell(cell, v);
+}
+
+//------------------ First store into a cell its declaration has just made (`local function f` ties the closure to its own variable). No older object can hold a cell that did not exist
+//------------------ a moment ago, and a closure that later survives into the old generation is remembered by the promotion itself (it checks its cells), so the cell needs no
+//------------------ remembered-set entry. Without this every such closure was a root of the next minor collection and was promoted even when dead.
+CLX_INLINE_HOT void upval_init(const LUpValue &cell, const LValue &v) {
+    *cell = v;
 }
 
 //------------------ Table write with __newindex fallback

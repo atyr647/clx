@@ -139,12 +139,12 @@ LTable::~LTable() {
     if (ext) {
         if (ext->ic)
             delete[] ext->ic;
-        if (!(flags & LFLAG_ARENA))
+        if (!arena_owns_entries(this))
             table_free_hash(ext->entries, ext->hash_bitmap);
         delete ext;
         ext = nullptr;
     }
-    if (!(flags & LFLAG_ARENA))
+    if (!arena_owns_array(this))
         table_free_array(array, array_types, small_array);}
 
 //------------------ LTable::resize_hash — allocate/rehash to new_size (power of 2)
@@ -176,11 +176,10 @@ void LTable::resize_hash(size_t new_size) {
             new_entries[h].vtype = ex->entries[i].vtype;
             new_bitmap[h / 64] |= (1ULL << (h % 64));
         }
-        if (!(flags & LFLAG_ARENA))
+        if (!arena_owns_entries(this))
             table_free_hash(ex->entries, ex->hash_bitmap);
     }
 
-    flags &= ~LFLAG_ARENA;
     ex->entries = new_entries;
     ex->hash_size = new_size;
     ex->hash_tombs = 0;
@@ -282,9 +281,8 @@ void LTable::settable(const LValue &key, const LValue &val) {
                 std::memcpy(new_arr, array, array_cap * sizeof(TValue));
                 std::memcpy(new_types, array_types, array_cap * sizeof(ValueType));
             }
-            if (!(flags & LFLAG_ARENA))
+            if (!arena_owns_array(this))
                 table_free_array(array, array_types, small_array);
-            flags &= ~LFLAG_ARENA;
             array = new_arr;
             array_types = new_types;
             array[array_size] = val.val;
@@ -356,9 +354,8 @@ void LTable::settable(const LValue &key, const LValue &val) {
                     std::memcpy(new_arr, array, array_cap * sizeof(TValue));
                     std::memcpy(new_types, array_types, array_cap * sizeof(ValueType));
                 }
-                if (!(flags & LFLAG_ARENA))
+                if (!arena_owns_array(this))
                     table_free_array(array, array_types, small_array);
-                flags &= ~LFLAG_ARENA;
                 array = new_arr;
                 array_types = new_types;
                 array[array_size] = val.val;
