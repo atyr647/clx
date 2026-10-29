@@ -67,6 +67,11 @@ struct CoroutineContext {
     bool has_thread = false;
     pthread_t th;
 };
+#elif defined(CLX_WASM_STACK_SWITCHING)
+//------------------ WebAssembly stack switching (src/runtime/wasm_costack.cpp): a coroutine runs on a pooled worker -- a continuation that never
+//------------------ finishes, plus a stack of its own in linear memory. The worker is acquired at the first resume and released when the body ends.
+struct CoWorker;
+struct CoroutineContext { CoWorker *worker = nullptr; };
 #else
 struct CoroutineContext { };
 #endif
@@ -1395,6 +1400,8 @@ struct LThread : public LHeader {
     bool is_main;
     bool has_error;
     bool close_requested;
+    //---------- kill_requested: set when an unfinished thread is destroyed; its next resume unwinds the body with CoKill (wasm stack switching)
+    bool kill_requested = false;
     size_t stack_bytes = 0;
     bool fiber_started = false;
     bool pre_unwind = false;
@@ -1466,6 +1473,9 @@ struct LState {
 
     LThread *main_thread = nullptr;
     LThread *running_thread = nullptr;
+    //---------- stack_limit: lowest address generated code may reach on the running thread's stack in linear memory (wasm stack switching only;
+    //---------- 0 = unchecked). FrameBase raises Lua's "stack overflow" error below it, which linear memory has no guard page to do.
+    uintptr_t stack_limit = 0;
 
     //---------- top_root: head of the running thread's RootRange chain (one frame per generated function)
     RootRange *top_root = nullptr;
@@ -1789,13 +1799,21 @@ struct RootRange {
 //------------------ aliases; blocks save it and restore it, which reuses slots across disjoint blocks.
 //------------------ `compact(base, mid)` folds callee-pushed tail entries down over a discarded base region
 //------------------ (the old multi-assign compaction), handling the empty-tail case the same way.
+#if defined(CLX_WASM_STACK_SWITCHING)
+[[noreturn]] void stack_overflow(LState *L);   // raises Lua's "stack overflow" error (src/runtime/wasm_costack.cpp)
+#endif
 struct FrameBase : RootRange {
     size_t used = 0;
     LValue **_heap = nullptr;
     size_t _cap = 0;
 
     CLX_INLINE_HOT explicit FrameBase(LState *L)
-        : RootRange(L, nullptr, 0, nullptr, 0) { }
+        : RootRange(L, nullptr, 0, nullptr, 0) {
+#if defined(CLX_WASM_STACK_SWITCHING)
+        if (__builtin_expect(reinterpret_cast<uintptr_t>(this) < L->stack_limit, 0))
+            stack_overflow(L);
+#endif
+    }
 
     CLX_INLINE_HOT ~FrameBase() { delete[] _heap; }
 

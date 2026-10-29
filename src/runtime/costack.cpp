@@ -13,7 +13,7 @@
 
 // A target with no way to switch stacks (WebAssembly without green threads) runs every body that has no coroutine form to completion;
 // other targets fall back to a fiber for such bodies. CLX_STACKLESS_ONLY forces the first behaviour (tests use it on native).
-#if defined(__wasi__) && !defined(__wasi_cooperative_threads__) && !defined(CLX_STACKLESS_ONLY)
+#if defined(__wasi__) && !defined(__wasi_cooperative_threads__) && !defined(CLX_WASM_STACK_SWITCHING) && !defined(CLX_STACKLESS_ONLY)
 #define CLX_STACKLESS_ONLY 1
 #endif
 
