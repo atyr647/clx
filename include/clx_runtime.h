@@ -663,6 +663,18 @@ struct LState;
 struct LTable;
 struct RootRange;
 
+//------------------ Compiled modules and --dynamic reloads (tiered loading). Every module clx compiles records a hash of the Lua source it was built from
+//------------------ (package.clx_hashes[name]). With --dynamic, require looks for the module's file first: when the file exists and its hash differs, the
+//------------------ compiled version is stale and the file is loaded by the embedded interpreter instead; when it matches, or there is no file (a release build
+//------------------ ships none), the compiled version runs. One loader serves development, hot reload and mods.
+CLX_INLINE uint64_t source_hash(const char *data, size_t len) {   // FNV-1a, 64 bit
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < len; ++i) { h ^= static_cast<unsigned char>(data[i]); h *= 1099511628211ULL; }
+    return h;
+}
+void register_module_hash(LState *L, const char *name, uint64_t hash);
+extern bool (*source_differs_hook)(LState *L, const char *name, size_t len);   // set by the --dynamic bridge
+
 //------------------ Shared upvalue type
 using LUpValue = std::shared_ptr<LValue>;
 

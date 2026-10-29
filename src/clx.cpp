@@ -878,6 +878,15 @@ int main(int argc, char* argv[])
             appender << "        L->register_module(\"" << lua_mod << "\", luaopen_" << mod << ");\n";
             if (lua_mod != mod)
                 appender << "        L->register_module(\"" << mod << "\", luaopen_" << mod << ");\n";
+            {   // the hash of the source this module is built from: with --dynamic a changed file takes over from the compiled module (tiered loading)
+                std::ifstream src_in(input_files[i], std::ios::binary);
+                std::string src_text((std::istreambuf_iterator<char>(src_in)), std::istreambuf_iterator<char>());
+                uint64_t h = 1469598103934665603ULL;
+                for (unsigned char c : src_text) { h ^= c; h *= 1099511628211ULL; }
+                appender << "        clx::register_module_hash(L, \"" << lua_mod << "\", " << h << "ULL);\n";
+                if (lua_mod != mod)
+                    appender << "        clx::register_module_hash(L, \"" << mod << "\", " << h << "ULL);\n";
+            }
         }
         for (const auto& mod : precompiled_modules) {
             ModuleLinkKind kind = module_kinds.at(mod);
