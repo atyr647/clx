@@ -3254,6 +3254,23 @@ CLX_INLINE_COLD LValue len(LState *L, const LValue &a) {
     return LValue(lo);
 }
 
+//------------------ `#x` is an integer unless a __len metamethod (which may return anything) or a non-string/table operand is involved;
+//------------------ these two never call a metamethod, so the codegen can evaluate them once for the flag and once for the value
+CLX_INLINE bool len_is_int(LState *L, const LValue &a) {
+    if (a.type == ValueType::String)
+        return true;
+    if (a.type != ValueType::Table)
+        return false;
+    LTable *mt = tbl_metatable(static_cast<LTable *>(a.as_pointer()));
+    return mt == nullptr || mt->gettable(L->str_len).type == ValueType::Nil;
+}
+
+CLX_INLINE int64_t len_int(LState *L, const LValue &a) {
+    if (!len_is_int(L, a))
+        return 0;
+    return len(L, a).as_integer();
+}
+
 //------------------ Modulo with metamethod fallback (stock errors for integer b == 0)
 CLX_INLINE LValue mod(LState *L, const LValue &a, const LValue &b) {
     if (a.type == ValueType::Int64 && b.type == ValueType::Int64) [[likely]]

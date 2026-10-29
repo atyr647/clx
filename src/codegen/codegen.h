@@ -83,6 +83,9 @@ private:
     std::string int_flag_expr(uint32_t expr_idx, int depth);
     //------------------ int_value_expr: C++ int64 expression for an expression proven integral by int_flag_expr
     std::string int_value_expr(uint32_t expr_idx, int depth);
+    //------------------ len_operand_expr: the LValue C++ name of a plain local that is the operand of `#`, or "" when it is
+    //------------------ native-typed, a string builder, or not a local (callers then fall back to the untyped path)
+    std::string len_operand_expr(uint32_t operand_idx);
     //------------------ fast_call_box_flag: C++ bool expression restoring the return subtype of a fast call
     std::string fast_call_box_flag(std::string_view fname, uint32_t first_arg, uint32_t arg_count);
 

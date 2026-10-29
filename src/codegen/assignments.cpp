@@ -309,7 +309,13 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                             bool r_self = is_self(rgt);
                             bool l_native = yields_number(ctx, state, lft, nullptr, state.current_fast_func);
                             bool r_native = yields_number(ctx, state, rgt, nullptr, state.current_fast_func);
-                            if ((l_self && !r_native) || (r_self && !l_native)) {
+                            //------------------ `#x` counts as non-native here: its subtype is integer unless a __len metamethod says otherwise, and it
+                            //------------------ has to be evaluated exactly once, which the boxed path below does and the flag/value expressions would not
+                            auto is_len = [&](uint32_t e) {
+                                return ctx.nodes[e].type == NodeType::UnaryOp
+                                    && ctx.nodes[e].as.unary_op.op == static_cast<int>(UnaryOp::Len);
+                            };
+                            if ((l_self && (!r_native || is_len(rgt))) || (r_self && (!l_native || is_len(lft)))) {
                                 for (auto it = locals.rbegin(); it != locals.rend(); ++it) {
                                     if (it->name == single_name && it->has_intf) {
                                         uint32_t other = l_self ? rgt : lft;
@@ -1678,9 +1684,12 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                     if (sit->has_ii)
                                         out << "_ii_l_" << name << " = " << num_str << ";\n";
                                 } else {
-                                    out << "_intf_l_" << name << " = false;\n";
+                                    //------------------ the temporary is a double, but the initializer may still be an integer (`local n, x = 0, nil`)
+                                    uint32_t fv = ctx.block_statements[first_v + i];
+                                    out << "_intf_l_" << name << " = (" << int_flag_expr(fv, 1) << ");\n";
                                     if (sit->has_ii)
-                                        out << "_ii_l_" << name << " = 0;\n";
+                                        out << "_ii_l_" << name << " = _intf_l_" << name << " ? (int64_t)("
+                                            << int_value_expr(fv, 1) << ") : 0;\n";
                                 }
                             } else if (last_is_call && i + 1 >= v_count) {
                                 std::string mi = std::to_string(i) + " - " + std::to_string(v_count - 1);

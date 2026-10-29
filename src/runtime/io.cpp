@@ -439,9 +439,9 @@ static LValue make_file(LState *L, FILE *fp, bool close_on_gc, bool is_pipe = fa
     f->close_on_gc = close_on_gc;
     f->is_pipe = is_pipe;
 
+    L->root_value(LValue(UserData, ud));   // before the next allocation: create_table can collect, and ud is reachable from nowhere yet
     LTable *mt = static_cast<LTable *>(L->create_table().as_pointer());
     LValue file_mt(Table, mt);
-    L->root_value(LValue(UserData, ud));
     L->root_value(file_mt);
 
     auto meth_close = [](LState *L, const LValue *a, size_t c) -> MultiValue {
@@ -583,9 +583,9 @@ static LValue get_std_file(LState *L, FILE *fp) {
     f->close_on_gc = false;
     f->is_pipe = false;
 
+    L->root_value(LValue(UserData, ud));   // before the next allocation (see make_file)
     LTable *mt = static_cast<LTable *>(L->create_table().as_pointer());
     LValue file_mt(Table, mt);
-    L->root_value(LValue(UserData, ud));
     L->root_value(file_mt);
 
     auto meth_close = [](LState *L, const LValue *a, size_t c) -> MultiValue { return MultiValue(boolean(true)); };
