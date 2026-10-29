@@ -102,7 +102,7 @@ void clx_coro_init(CoroutineContext *ctx, void *stack_top, void *entry);
 #define CLX_INLINE_HOT __forceinline
 #endif
 #ifndef CLX_INLINE_COLD
-#define CLX_INLINE_COLD __declspec(noinline) inline
+#define CLX_INLINE_COLD inline __attribute__((noinline))
 #endif
 #ifndef CLX_INLINE
 #define CLX_INLINE inline
@@ -518,7 +518,7 @@ struct MultiValue {
     }
 
     //------------------ Defined out of line (below LState) like overflow_init: needs LState complete.
-    CLX_INLINE_COLD clx::LValue *push_grow();
+    clx::LValue *push_grow();
 
     MultiValue(const clx::LValue *arr, size_t c, LState *L = nullptr)
         : count(c)
@@ -640,12 +640,17 @@ struct MultiValue {
 struct LState;
 struct LTable;
 struct RootRange;
+struct CallSite;
+
+//------------------ default_call_site: no-file/no-line descriptor used when a call has no source context
+const CallSite *default_call_site();
 
 //------------------ Shared upvalue type
 using LUpValue = std::shared_ptr<LValue>;
 
 //------------------ Function call dispatcher (with error context)
-MultiValue call_function(LState *L, const LValue &func, const LValue *args, size_t count, const char *file, int line);
+MultiValue call_function(
+    LState *L, const LValue &func, const LValue *args, size_t count, const CallSite *cs = default_call_site());
 //------------------ Protected function call
 MultiValue pcall_function(LState *L, const LValue &func, const LValue *args, size_t count);
 
@@ -725,15 +730,16 @@ struct LCFunction : public LHeader {
 };
 
 //------------------ Fast path for LCFunction direct calls
-MultiValue call_direct(LState *L, const LValue &func, const LValue *args, size_t count, const char *file, int line);
+MultiValue call_direct(
+    LState *L, const LValue &func, const LValue *args, size_t count, const CallSite *cs = default_call_site());
 
 //------------------ Rooted call wrappers (defined after LState; alias func + args into a RootRange around a call)
 MultiValue call_function_rooted(
-    LState *L, const LValue &func, const LValue *args, size_t count, const char *file, int line);
+    LState *L, const LValue &func, const LValue *args, size_t count, const CallSite *cs = default_call_site());
 MultiValue call_direct_rooted(
-    LState *L, const LValue &func, const LValue *args, size_t count, const char *file, int line);
+    LState *L, const LValue &func, const LValue *args, size_t count, const CallSite *cs = default_call_site());
 MultiValue call_cfunc_rooted(
-    LState *L, CFunctionType f, const LValue *args, size_t count, const char *file = "", int line = 0);
+    LState *L, CFunctionType f, const LValue *args, size_t count, const CallSite *cs = default_call_site());
 
 //------------------ Userdata block
 struct LUserdata : public LHeader {
@@ -754,7 +760,7 @@ struct LReg {
 using RawCFunction = MultiValue (*)(LState *, const LValue *, size_t);
 
 MultiValue call_cfunc_rooted(
-    LState *L, RawCFunction f, const LValue *args, size_t count, const char *file = "", int line = 0);
+    LState *L, RawCFunction f, const LValue *args, size_t count, const CallSite *cs = default_call_site());
 
 //------------------ C function registration (lazy init)
 struct LazyReg {
@@ -880,44 +886,6 @@ CLX_INLINE_HOT void gc_barrier_table(LState *L, const LTable *owner, const LValu
     gc_barrier_header(L, const_cast<LTable *>(owner), newval);
 }
 
-//------------------ TEMPORARY allocation census (CLX_ALLOC_STATS=1 dumps at state close). Remove after tuning.
-struct AllocCensus {
-    uint64_t table_new = 0;
-    uint64_t table_recycled = 0;
-    uint64_t table_arena = 0;
-    uint64_t array_new = 0;
-    uint64_t array_grow = 0;
-    uint64_t ext_new = 0;
-    uint64_t hash_resize = 0;
-    uint64_t closure_new = 0;
-    uint64_t closure_recycled = 0;
-    uint64_t str_intern_new = 0;
-    uint64_t str_intern_hit = 0;
-    uint64_t gc_minor_us = 0;
-    uint64_t gc_major_us = 0;
-    uint64_t gc_minor_mark_us = 0;
-    uint64_t gc_minor_sweep_us = 0;
-    uint64_t gc_minors = 0;
-    uint64_t gc_old_skipped = 0;
-};
-
-inline AllocCensus g_alloc_census;
-
-inline void dump_alloc_census() {
-    const AllocCensus &c = g_alloc_census;
-    std::fprintf(stderr,
-        "[alloc] table_new=%llu table_recycled=%llu table_arena=%llu array_new=%llu array_grow=%llu ext_new=%llu "
-        "hash_resize=%llu "
-        "closure_new=%llu closure_recycled=%llu str_new=%llu str_hit=%llu gc_minor_us=%llu gc_major_us=%llu "
-        "mark_us=%llu sweep_us=%llu minors=%llu oldskip=%llu\n",
-        (unsigned long long)c.table_new, (unsigned long long)c.table_recycled, (unsigned long long)c.table_arena,
-        (unsigned long long)c.array_new, (unsigned long long)c.array_grow, (unsigned long long)c.ext_new,
-        (unsigned long long)c.hash_resize, (unsigned long long)c.closure_new, (unsigned long long)c.closure_recycled,
-        (unsigned long long)c.str_intern_new, (unsigned long long)c.str_intern_hit, (unsigned long long)c.gc_minor_us,
-        (unsigned long long)c.gc_major_us, (unsigned long long)c.gc_minor_mark_us,
-        (unsigned long long)c.gc_minor_sweep_us, (unsigned long long)c.gc_minors, (unsigned long long)c.gc_old_skipped);
-}
-
 //------------------ Tag-based table barrier for sites that already hold a raw TValue/ValueType pair
 //------------------ (in-place array swap/store fast paths). Skips boxing the pair into a temporary
 //------------------ LValue; the box happens lazily inside the cold slow path only when it fires.
@@ -937,7 +905,6 @@ CLX_INLINE LTable *tbl_metatable(const LTable *t) {
 CLX_INLINE LTableExt *tbl_ensure_ext(LTable *t) {
     if (t->ext == nullptr) {
         t->ext = new LTableExt();
-        g_alloc_census.ext_new++;
     }
     return t->ext;
 }
@@ -966,7 +933,6 @@ CLX_INLINE_HOT void table_alloc_array(TValue *&arr, ValueType *&types, size_t ca
         types = nullptr;
         return;
     }
-    g_alloc_census.array_new++;
     char *mem = static_cast<char *>(std::calloc(1, table_array_block_bytes(cap)));
     if (!mem)
         throw std::bad_alloc();
@@ -1222,13 +1188,10 @@ struct StringPool {
             if (s.empty()) {
                 s = make_slot(str, len, h);
                 count++;
-                g_alloc_census.str_intern_new++;
                 return s.baked;
             }
-            if (slot_matches(s.baked, str, len, h)) {
-                g_alloc_census.str_intern_hit++;
+            if (slot_matches(s.baked, str, len, h))
                 return s.baked;
-            }
             idx = (idx + 1) & mask;
         }
     }
@@ -1401,6 +1364,19 @@ struct TableSlab {
     TableSlab *next;
 };
 
+//------------------ CallSite: immutable source location + name/method flags for one call site
+struct CallSite {
+    const char *file;
+    int line;
+    bool is_method;
+    bool name_short;
+};
+
+inline const CallSite *default_call_site() {
+    static constexpr CallSite site = { "", 0, false, false };
+    return &site;
+}
+
 struct LState {
     LTable *_G;
     LCFunction *current_func = nullptr;
@@ -1437,26 +1413,11 @@ struct LState {
     //---------- top_root: head of the running thread's RootRange chain (one frame per generated function)
     RootRange *top_root = nullptr;
 
-    const char *current_file;
-    int current_line;
-
-
-    //------------------ call-site context for stock luaL_argerror semantics: pending_* is set by generated//------------------ code before dispatch; a C-function wrapper moves it into arg_* for the callee to read.
-    //------------------ pending_* is a stack: codegen pushes the saved frame (call_ctx_push) at the start of every
-    //------------------ call-expression lambda and pops (call_ctx_pop) before restore. Nested evaluation (callee
-    //------------------ lookup / argument subexpressions) may dispatch Lua functions that clobber the *live*
-    //------------------ pending_* fields, but CallCtxGuard reads the flags captured at this call site's frame
-    //------------------ (pending_ctx_bottom), so lazy __index materialization or an argument call no longer
-    //------------------ steals the name/method flags destined for the real callee. Depth is bounded by nesting.
-    static constexpr size_t kMaxCallCtxDepth = 128;
-    bool pending_call_is_method = false;
-    bool pending_call_name_short = false;
-    bool pending_ctx_bottom_is_method = false;
-    bool pending_ctx_bottom_name_short = false;
-    uint32_t pending_ctx_depth = 0;
-    bool call_ctx_frames[kMaxCallCtxDepth][2] = { };
-    bool arg_is_method = false;
-    bool arg_name_short = false;
+    //------------------ Active call site: the descriptor captured at the most recent call/statement, read by
+    //------------------ file_line_prefix and bad_arg_msg for Lua-compatible error context.
+    const CallSite *current_site = nullptr;
+    //------------------ pcall_site: stable descriptor for errors raised directly under pcall (file, no line)
+    CallSite pcall_site = { "", 0, false, false };
 
     //---------- luaapi: backing ApiBundle for the Lua 5.5 C API (src/runtime/luaapi.cpp)
     void *luaapi = nullptr;
@@ -1720,6 +1681,11 @@ struct LState {
 
     void register_module(const std::string &name, LValue (*func)(LState *));
     void register_loaded_module(const std::string &name, const LValue &module);
+    //------------------ _layout_reserve: holds sizeof(LState) at its pre-call-site-refactor footprint.
+    //------------------ Shrinking the struct shifts every later heap allocation; that changed table
+    //------------------ inline-cache cache-set aliasing and slowed nbody ~1.7x. The reserve keeps the
+    //------------------ established allocation layout. Re-validate hot table benchmarks before resizing.
+    char _layout_reserve[256] = {};
 };
 
 //------------------ RootRange — one GC-root frame. The constructor links it into the owning thread's chain, the
@@ -1867,69 +1833,13 @@ template<typename F> static void gc_walk_roots(RootRange *head, F &&mark) {
 //------------------ call_function/call_direct root func+args themselves on entry, so a wrapper
 //------------------ range would double-root the same values on every call.
 CLX_INLINE_HOT MultiValue call_function_rooted(
-    LState *L, const LValue &func, const LValue *args, size_t count, const char *file, int line) {
-    return call_function(L, func, args, count, file, line);
+    LState *L, const LValue &func, const LValue *args, size_t count, const CallSite *cs) {
+    return call_function(L, func, args, count, cs);
 }
 
 CLX_INLINE_HOT MultiValue call_direct_rooted(
-    LState *L, const LValue &func, const LValue *args, size_t count, const char *file, int line) {
-    return call_direct(L, func, args, count, file, line);
-}
-
-//------------------ CallCtxGuard: moves pending call-site flags into arg_* for the callee; restores on exit
-struct CallCtxGuard {
-    LState *L;
-    bool saved_method;
-    bool saved_name_short;
-
-    CLX_INLINE explicit CallCtxGuard(LState *state)
-        : L(state)
-        , saved_method(state->arg_is_method)
-        , saved_name_short(state->arg_name_short) {
-        state->arg_is_method = state->pending_ctx_bottom_is_method;
-        state->arg_name_short = state->pending_ctx_bottom_name_short;
-        state->pending_call_is_method = false;
-        state->pending_call_name_short = false;
-    }
-
-    CLX_INLINE ~CallCtxGuard() {
-        L->arg_is_method = saved_method;
-        L->arg_name_short = saved_name_short;
-    }
-
-    CallCtxGuard(const CallCtxGuard &) = delete;
-    CallCtxGuard &operator=(const CallCtxGuard &) = delete;
-};
-
-//------------------ call_ctx_push: generated code calls this at the start of every call-expression lambda,
-//------------------ right after capturing the flags it will restore. It records this call site's flags into the
-//------------------ depth-indexed frame stack and mirrors the top into pending_ctx_bottom_*, which CallCtxGuard
-//------------------ reads. This decouples the flags destined for the callee from the live pending_* fields that
-//------------------ nested evaluation (callee lookup / argument subexpressions) may clobber.
-CLX_INLINE void call_ctx_push(LState *L, bool is_method, bool name_short) {
-    size_t d = L->pending_ctx_depth;
-    if (d < LState::kMaxCallCtxDepth) {
-        L->call_ctx_frames[d][0] = is_method;
-        L->call_ctx_frames[d][1] = name_short;
-        L->pending_ctx_depth = static_cast<uint32_t>(d + 1);
-    }
-    L->pending_ctx_bottom_is_method = is_method;
-    L->pending_ctx_bottom_name_short = name_short;
-}
-
-//------------------ call_ctx_pop: mirrors the enclosing call site's flags back into pending_ctx_bottom_* before
-//------------------ the generated code restores the live pending_* fields. Pops one frame.
-CLX_INLINE void call_ctx_pop(LState *L) {
-    if (L->pending_ctx_depth > 0)
-        L->pending_ctx_depth--;
-    size_t d = L->pending_ctx_depth;
-    if (d < LState::kMaxCallCtxDepth) {
-        L->pending_ctx_bottom_is_method = L->call_ctx_frames[d][0];
-        L->pending_ctx_bottom_name_short = L->call_ctx_frames[d][1];
-    } else {
-        L->pending_ctx_bottom_is_method = false;
-        L->pending_ctx_bottom_name_short = false;
-    }
+    LState *L, const LValue &func, const LValue *args, size_t count, const CallSite *cs) {
+    return call_direct(L, func, args, count, cs);
 }
 
 //------------------ Rooted call wrapper for direct C function pointers (hoisted builtins, direct impls)
@@ -1937,36 +1847,30 @@ CLX_INLINE void call_ctx_pop(LState *L) {
 //------------------ raw-pointer overload still skips CFunctionType construction on hot builtin calls.
 template<typename CFunc>
 CLX_INLINE_HOT MultiValue call_cfunc_rooted_impl(
-    LState *L, CFunc f, const LValue *args, size_t count, const char *file, int line) {
+    LState *L, CFunc f, const LValue *args, size_t count, const CallSite *cs) {
     RootRange rr(L, const_cast<LValue *>(args), args ? count : 0);
-    CallCtxGuard cg(L);
-    if (line > 0) {
-        L->current_file = file;
-        L->current_line = line;
-    }
+    if (cs && cs->line > 0)
+        L->current_site = cs;
     return f(L, args, count);
 }
 
 CLX_INLINE_HOT MultiValue call_cfunc_rooted(
-    LState *L, CFunctionType f, const LValue *args, size_t count, const char *file, int line) {
-    return call_cfunc_rooted_impl(L, f, args, count, file, line);
+    LState *L, CFunctionType f, const LValue *args, size_t count, const CallSite *cs) {
+    return call_cfunc_rooted_impl(L, f, args, count, cs);
 }
 
 //------------------ Raw pointer overload: skips CFunctionType construction on hot builtin calls
 CLX_INLINE_HOT MultiValue call_cfunc_rooted(
-    LState *L, RawCFunction f, const LValue *args, size_t count, const char *file, int line) {
-    return call_cfunc_rooted_impl(L, f, args, count, file, line);
+    LState *L, RawCFunction f, const LValue *args, size_t count, const CallSite *cs) {
+    return call_cfunc_rooted_impl(L, f, args, count, cs);
 }
 
 //------------------ Roots args[] across the direct-call fast path; else collections inside the callee miss survivor-aged args.
 CLX_INLINE_HOT MultiValue call_cfunc_direct(
-    LState *L, const CFunctionType &f, const LValue *args, size_t count, const char *file = "", int line = 0) {
+    LState *L, const CFunctionType &f, const LValue *args, size_t count, const CallSite *cs = default_call_site()) {
     RootRange rr(L, const_cast<LValue *>(args), args ? count : 0);
-    CallCtxGuard cg(L);
-    if (line > 0) {
-        L->current_file = file;
-        L->current_line = line;
-    }
+    if (cs && cs->line > 0)
+        L->current_site = cs;
     return f(L, args, count);
 }
 
@@ -1977,13 +1881,10 @@ CLX_INLINE_HOT MultiValue call_cfunc_direct(
 //------------------ CFunctionType arguments still prefer the non-template above.
 template<typename F>
 CLX_INLINE_HOT MultiValue call_cfunc_direct(
-    LState *L, const F &f, const LValue *args, size_t count, const char *file = "", int line = 0) {
+    LState *L, const F &f, const LValue *args, size_t count, const CallSite *cs = default_call_site()) {
     RootRange rr(L, const_cast<LValue *>(args), args ? count : 0);
-    CallCtxGuard cg(L);
-    if (line > 0) {
-        L->current_file = file;
-        L->current_line = line;
-    }
+    if (cs && cs->line > 0)
+        L->current_site = cs;
     return f(L, args, count);
 }
 
@@ -2033,8 +1934,9 @@ CLX_INLINE void meta_ud_list_remove(LState *L, LUserdata *ud) {
 }
 
 inline std::string file_line_prefix(LState *L) {
-    if (L->current_file && L->current_file[0] != '\0' && L->current_line > 0)
-        return std::string(L->current_file) + ":" + std::to_string(L->current_line) + ": ";
+    const CallSite *cs = L->current_site;
+    if (cs && cs->file && cs->file[0] != '\0' && cs->line > 0)
+        return std::string(cs->file) + ":" + std::to_string(cs->line) + ": ";
     return "";
 }
 
@@ -2048,7 +1950,7 @@ inline const char *stock_type_name(const LValue &v) {
 //------------------ err_func_name: stock luaL_argerror uses the short name when the call site is
 //------------------ resolvable (direct field call or method); otherwise the pushglobalfuncname fallback.
 inline const char *err_func_name(LState *L, const char *fname) {
-    if (L->arg_is_method || L->arg_name_short) {
+    if (L->current_site && (L->current_site->is_method || L->current_site->name_short)) {
         const char *dot = std::strrchr(fname, '.');
         if (dot)
             return dot + 1;
@@ -2061,7 +1963,7 @@ inline const char *err_func_name(LState *L, const char *fname) {
 inline std::string bad_arg_msg(LState *L, int idx, const char *fname, const std::string &expected_got) {
     const char *nm = err_func_name(L, fname);
     int eidx = idx;
-    if (L->arg_is_method) {
+    if (L->current_site && L->current_site->is_method) {
         if (idx == 1)
             return file_line_prefix(L) + "calling '" + nm + "' on bad self (" + expected_got + ")";
         eidx = idx - 1;
@@ -2078,7 +1980,7 @@ inline void MultiValue::overflow_init(const clx::LValue *arr, size_t c) {
         overflow[i - INLINE_CAP] = arr[i];
 }
 
-inline clx::LValue *MultiValue::push_grow() {
+CLX_INLINE_COLD clx::LValue *MultiValue::push_grow() {
     if (!alloc_L)
         throw std::runtime_error(
             "clx: MultiValue overflow requires an LState; pass L when returning more than 4 values");
@@ -2508,7 +2410,6 @@ CLX_INLINE FuncArena::~FuncArena() {
 }
 
 CLX_INLINE_HOT LValue arena_create_table(LState *L, FuncArena *a, size_t asize, size_t hsize) {
-    g_alloc_census.table_arena++;
 #if CLX_ARENA_DEFAULT_FIELDS > 0
     if (asize < CLX_ARENA_DEFAULT_FIELDS)
         asize = CLX_ARENA_DEFAULT_FIELDS;
@@ -3365,14 +3266,12 @@ CLX_INLINE_HOT LValue make_string(LState *L, const std::string &s) {
     return make_string(L, s.data(), s.size());
 }
 
-//------------------ Creates a string LValue, trying pool lookup before heap allocation
+//------------------ Creates a string LValue, interning in a single hash/probe pass
 CLX_INLINE LValue make_string_pooled(LState *L, const char *s, size_t len) {
     if (len <= 6)
         return LValue::istr(s, len);
     uint64_t h = len <= 8 ? swar_hash_8(s, len) : wyhash_str(s, len);
-    if (const char *hit = L->string_pool.lookup(s, len, h))
-        return LValue(hit);
-    return LValue(L->intern_string(s, len));
+    return LValue(L->string_pool.intern(s, len, h));
 }
 
 //------------------ Table read with __index fallback
@@ -3508,8 +3407,9 @@ CLX_INLINE void table_set(LState *L, const LValue &obj, const LValue &key, const
         if (newindex.type == ValueType::Nil)
             return;
         if (newindex.type == ValueType::Function) {
+            static constexpr CallSite newindex_site = { "__newindex", 0, false, false };
             LValue args[3] = { obj, key, val };
-            call_function_rooted(L, newindex, args, 3, "__newindex", 0);
+            call_function_rooted(L, newindex, args, 3, &newindex_site);
         } else if (newindex.type == ValueType::Table) {
             table_set(L, newindex, key, val);
         }
@@ -3546,7 +3446,8 @@ CLX_INLINE LValue table_get_int(LState *L, const LValue &obj, size_t idx) {
         return LValue();
     if (index.type == ValueType::Function) {
         LValue args[2] = { obj, key_val };
-        MultiValue mv = call_function_rooted(L, index, args, 2, "__index", 0);
+        static constexpr CallSite index_site = { "__index", 0, false, false };
+        MultiValue mv = call_function_rooted(L, index, args, 2, &index_site);
         return mv.count > 0 ? mv[0] : LValue();
     }
     if (index.type == ValueType::Table)
@@ -3584,8 +3485,9 @@ CLX_INLINE void table_set_int(LState *L, const LValue &obj, size_t idx, const LV
         if (newindex.type == ValueType::Nil)
             return;
         if (newindex.type == ValueType::Function) {
+            static constexpr CallSite newindex_site = { "__newindex", 0, false, false };
             LValue args[3] = { obj, key_val, val };
-            call_function_rooted(L, newindex, args, 3, "__newindex", 0);
+            call_function_rooted(L, newindex, args, 3, &newindex_site);
         } else if (newindex.type == ValueType::Table) {
             table_set(L, newindex, key_val, val);
         }
