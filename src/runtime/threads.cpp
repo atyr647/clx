@@ -75,7 +75,9 @@ extern "C" {
 CLX_CO_STUB __attribute__((export_name("clx_costack_new"))) void clx_costack_new(uint32_t slot, void (*entry)(void)) { __asm__ volatile("" ::"r"(slot), "r"(entry) : "memory"); }
 // unspliced, resume returns kCoroUnspliced; the real body returns the worker's stack pointer (a linear-memory address, never this value)
 static constexpr uint32_t kCoroUnspliced = 0xDEADBEEFu;
-CLX_CO_STUB __attribute__((export_name("clx_costack_resume"))) uint32_t clx_costack_resume(uint32_t slot, uint32_t sp) { __asm__ volatile("" ::"r"(slot), "r"(sp) : "memory"); return kCoroUnspliced; }
+// read through a volatile so that no optimisation level can fold the comparison below into a constant (interprocedural constant propagation did at -O3)
+static volatile uint32_t g_coro_unspliced_value = kCoroUnspliced;
+CLX_CO_STUB __attribute__((export_name("clx_costack_resume"))) uint32_t clx_costack_resume(uint32_t slot, uint32_t sp) { __asm__ volatile("" ::"r"(slot), "r"(sp) : "memory"); return g_coro_unspliced_value; }
 CLX_CO_STUB __attribute__((export_name("clx_costack_suspend"))) void clx_costack_suspend(void) { __asm__ volatile("" ::: "memory"); }
 }
 
