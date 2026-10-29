@@ -62,6 +62,130 @@ static inline void root_load(LState *L, LThread *t) {
     t->top_root = nullptr;
 }
 
+#if defined(__wasi__) && defined(CLX_WASM_STACK_SWITCHING)
+//------------------ WebAssembly stack switching. Wasmtime's stack-switching instructions (cont.new / resume / suspend) cannot be emitted by clang, so the
+//------------------ four clx_costack_* functions below are stubs whose bodies tools/wasm-costack-splice.py replaces after linking (scripts/ and
+//------------------ decisions/scripting-direction.md section 3b). The stubs are noinline/optnone with a memory clobber so the optimiser infers nothing about them.
+//
+//------------------ A coroutine runs on a CoWorker: a continuation that never finishes, plus a stack in linear memory (the wasm "shadow" stack, which
+//------------------ the host cannot protect). Wasmtime 49 frees no continuation until the store is dropped, so workers are created once and reused:
+//------------------ a worker runs one thread's body, is released when it ends, and is picked up by the next thread that starts.
+#define CLX_CO_STUB __attribute__((noinline, optnone))
+extern "C" {
+CLX_CO_STUB __attribute__((export_name("clx_costack_new"))) void clx_costack_new(uint32_t slot, void (*entry)(void)) { __asm__ volatile("" ::"r"(slot), "r"(entry) : "memory"); }
+CLX_CO_STUB __attribute__((export_name("clx_costack_resume"))) uint32_t clx_costack_resume(uint32_t slot, uint32_t sp) { __asm__ volatile("" ::"r"(slot), "r"(sp) : "memory"); return slot ^ sp; }
+CLX_CO_STUB __attribute__((export_name("clx_costack_suspend"))) void clx_costack_suspend(void) { __asm__ volatile("" ::: "memory"); }
+}
+
+struct CoKill { };   // unwinds the body of a thread that is being destroyed unfinished; not a Lua error, so no pcall sees it
+
+}   // namespace clx
+struct CoWorker {   // the global one clx_runtime.h declares for CoroutineContext
+    uint32_t slot;
+    char *mem;           // the stack allocation; mem[0..15] holds the canary
+    size_t size;
+    uintptr_t limit;     // FrameBase raises "stack overflow" below this address
+    uint32_t sp;         // the worker's stack pointer at its last suspension
+    clx::LThread *job;
+    CoWorker *next_free;
+};
+namespace clx {
+
+static constexpr uint32_t kCoCanary = 0xC0DE5AFEu;
+static constexpr uint32_t kCoMaxWorkers = 65535;   // the splice allocates a 65536-entry continuation table
+static CoWorker *g_co_free = nullptr;
+static CoWorker *g_co_cur = nullptr;
+static uint32_t g_co_workers = 0;
+
+static void fiber_entry_impl(LThread *t);
+
+static void co_worker_entry() {
+    CoWorker *self = g_co_cur;
+    for (;;)
+        fiber_entry_impl(self->job);
+}
+
+[[noreturn]] void stack_overflow(LState *L) {
+    L->stack_limit = 0;   // the error needs room: unchecked until the thread's next resume sets its limit again
+    error(L, "stack overflow");
+}
+
+static CoWorker *co_acquire(LThread *t) {
+    size_t need = t->stack_bytes ? t->stack_bytes : 262144;
+    CoWorker **link = &g_co_free;
+    for (CoWorker *w = g_co_free; w; link = &w->next_free, w = w->next_free) {
+        if (w->size >= need) { *link = w->next_free; w->next_free = nullptr; w->job = t; t->ctx.worker = w; return w; }
+    }
+    if (g_co_workers >= kCoMaxWorkers)
+        throw_runtime_error("too many live coroutines (65535)");
+    CoWorker *w = new CoWorker();
+    w->size = (need + 15) & ~size_t(15);
+    w->mem = static_cast<char *>(std::malloc(w->size + 16));
+    if (!w->mem) { delete w; throw_runtime_error("not enough memory for a coroutine stack"); }
+    std::memset(w->mem, 0, 16);
+    for (int i = 0; i < 4; ++i) reinterpret_cast<uint32_t *>(w->mem)[i] = kCoCanary;
+    size_t margin = w->size >= 65536 ? 16384 : w->size / 4;   // room for the runtime's own frames below the last check
+    w->limit = reinterpret_cast<uintptr_t>(w->mem) + 16 + margin;
+    w->sp = static_cast<uint32_t>((reinterpret_cast<uintptr_t>(w->mem) + 16 + w->size) & ~uintptr_t(15));
+    w->slot = g_co_workers++;
+    w->job = t;
+    t->ctx.worker = w;
+    clx_costack_new(w->slot, co_worker_entry);
+    return w;
+}
+
+//---------- called by the body's last step, on the worker: hand the worker back before the final switch to the caller
+static void wasm_co_finish(LThread *t) {
+    CoWorker *w = t->ctx.worker;
+    t->ctx.worker = nullptr;
+    w->job = nullptr;
+    w->next_free = g_co_free;
+    g_co_free = w;
+}
+
+static void wasm_co_switch(LThread *from, LThread *to) {
+    if (!from->is_main && from->caller == to) {   // a yield, or the end of a body: back to the resumer's clx_costack_resume
+        clx_costack_suspend();
+        return;
+    }
+    LState *L = to->state;
+    CoWorker *w = to->ctx.worker ? to->ctx.worker : co_acquire(to);
+    uintptr_t prev_limit = L->stack_limit;
+    CoWorker *prev_cur = g_co_cur;
+    L->stack_limit = w->limit;
+    g_co_cur = w;
+    uint32_t sp = clx_costack_resume(w->slot, w->sp);
+    g_co_cur = prev_cur;
+    L->stack_limit = prev_limit;
+    if (!sp)
+        std::abort();   // a worker never finishes; reaching here means the splice was not applied or the continuation table is corrupt
+    w->sp = sp;
+    if (reinterpret_cast<uint32_t *>(w->mem)[0] != kCoCanary || reinterpret_cast<uint32_t *>(w->mem)[3] != kCoCanary) {
+        std::fprintf(stderr, "clx: coroutine stack overflow clobbered the memory below its stack; aborting\n");
+        std::abort();
+    }
+}
+
+//---------- destroy the unfinished body of a thread (garbage collected while suspended): resume it once with kill_requested so that its yield
+//---------- throws CoKill, which unwinds the body's frames and returns the worker to the pool
+static void wasm_co_kill(LThread *t) {
+    LState *L = t->state;
+    if (!t->ctx.worker || !L || !L->running_thread)
+        return;
+    LThread *prev = L->running_thread;
+    t->kill_requested = true;
+    t->caller = prev;
+    prev->status = THREAD_NORMAL;
+    t->status = THREAD_RUNNING;
+    root_stash(L, prev);
+    root_load(L, t);
+    L->running_thread = t;
+    wasm_co_switch(prev, t);   // returns once the body has unwound and the worker has handed itself back (fiber_entry_impl restores the roots)
+    t->kill_requested = false;
+}
+
+#endif
+
 //---------- coro_switch_to: the single site for the platform context switch (fiber end, resume
 //---------- and yield each had their own copy). Conditions preserved exactly: the two middle
 //---------- branches had identical bodies, so they are OR-ed, nothing else changes.
@@ -70,6 +194,8 @@ static inline void coro_switch_to(LThread *from, LThread *to) {
     SwitchToFiber(to->fiber);
 #elif ((defined(__APPLE__) || defined(__linux__)) && defined(__aarch64__)) || (defined(__linux__) && defined(__x86_64__))
     clx_coro_switch(&from->ctx, &to->ctx);
+#elif defined(__wasi__) && defined(CLX_WASM_STACK_SWITCHING)
+    wasm_co_switch(from, to);
 #elif defined(__wasi__) && defined(__wasi_cooperative_threads__)
     pthread_mutex_lock(&to->ctx.mu); to->ctx.go = true; pthread_cond_signal(&to->ctx.cv); pthread_mutex_unlock(&to->ctx.mu);
     pthread_mutex_lock(&from->ctx.mu);
@@ -96,6 +222,11 @@ static void fiber_entry_impl(LThread *t) {
 
             t->yield_args = call_function_rooted(L, t->function, args, argc, "coroutine", 0);
             t->status = THREAD_DEAD;
+#if defined(CLX_WASM_STACK_SWITCHING)
+        } catch (const CoKill &) {
+            t->yield_args = MultiValue();
+            t->status = THREAD_DEAD;
+#endif
         } catch (const LRuntimeException &e) {
 
             t->yield_args = MultiValue(e.error_obj);
@@ -120,6 +251,9 @@ static void fiber_entry_impl(LThread *t) {
     root_load(L, caller);
     L->running_thread = caller;
     caller->status = THREAD_RUNNING;
+#if defined(CLX_WASM_STACK_SWITCHING)
+    wasm_co_finish(t);
+#endif
 
     coro_switch_to(t, caller);
 }
@@ -158,6 +292,11 @@ LValue create_thread(LState *L, const LValue &func, double stack_size) {
     L->gc_maybe_collect();
 
     LThread *t = L->free_threads;
+#if defined(CLX_WASM_STACK_SWITCHING)
+    if (t && t->ctx.worker)
+        wasm_co_kill(t);   // an unreachable thread collected while suspended: unwind its body so its worker can be reused
+    t = L->free_threads;   // the unwinding can run a collection through a destructor; re-read the head
+#endif
     bool recycled = (t != nullptr);
     uint8_t prev_age_th = recycled ? t->age : AGE_YOUNG;
 #if defined(_WIN32)
@@ -220,6 +359,8 @@ LValue create_thread(LState *L, const LValue &func, double stack_size) {
         pthread_detach(t->ctx.th);
         t->ctx.has_thread = true;
     }
+#elif defined(__wasi__) && defined(CLX_WASM_STACK_SWITCHING)
+    (void)0;   // the worker is acquired at the first resume
 #elif defined(__wasi__)
     throw_runtime_error("coroutines are not available on this WebAssembly target (no stack switching)");
 #else
@@ -323,6 +464,10 @@ MultiValue yield(LState *L, const LValue *args, size_t count) {
 
     coro_switch_to(t, caller);
 
+#if defined(CLX_WASM_STACK_SWITCHING)
+    if (t->kill_requested)
+        throw CoKill{};
+#endif
     if (t->close_requested) {
         t->close_requested = false;
         t->has_error = true;
