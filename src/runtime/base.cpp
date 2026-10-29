@@ -212,6 +212,16 @@ MultiValue collectgarbage(LState *L, const LValue *args, size_t arg_count) {
         if (arg_count < 2)
             clx::error(L, bad_arg_msg(L, 2, "collectgarbage", "option expected").c_str());
         std::string_view param = clx::check_string(L, args[1]);
+        if (param == "youngkb") {
+            //------------------ the size of the young generation in KB (allocation between minor collections), pinned: the adaptive pacing leaves a pinned value alone
+            int64_t old_kb = static_cast<int64_t>(L->gc_minor_threshold / 1024);
+            if (arg_count >= 3) {
+                int64_t kb = std::clamp<int64_t>(clx::check_integer(L, args[2]), 1, 1 << 20);
+                L->gc_minor_threshold = static_cast<size_t>(kb) * 1024;
+                L->gc_minor_threshold_env = true;
+            }
+            return MultiValue(clx::integer(old_kb));
+        }
         int *target = nullptr;
         int old_val;
         if (param == "pause")
