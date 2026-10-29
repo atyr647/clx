@@ -81,6 +81,9 @@ bool vm_pcall_function_(LState *clx_L, int lua_ref, const LValue *args, size_t n
 
     lua_rawgeti(L, LUA_REGISTRYINDEX, lua_ref);
     int base = lua_gettop(L);
+    // whatever the call leaves above `base - 1` (results, or the error) is dropped on every path out: before this, each successful call left its results on the
+    // VM stack and about a million calls into an interpreted function ended in a Lua "stack overflow"
+    struct StackRestore { lua_State *L; int top; ~StackRestore() { lua_settop(L, top); } } restore{L, base - 1};
 
     for (size_t i = 0; i < nargs; ++i)
         clx_to_vm_value_(clx_L, L, args[i]);
