@@ -53,6 +53,38 @@ static MultiValue pkg_searcher_luafile_vm(LState *L, const LValue *args, size_t 
     return MultiValue(VMFunction::from_ref(L, ref));
 }
 
+//------------------ module_file_differs - true when a Lua file for the module exists on package.path and its hash differs from the one recorded when the
+//------------------ compiled version was built (register_module_hash)
+static bool module_file_differs(LState *L, const char *name, size_t len) {
+    LValue pkg = get_global(L, "package");
+    if (pkg.type != Table)
+        return false;
+    LTable *pack = static_cast<LTable *>(pkg.as_pointer());
+    LValue hashes = pack->gettable(LValue(L->intern_string("celori_hashes")));
+    if (hashes.type != Table)
+        return false;
+    LValue recorded = static_cast<LTable *>(hashes.as_pointer())->gettable(LValue(L->intern_string(name, len)));
+    if (recorded.type != ValueType::Int64)
+        return false;
+    LValue path = pack->gettable(LValue(L->intern_string("path", 4)));
+    if (path.type != String)
+        return false;
+#if defined(_WIN32)
+    const char dirsep = '\\';
+#else
+    const char dirsep = '/';
+#endif
+    std::string tried;
+    std::string filename = package_searchpath(L, name, len, path.as_string(), path.string_len(), '.', dirsep, &tried);
+    if (filename.empty())
+        return false;
+    std::ifstream in(filename, std::ios::binary);
+    if (!in)
+        return false;
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    return static_cast<int64_t>(source_hash(text.data(), text.size())) != recorded.as_integer();
+}
+
 //------------------ pkg_searcher_c - package.searchers[3]: C modules must be linked statically (see --modules)
 static MultiValue pkg_searcher_c(LState *L, const LValue *, size_t) {
     return MultiValue(LValue(),
@@ -198,6 +230,7 @@ extern "C" void clx_register_load_builtins(clx::LState *L) {
         if (searchers.type == Table) {
             LTable *searchers_tbl = static_cast<LTable *>(searchers.as_pointer());
             searchers_tbl->settable(LValue(static_cast<int64_t>(2)), L->create_closure(pkg_searcher_luafile_vm));
+            source_differs_hook = module_file_differs;
             searchers_tbl->settable(LValue(static_cast<int64_t>(3)), L->create_closure(pkg_searcher_c));
         }
     }
