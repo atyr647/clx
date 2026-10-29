@@ -1342,6 +1342,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
 
     std::vector<bool> tmp_is_native(v_count, false);
     std::vector<bool> tmp_is_integer(v_count, false);
+    std::vector<bool> tmp_has_flag(v_count, false);   // the flag and exact value of a double temporary were captured with it (before any target is assigned)
     std::vector<BoxedRhsGuard> bx_tmps;   // run-time-typed `#x` values evaluated once and boxed; they stay registered until the flags below are emitted
     if (v_count > 0) {
         out << "size_t _rg_base_" << node_idx << " = _fr.mark();\n";
@@ -1531,6 +1532,17 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                     }
                     emit_native(v_idx);
                     out << ";\n";
+                    if (!is_int_tmp) {
+                        //------------------ the integer flag and exact value are read now, with the temporary: after the targets are assigned, `a, b = b, a` would read the
+                        //------------------ new values
+                        std::string tf = int_flag_expr(v_idx, 1);
+                        if (tf != "false") {
+                            tmp_has_flag[i] = true;
+                            out << "bool _tmpf_" << node_idx << "_" << i << " = (" << tf << ");\n";
+                            out << "int64_t _tmpi_" << node_idx << "_" << i << " = _tmpf_" << node_idx << "_" << i << " ? (int64_t)("
+                                << int_value_expr(v_idx, 1) << ") : 0;\n";
+                        }
+                    }
                 } else {
                     out << "clx::LValue _tmp_" << node_idx << "_" << i << " = ";
                     emit_node(v_idx);
@@ -1667,6 +1679,10 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                     num_str = "_tmp_" + std::to_string(node_idx) + "_" + std::to_string(i);
                     if (tmp_is_integer[i]) {
                         val_str = "clx::LValue(static_cast<int64_t>(" + num_str + "))";
+                    } else if (tmp_has_flag[i]) {
+                        //------------------ a boxed target takes the temporary with its integer subtype (flag and exact value captured with it)
+                        std::string sfx = std::to_string(node_idx) + "_" + std::to_string(i);
+                        val_str = "(_tmpf_" + sfx + " ? clx::LValue(_tmpi_" + sfx + ") : clx::LValue(static_cast<double>(" + num_str + ")))";
                     } else {
                         val_str = "clx::LValue(static_cast<double>(" + num_str + "))";
                     }
@@ -1719,12 +1735,15 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                     if (sit->has_ii)
                                         out << "_ii_l_" << name << " = " << num_str << ";\n";
                                 } else {
-                                    //------------------ the temporary is a double, but the initializer may still be an integer (`local n, x = 0, nil`)
-                                    uint32_t fv = ctx.block_statements[first_v + i];
-                                    out << "_intf_l_" << name << " = (" << int_flag_expr(fv, 1) << ");\n";
-                                    if (sit->has_ii)
-                                        out << "_ii_l_" << name << " = _intf_l_" << name << " ? (int64_t)("
-                                            << int_value_expr(fv, 1) << ") : 0;\n";
+                                    if (tmp_has_flag[i]) {
+                                        out << "_intf_l_" << name << " = _tmpf_" << node_idx << "_" << i << ";\n";
+                                        if (sit->has_ii)
+                                            out << "_ii_l_" << name << " = _tmpi_" << node_idx << "_" << i << ";\n";
+                                    } else {
+                                        out << "_intf_l_" << name << " = false;\n";
+                                        if (sit->has_ii)
+                                            out << "_ii_l_" << name << " = 0;\n";
+                                    }
                                 }
                             } else if (last_is_call && i + 1 >= v_count) {
                                 std::string mi = std::to_string(i) + " - " + std::to_string(v_count - 1);
