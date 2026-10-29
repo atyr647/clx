@@ -28,8 +28,6 @@ LState::LState()
     , free_tables_big(nullptr)
     , free_functions(nullptr)
     , metatabled_ud(nullptr)
-    , current_file("")
-    , current_line(0)
     , object_count(0)
     , gc_bytes_threshold(2 * 1024 * 1024)
     , string_metatable(nullptr) {
@@ -164,7 +162,8 @@ void LState::invoke_gc_finalizer(LUserdata *ud, const char *tag) {
     LValue args[1] = { LValue(UserData, ud) };
     RootRange rr(this, args, 1);
     try {
-        call_function(this, gc_func, args, 1, tag, 0);
+        CallSite gc_site = { tag, 0, false, false };
+        call_function(this, gc_func, args, 1, &gc_site);
     } catch (const LRuntimeException &e) {
         std::cerr << "error in __gc metamethod: " << e.what() << "\n";
     } catch (std::exception &e) {
@@ -292,7 +291,8 @@ CloseGuard::~CloseGuard() {
 
     LValue args[2] = { val, LValue() };
     try {
-        call_function_rooted(L, close_func, args, 2, "CloseGuard", 0);
+        static constexpr CallSite close_site = { "CloseGuard", 0, false, false };
+        call_function_rooted(L, close_func, args, 2, &close_site);
     } catch (const LRuntimeException &e) {
         std::cerr << "error in __close metamethod: " << e.what() << "\n";
     } catch (std::exception &e) {
@@ -332,10 +332,6 @@ LValue LState::create_table(size_t asize, size_t hsize) {
     if (!*pool)
         pool = want_big ? &free_tables : &free_tables_big;
     bool recycled_tbl = (*pool != nullptr);
-    if (recycled_tbl)
-        g_alloc_census.table_recycled++;
-    else
-        g_alloc_census.table_new++;
     uint8_t prev_age_tbl = recycled_tbl ? (*pool)->age : AGE_YOUNG;
     if (*pool) {
         t = *pool;
@@ -421,10 +417,6 @@ clx::LValue clx::LState::create_closure(CFunctionType func, LTable *env, std::ve
 
     LCFunction *f;
     bool recycled_fn = (free_functions != nullptr);
-    if (recycled_fn)
-        g_alloc_census.closure_recycled++;
-    else
-        g_alloc_census.closure_new++;
     uint8_t prev_age_fn = recycled_fn ? free_functions->age : AGE_YOUNG;
     if (free_functions) {
         f = free_functions;
@@ -542,8 +534,6 @@ LState *open(int argc, char *argv[]) {
 
 //------------------ close — close Lua state
 void close(LState *L) {
-    if (std::getenv("CLX_ALLOC_STATS"))
-        dump_alloc_census();
     if (clx_current_L == L)
         clx_current_L = nullptr;
 #if defined(_WIN32)
