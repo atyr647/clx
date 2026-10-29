@@ -379,13 +379,9 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                     uint32_t v_idx = ctx.block_statements[first_v];
                     if (ctx.nodes[v_idx].type == NodeType::FunctionDef && !t_node.as.ident.is_global) {
                         if (state.reassigned_vars.count(name) == 0) {
-                            bool is_fast = false;
-                            if (state.native_return_funcs.count(name) && state.func_param_native.count(name)) {
-                                is_fast = true;
-                                for (bool p : state.func_param_native[name])
-                                    if (!p)
-                                        is_fast = false;
-                            }
+                            bool fast_body = state.fast_body_funcs.count(name) > 0;
+                            bool mixed = fast_body && state.slow_call_funcs.count(name) > 0;
+                            bool is_fast = fast_body && !mixed;
                             if (!is_fast && state.native_direct_funcs.count(name)) {
                                 emit_native_impl_def(name, v_idx);
                             }
@@ -395,25 +391,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                             }
 
                             if (is_fast) {
-                                out << "auto _fast_" << name << "_impl = ";
-                                state.emit_fast_lambda = true;
-                                state.in_fast_function = true;
-                                state.current_fast_func = name;
-                                emit_node(v_idx);
-                                state.emit_fast_lambda = false;
-                                state.in_fast_function = false;
-                                state.current_fast_func = "";
-                                out << ";\n";
-                                out << "#line " << ctx.nodes[v_idx].line << " \"" << ctx.filename << "\"\n";
-                                out << "auto _fast_" << name << " = [=](clx::FrameBase& _fr";
-                                for (uint32_t a = 0; a < state.func_param_counts[name]; ++a) {
-                                    out << ", double p" << a;
-                                }
-                                out << ") -> double { return _fast_" << name << "_impl(_fast_" << name << "_impl, _fr";
-                                for (uint32_t a = 0; a < state.func_param_counts[name]; ++a) {
-                                    out << ", p" << a;
-                                }
-                                out << "); };\n";
+                                emit_fast_variant(name, v_idx);
 
                                 out << "auto _impl_" << name
                                     << " = [=](clx::LState* L, const clx::LValue* args, size_t arg_count) -> "
@@ -463,6 +441,10 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                 locals.push_back({ name, false });
                                 state.fast_callables.insert(name);
                             } else {
+                                if (mixed) {
+                                    emit_fast_variant(name, v_idx);
+                                    state.fast_callables.insert(name);
+                                }
                                 out << "clx::LValue l_" << name << ";\n";
                                 out << "auto l_" << name << "_cell = std::make_shared<clx::LValue>();\n";
                                 out << "auto _impl_" << name
@@ -476,9 +458,13 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                 locals.push_back({ name, false });
                                 state.direct_callables.insert(name);
                                 out << "*_impl_" << name << " = ";
+                                uint32_t _prev_gbf = state.generic_body_func;
+                                if (mixed)
+                                    state.generic_body_func = v_idx;
                                 state.emit_raw_lambda = true;
                                 emit_node(v_idx);
                                 state.emit_raw_lambda = false;
+                                state.generic_body_func = _prev_gbf;
                                 state.raw_lambda_cell = saved_raw_cell;
                                 state.ref_capture.clear();
                                 out << ";\n";
@@ -732,13 +718,9 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                     uint32_t v_idx = ctx.block_statements[first_v];
                     if (ctx.nodes[v_idx].type == NodeType::FunctionDef) {
                         if (state.reassigned_vars.count(name) == 0) {
-                            bool is_fast = false;
-                            if (state.native_return_funcs.count(name) && state.func_param_native.count(name)) {
-                                is_fast = true;
-                                for (bool p : state.func_param_native[name])
-                                    if (!p)
-                                        is_fast = false;
-                            }
+                            bool fast_body = state.fast_body_funcs.count(name) > 0;
+                            bool mixed = fast_body && state.slow_call_funcs.count(name) > 0;
+                            bool is_fast = fast_body && !mixed;
                             if (!is_fast && state.native_direct_funcs.count(name)) {
                                 emit_native_impl_def(name, v_idx);
                             }
@@ -748,25 +730,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                             }
 
                             if (is_fast) {
-                                out << "auto _fast_" << name << "_impl = ";
-                                state.emit_fast_lambda = true;
-                                state.in_fast_function = true;
-                                state.current_fast_func = name;
-                                emit_node(v_idx);
-                                state.emit_fast_lambda = false;
-                                state.in_fast_function = false;
-                                state.current_fast_func = "";
-                                out << ";\n";
-                                out << "#line " << ctx.nodes[v_idx].line << " \"" << ctx.filename << "\"\n";
-                                out << "auto _fast_" << name << " = [=](clx::FrameBase& _fr";
-                                for (uint32_t a = 0; a < state.func_param_counts[name]; ++a) {
-                                    out << ", double p" << a;
-                                }
-                                out << ") -> double { return _fast_" << name << "_impl(_fast_" << name << "_impl, _fr";
-                                for (uint32_t a = 0; a < state.func_param_counts[name]; ++a) {
-                                    out << ", p" << a;
-                                }
-                                out << "); };\n";
+                                emit_fast_variant(name, v_idx);
 
                                 out << "auto _impl_" << name
                                     << " = [=](clx::LState* L, const clx::LValue* args, size_t arg_count) -> "
@@ -805,10 +769,18 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                 out << "};\n";
                                 state.fast_callables.insert(name);
                             } else {
+                                if (mixed) {
+                                    emit_fast_variant(name, v_idx);
+                                    state.fast_callables.insert(name);
+                                }
                                 out << "auto _impl_" << name << " = ";
+                                uint32_t _prev_gbf = state.generic_body_func;
+                                if (mixed)
+                                    state.generic_body_func = v_idx;
                                 state.emit_raw_lambda = true;
                                 emit_node(v_idx);
                                 state.emit_raw_lambda = false;
+                                state.generic_body_func = _prev_gbf;
                                 out << ";\n";
                             }
 
@@ -1315,13 +1287,9 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                     std::string_view fname(ctx.nodes[t_idx].as.ident.name, ctx.nodes[t_idx].as.ident.length);
 
                     if (state.reassigned_vars.count(fname) == 0) {
-                        bool is_fast = false;
-                        if (state.native_return_funcs.count(fname) && state.func_param_native.count(fname)) {
-                            is_fast = true;
-                            for (bool p : state.func_param_native[fname])
-                                if (!p)
-                                    is_fast = false;
-                        }
+                        bool fast_body = state.fast_body_funcs.count(fname) > 0;
+                        bool mixed = fast_body && state.slow_call_funcs.count(fname) > 0;
+                        bool is_fast = fast_body && !mixed;
                         if (!is_fast && state.native_direct_funcs.count(fname)) {
                             emit_native_impl_def(fname, v_idx);
                         }
@@ -1331,25 +1299,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                         }
 
                         if (is_fast) {
-                            out << "auto _fast_" << fname << "_impl = ";
-                            state.emit_fast_lambda = true;
-                            state.in_fast_function = true;
-                            state.current_fast_func = fname;
-                            emit_node(v_idx);
-                            state.emit_fast_lambda = false;
-                            state.in_fast_function = false;
-                            state.current_fast_func = "";
-                            out << ";\n";
-
-                            out << "auto _fast_" << fname << " = [=](clx::FrameBase& _fr";
-                            for (uint32_t a = 0; a < state.func_param_counts[fname]; ++a) {
-                                out << ", double p" << a;
-                            }
-                            out << ") -> double { return _fast_" << fname << "_impl(_fast_" << fname << "_impl, _fr";
-                            for (uint32_t a = 0; a < state.func_param_counts[fname]; ++a) {
-                                out << ", p" << a;
-                            }
-                            out << "); };\n";
+                            emit_fast_variant(fname, v_idx);
 
                             out << "auto _impl_" << fname
                                 << " = [=](clx::LState* L, const clx::LValue* args, size_t arg_count) -> "
@@ -1390,10 +1340,18 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                             out << "};\n";
                             state.fast_callables.insert(fname);
                         } else {
+                            if (mixed) {
+                                emit_fast_variant(fname, v_idx);
+                                state.fast_callables.insert(fname);
+                            }
                             out << "auto _impl_" << fname << " = ";
+                            uint32_t _prev_gbf = state.generic_body_func;
+                            if (mixed)
+                                state.generic_body_func = v_idx;
                             state.emit_raw_lambda = true;
                             emit_node(v_idx);
                             state.emit_raw_lambda = false;
+                            state.generic_body_func = _prev_gbf;
                             out << ";\n";
                         }
 

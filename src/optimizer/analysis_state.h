@@ -92,6 +92,20 @@ struct AnalysisState {
     std::set<std::string, std::less<>> numeric_builtin_aliases;
     std::map<std::string_view, uint32_t> func_param_counts;
     std::map<std::string_view, std::vector<bool>> func_param_native;
+    //------------------ func_param_body: snapshot of func_param_native before call-site argument
+    //------------------ proofs disqualify params; identifies functions whose bodies can use a fast variant.
+    std::map<std::string_view, std::vector<bool>> func_param_body;
+    //------------------ fast_body_funcs: functions eligible for a native-double fast variant.
+    std::set<std::string_view> fast_body_funcs;
+    //------------------ fast_call_sites: CallExpression nodes whose args are proven numeric, so a
+    //------------------ mixed function (fast variant + generic closure) can take the fast path here.
+    std::set<uint32_t> fast_call_sites;
+    //------------------ slow_call_funcs: fast-body functions with at least one unproven call site;
+    //------------------ they emit both the fast variant and a fully generic closure body.
+    std::set<std::string_view> slow_call_funcs;
+    //------------------ generic_body_func: FunctionDef whose body is currently emitted as the generic
+    //------------------ closure of a mixed function; params stay LValue and fast calls are suppressed.
+    uint32_t generic_body_func = 0xFFFFFFFF;
     std::set<std::string_view> reassigned_vars;
     std::set<std::string_view> assigned_targets;
     //------------------ nogc_locals: (owner scope, local name) proven to never hold a GC-managed

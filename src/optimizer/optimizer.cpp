@@ -165,6 +165,11 @@ void Optimizer::run(const ASTContext &ctx, uint32_t root_node) {
     state.native_return_funcs.clear();
     state.func_param_counts.clear();
     state.func_param_native.clear();
+    state.func_param_body.clear();
+    state.fast_body_funcs.clear();
+    state.fast_call_sites.clear();
+    state.slow_call_funcs.clear();
+    state.generic_body_func = 0xFFFFFFFF;
     state.multi_native_return_counts.clear();
     state.nogc_locals.clear();
     state.dead_stmts.clear();

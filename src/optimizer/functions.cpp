@@ -289,6 +289,8 @@ void pass_callables(const ASTContext &ctx, AnalysisState &state, PassScratch &sk
         }
     }
 
+    state.func_param_body = state.func_param_native;
+
     bool params_changed;
     do {
         params_changed = false;

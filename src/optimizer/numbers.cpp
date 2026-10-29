@@ -510,17 +510,34 @@ void pass_numeric_params(const ASTContext &ctx, AnalysisState &state, PassScratc
 
     int _np_debug_node_count = 0;
     state.param_numbers.clear();
-    std::map<std::string_view, std::map<uint32_t, uint32_t>> func_to_param_indices;
-    for (uint32_t ni = 0; ni < ctx.nodes.size(); ++ni) {
-        const auto &nd = ctx.nodes[ni];
-        if (nd.type != NodeType::FunctionDef)
+    std::map<std::string_view, uint32_t> func_name_node;
+    for (const auto &node : ctx.nodes) {
+        uint32_t first_t = 0, t_count = 0, first_v = 0, v_count = 0;
+        if (node.type == NodeType::LocalDecl) {
+            first_t = node.as.local_decl.first_ident;
+            t_count = node.as.local_decl.ident_count;
+            first_v = node.as.local_decl.first_value;
+            v_count = node.as.local_decl.value_count;
+        } else if (node.type == NodeType::Assignment) {
+            first_t = node.as.assign.first_target;
+            t_count = node.as.assign.target_count;
+            first_v = node.as.assign.first_value;
+            v_count = node.as.assign.value_count;
+        } else {
             continue;
-        _np_debug_node_count++;
-        for (size_t p = 0; p < nd.as.func_def.param_count; ++p) {
-            uint32_t pi = ctx.block_statements[nd.as.func_def.first_param + p];
-            if (pi < ctx.nodes.size() && ctx.nodes[pi].type == NodeType::Identifier)
-                func_to_param_indices[std::string_view(ctx.nodes[pi].as.ident.name, ctx.nodes[pi].as.ident.length)][ni]
-                    = (uint32_t)p;
+        }
+        uint32_t pair = std::min(t_count, v_count);
+        for (uint32_t i = 0; i < pair; ++i) {
+            uint32_t t = ctx.block_statements[first_t + i];
+            uint32_t v = ctx.block_statements[first_v + i];
+            if (t >= ctx.nodes.size() || v >= ctx.nodes.size())
+                continue;
+            if (ctx.nodes[t].type != NodeType::Identifier || ctx.nodes[t].as.ident.is_global
+                || ctx.nodes[v].type != NodeType::FunctionDef)
+                continue;
+            std::string_view fname(ctx.nodes[t].as.ident.name, ctx.nodes[t].as.ident.length);
+            if (!state.reassigned_vars.count(fname))
+                func_name_node[fname] = v;
         }
     }
     std::map<uint32_t, std::vector<std::string_view>> func_def_params;
@@ -628,13 +645,17 @@ void pass_numeric_params(const ASTContext &ctx, AnalysisState &state, PassScratc
                     }
                 }
                 if (nn.type == NodeType::CallExpression) {
+                    for (uint32_t ai = 0; ai < nn.as.call_expr.arg_count; ++ai)
+                        stack.push_back(ctx.block_statements[nn.as.call_expr.first_arg + ai]);
                     uint32_t tgt = nn.as.call_expr.target;
                     if (tgt < ctx.nodes.size() && ctx.nodes[tgt].type == NodeType::Identifier) {
                         std::string_view callee(ctx.nodes[tgt].as.ident.name, ctx.nodes[tgt].as.ident.length);
-                        auto cit = func_to_param_indices.find(callee);
-                        if (cit != func_to_param_indices.end()) {
-                            for (auto &[ci, start_idx] : cit->second) {
-                                auto &cparams = func_def_params[ci];
+                        auto cit = func_name_node.find(callee);
+                        if (cit != func_name_node.end()) {
+                            uint32_t ci = cit->second;
+                            auto cpit = func_def_params.find(ci);
+                            if (cpit != func_def_params.end()) {
+                                const auto &cparams = cpit->second;
                                 for (size_t ai = 0; ai < nn.as.call_expr.arg_count && ai < cparams.size(); ++ai) {
                                     uint32_t arg_nid = ctx.block_statements[nn.as.call_expr.first_arg + ai];
                                     if (arg_nid < ctx.nodes.size() && ctx.nodes[arg_nid].type == NodeType::Identifier) {
@@ -793,6 +814,69 @@ void pass_numeric_params(const ASTContext &ctx, AnalysisState &state, PassScratc
                     state.pure_numeric_func_params[sname].insert(fnd_idx);
                 }
             }
+        }
+    }
+
+    {
+        for (const auto &fdef : sk.func_defs) {
+            auto it = state.func_param_body.find(fdef.first);
+            if (it == state.func_param_body.end() || state.native_return_funcs.count(fdef.first) == 0)
+                continue;
+            bool all = true;
+            for (bool p : it->second) {
+                if (!p) {
+                    all = false;
+                    break;
+                }
+            }
+            if (all)
+                state.fast_body_funcs.insert(fdef.first);
+        }
+
+        for (uint32_t n_idx = 0; n_idx < ctx.nodes.size(); ++n_idx) {
+            const auto &node = ctx.nodes[n_idx];
+            if (node.type != NodeType::CallExpression)
+                continue;
+            uint32_t tgt = node.as.call_expr.target;
+            if (ctx.nodes[tgt].type != NodeType::Identifier || ctx.nodes[tgt].as.ident.is_global)
+                continue;
+            std::string_view fname(ctx.nodes[tgt].as.ident.name, ctx.nodes[tgt].as.ident.length);
+            if (state.fast_body_funcs.count(fname) == 0)
+                continue;
+
+            uint32_t owner_idx = 0xFFFFFFFF;
+            std::string_view owner = sk.call_to_func.count(n_idx) ? sk.call_to_func[n_idx] : std::string_view();
+            if (!owner.empty()) {
+                for (const auto &fd : sk.func_defs) {
+                    if (fd.first == owner) {
+                        owner_idx = fd.second;
+                        break;
+                    }
+                }
+            }
+            std::set<std::string_view> owner_params;
+            if (owner_idx != 0xFFFFFFFF) {
+                auto pit = state.param_numbers.find(owner_idx);
+                if (pit != state.param_numbers.end())
+                    owner_params.insert(pit->second.begin(), pit->second.end());
+            }
+            const std::set<std::string_view> *params = owner_idx != 0xFFFFFFFF ? &owner_params : nullptr;
+
+            bool ok = node.as.call_expr.arg_count >= state.func_param_counts[fname];
+            if (ok && owner_idx != 0xFFFFFFFF) {
+                const auto &ofn = ctx.nodes[owner_idx];
+                if (ofn.type == NodeType::FunctionDef && ofn.as.func_def.is_vararg)
+                    ok = false;
+            }
+            for (uint32_t a = 0; ok && a < node.as.call_expr.arg_count; ++a) {
+                uint32_t arg_idx = ctx.block_statements[node.as.call_expr.first_arg + a];
+                if (!yields_number(ctx, state, arg_idx, &known_numbers, owner, params))
+                    ok = false;
+            }
+            if (ok)
+                state.fast_call_sites.insert(n_idx);
+            else
+                state.slow_call_funcs.insert(fname);
         }
     }
 }
