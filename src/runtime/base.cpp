@@ -184,6 +184,16 @@ MultiValue collectgarbage(LState *L, const LValue *args, size_t arg_count) {
         bool finished = L->gc_step();
         return MultiValue(clx::boolean(finished));
     }
+    if (opt == "frame") {
+        //------------------ end-of-frame collection: collectgarbage("frame" [, ms]). Stops the automatic collector; each call does one young collection or advances a running major cycle for up to
+        //------------------ at most `ms` milliseconds (default 4; a cycle that needs less is spread over about 30 frames). Returns true while a major cycle is running.
+        if (arg_count >= 2 && args[1].type != Nil) {
+            double ms = clx::check_number(L, args[1]);
+            if (ms > 0)
+                L->gc_frame_ms = ms;
+        }
+        return MultiValue(clx::boolean(L->gc_frame(0)));
+    }
     if (opt == "startmajor") {
         //------------------ begins a major collection that runs in increments (collectgarbage("step") or allocation advances it); false when one is already running or the collector cannot start one now
         bool idle = L->gc_phase == LState::GCPhase::Idle && !L->gc_minor_active && !L->gc_draining;

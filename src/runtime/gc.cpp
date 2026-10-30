@@ -937,6 +937,7 @@ bool LState::gc_step() {
     gc_barrier_all = false;
     if (gc_bytes_at_sweep > allocated_bytes)
         gc_stats_major_freed += gc_bytes_at_sweep - allocated_bytes;
+    gc_last_cycle_us = gc_stats_major_us - gc_cycle_us0;
     gc_ud_set.clear();
     gc_ud_ready = false;
     gc_drain_finalizables(this);
@@ -1166,6 +1167,7 @@ void LState::gc_start_major() {
     for (FuncArena *ar = active_arenas; ar; ar = ar->next_active)
         for (LTable *at = ar->tables; at; at = static_cast<LTable *>(at->next))
             at->marked = 0;
+    gc_cycle_us0 = gc_stats_major_us;
     gc_phase = GCPhase::Marking;
 }
 
@@ -1443,6 +1445,47 @@ void LState::gc_trigger_major() {
     if (gc_mode == GCMode::Generational)
         gc_minor();
     gc_start_major();
+}
+
+//------------------ LState::gc_frame — the collection a program does at the end of each frame, instead of letting allocation trigger it. The first call stops the automatic
+//------------------ collector. Each call: when no major cycle is running, one young-generation collection (bounded by what one frame allocated) and, when the old generation has grown
+//------------------ by half over what the last cycle left (and passed the floor), the start of a cycle; when one is running, up to `budget_ms` of its marking or sweeping. Returns true
+//------------------ while a cycle is running. No minor collection runs during a cycle, so a long cycle lets the young generation grow (a bigger budget shortens the cycle).
+bool LState::gc_frame(double budget_ms) {
+    gc_frame_managed = true;
+    gc_running = false;
+    if (budget_ms <= 0)
+        budget_ms = gc_frame_ms;
+    if (gc_phase == GCPhase::Idle && !gc_draining && !gc_minor_active) {
+        if (gc_mode == GCMode::Generational) {
+            gc_minor();
+            if (gc_old_bytes >= gc_major_threshold)
+                gc_start_major();
+        } else if (allocated_bytes >= gc_bytes_threshold) {
+            gc_start_major();
+        }
+    }
+    if (gc_phase != GCPhase::Idle) {
+        //------------------ `budget_ms` (the argument, else gc_frame_ms) is the most a frame gives to the cycle. A cycle that needs little (a small heap) is spread over about kFrameCycleFrames frames instead, so
+        //------------------ that it does not stretch a frame by the whole budget: the estimate is what the last cycle took, or 0.5 ms per MB of heap before there has been one.
+        const double estimate_ms = gc_last_cycle_us ? static_cast<double>(gc_last_cycle_us) / 1000.0
+                                                     : static_cast<double>(allocated_bytes) / (1024.0 * 1024.0) * 0.5;
+        const double effective_ms = std::clamp(estimate_ms / kFrameCycleFrames, 0.25, budget_ms);
+        const uint64_t deadline = gc_now_us() + static_cast<uint64_t>(effective_ms * 1000.0);
+        do {
+            const uint64_t t0 = gc_now_us();
+            if (gc_phase == GCPhase::Marking) {
+                gc_mark_step(GC_STEP_BUDGET * 8);
+            } else {
+                gc_step();
+                const uint64_t dt = gc_now_us() - t0;
+                gc_stats_major_us += dt;
+                if (dt > gc_stats_step_max_us)
+                    gc_stats_step_max_us = dt;
+            }
+        } while (gc_phase != GCPhase::Idle && gc_now_us() < deadline);
+    }
+    return gc_phase != GCPhase::Idle;
 }
 
 //------------------ LState::collect_garbage — full mark-sweep collection (entry point)
