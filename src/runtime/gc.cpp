@@ -935,6 +935,8 @@ bool LState::gc_step() {
     }
     gc_draining = true;
     gc_barrier_all = false;
+    if (gc_bytes_at_sweep > allocated_bytes)
+        gc_stats_major_freed += gc_bytes_at_sweep - allocated_bytes;
     gc_ud_set.clear();
     gc_ud_ready = false;
     gc_drain_finalizables(this);
@@ -1370,6 +1372,7 @@ void LState::gc_atomic() {
 
 //------------------ gc_start_sweep: the sweep walks the young chain, then the old chain; survivors that are old by then are moved onto the old chain as they are passed
 void LState::gc_start_sweep() {
+    gc_bytes_at_sweep = allocated_bytes;
     gc_phase = GCPhase::Sweeping;
     gc_sweep_old = false;
     gc_sweep_cursor = allocated_objects;
@@ -1455,9 +1458,7 @@ void LState::collect_garbage() {
         gc_run_cycle_to_end();
     if (gc_mode == GCMode::Generational && !gc_draining && gc_phase == GCPhase::Idle)
         gc_minor();
-    size_t before = allocated_bytes;
     collect_garbage_full();
-    gc_stats_major_freed += (before > allocated_bytes) ? (before - allocated_bytes) : 0;
     if (gc_mode == GCMode::Generational)
         gc_major_pending = false;
 }

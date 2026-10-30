@@ -188,6 +188,7 @@ end
 do
     collectgarbage("collect")
     local base = collectgarbage("count")
+    local freed0 = stats().major_freed_kb
     do
         local head = build()
         collectgarbage("startmajor")
@@ -195,6 +196,7 @@ do
     end
     collectgarbage("collect")
     check(collectgarbage("count") < base + 256, "a dropped structure is freed", string.format("%.0f KB over the start", collectgarbage("count") - base))
+    check(stats().major_freed_kb >= freed0, "the statistics count what a cycle frees", string.format("%.0f -> %.0f KB", freed0, stats().major_freed_kb))
     check(collectgarbage("param", "incmajor") == 1, "incremental major collection is on by default")
     collectgarbage("param", "incmajor", 0)
     local c0 = stats().cycles

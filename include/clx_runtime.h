@@ -1837,6 +1837,7 @@ struct LState {
     int gc_verify = 0;                  //------------------ CLX_GC_VERIFY=1: before the sweep, check that everything reachable from the roots is marked
     size_t gc_stress_incr = 0;          //------------------ CLX_GC_STRESS_INCR=n: start a cycle every n allocations and give each allocation one object of marking work
     size_t gc_stress_count = 0;
+    size_t gc_bytes_at_sweep = 0;       //------------------ allocated_bytes when the sweep of the running cycle began; what the sweep took off is the cycle's gain
     size_t gc_stress_units = 1;         //------------------ CLX_GC_STRESS_UNITS=n: slots of marking per allocation in stress mode (default 1: the cycle crawls and the program races ahead of it)
     size_t gc_stats_cycles = 0;
     size_t gc_stats_steps = 0;
@@ -1846,7 +1847,7 @@ struct LState {
     //------------------ Shrinking the struct shifts every later heap allocation; that changed table
     //------------------ inline-cache cache-set aliasing and slowed nbody ~1.7x. The reserve keeps the
     //------------------ established allocation layout. Re-validate hot table benchmarks before resizing.
-    char _layout_reserve[56] = {};
+    char _layout_reserve[48] = {};
 };
 
 //------------------ RootRange — one GC-root frame. The constructor links it into the owning thread's chain, the
