@@ -98,6 +98,20 @@ LState::LState()
     if (const char *e = getenv("CLX_GC_MAX_KB")) { long long v = atoll(e); if (v > 0) gc_policy_max = size_t(v) * 1024; }
     if (const char *e = getenv("CLX_GC_GROW_PCT")) { long long v = atoll(e); if (v > 0) gc_policy_grow_pct = int(v); }
     if (const char *e = getenv("CLX_GC_SHRINK_PCT")) { long long v = atoll(e); if (v > 0) gc_policy_shrink_pct = int(v); }
+    if (const char *e = getenv("CLX_GC_INCREMENTAL"))
+        gc_incremental_major = atoi(e) != 0;
+    if (const char *e = getenv("CLX_GC_VERIFY"))
+        gc_verify = atoi(e);
+    if (const char *e = getenv("CLX_GC_STRESS_INCR")) {
+        long long v = atoll(e);
+        if (v > 0)
+            gc_stress_incr = size_t(v);
+    }
+    if (const char *e = getenv("CLX_GC_STRESS_UNITS")) {
+        long long v = atoll(e);
+        if (v > 0)
+            gc_stress_units = size_t(v);
+    }
     if (const char *e = getenv("CLX_GC_MAJOR_KB")) {
         long long v = atoll(e);
         if (v > 0)
@@ -192,6 +206,7 @@ LState::~LState() {
         clx_io_flush_all_ptr();
     if (luaapi_cleanup)
         luaapi_cleanup(this);
+    gc_abort_cycle();
     if (gc_phase == GCPhase::Sweeping) {
         while (gc_phase == GCPhase::Sweeping)
             gc_step();
@@ -475,6 +490,7 @@ LValue newuserdata(LState *L, size_t size) {
 
     ud->next = L->allocated_objects;
     L->allocated_objects = ud;
+    L->gc_has_userdata = true;
     L->gc_recent.push(ud);
     L->object_count++;
     L->allocated_bytes += sizeof(LUserdata) + size;

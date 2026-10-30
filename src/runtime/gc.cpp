@@ -255,7 +255,21 @@ void gc_barrier_header(LState *L, LHeader *owner, const LValue &newval) {
     if (!newval.is_gc_obj())
         return;
     LHeader *nv = static_cast<LHeader *>(newval.as_pointer());
-    if (!nv || nv->age == AGE_OLD)
+    if (!nv)
+        return;
+    if (L->gc_barrier_all && owner->marked != 0) {
+        //------------------ marking: an owner that is already marked (traced, or queued to be) must not hide a white object from the marking. An owner that is still white is traced
+        //------------------ later and sees the new value then.
+        if (L->gc_phase == LState::GCPhase::Marking)
+            L->gc_mark_gray(newval);
+        //------------------ sweeping: an owner the sweep has not reached yet (still marked) is promoted to the old generation when it does, and by then the object stored now is not
+        //------------------ old: the owner is remembered, which keeps it where it is (young or survivor) until a minor collection has seen what it holds
+        else if (L->gc_phase == LState::GCPhase::Sweeping && nv->age != AGE_OLD && owner->age != AGE_OLD) {
+            L->gc_remember(owner);
+            return;
+        }
+    }
+    if (nv->age == AGE_OLD)
         return;
     if (owner->age == AGE_OLD || owner->age == AGE_SURVIVOR)
         L->gc_remember(owner);
@@ -263,9 +277,11 @@ void gc_barrier_header(LState *L, LHeader *owner, const LValue &newval) {
 
 //------------------ gc_barrier_cell — upvalue cell write barrier
 void gc_barrier_cell(LState *L, const LUpValue &cell, const LValue &newval) {
-    (void)L;
     if (!newval.is_gc_obj())
         return;
+    //------------------ a cell has no mark of its own; the closures that share it may all be traced already
+    if (L->gc_phase == LState::GCPhase::Marking)
+        L->gc_mark_gray(newval);
     LHeader *nv = static_cast<LHeader *>(newval.as_pointer());
     if (!nv || nv->age == AGE_OLD)
         return;
@@ -290,13 +306,9 @@ static CLX_INLINE_HOT LHeader *gc_mark_value(LState *L, const LValue &v, uint8_t
         return nullptr;
     if (h->type != static_cast<uint8_t>(v.type))
         return nullptr;
-    if (v.type == ValueType::UserData) {
-
-        bool real = chain_contains(L->allocated_objects, h) || chain_contains(L->old_objects, h);
-        if (!real)
-            return nullptr;
-    }
     if (h->marked != 0)
+        return nullptr;
+    if (v.type == ValueType::UserData && !L->gc_userdata_known(h))
         return nullptr;
     h->marked = markval;
     return h;
@@ -815,34 +827,49 @@ void LState::gc_minor() {
         + ((int64_t)_gt1.tv_nsec - (int64_t)_gt0.tv_nsec) / 1000);
 }
 
-//------------------ LState::gc_step — incremental GC sweep step
+//------------------ now_us — monotonic microseconds, for the pause statistics
+static uint64_t gc_now_us() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000u + static_cast<uint64_t>(ts.tv_nsec) / 1000u;
+}
+
+//------------------ LState::gc_step — one increment of a major collection: marking while Marking, the sweep while Sweeping
 bool LState::gc_step() {
+    if (gc_phase == GCPhase::Marking) {
+        gc_mark_step(GC_STEP_BUDGET * 8);
+        return false;
+    }
     if (gc_phase != GCPhase::Sweeping)
         return true;
 
     size_t budget = GC_STEP_BUDGET;
     LHeader *curr = gc_sweep_cursor;
     LHeader *prev = gc_prev;
+    LHeader **head = gc_sweep_old ? &old_objects : &allocated_objects;
+
+    //------------------ take `c` out of the chain being swept; `prev` is its predecessor when it is known (the sweep may start behind objects allocated since)
+    auto unlink = [&](LHeader *c, LHeader *nx) {
+        if (prev) {
+            prev->next = nx;
+        } else if (c == *head) {
+            *head = nx;
+        } else {
+            LHeader *h = *head;
+            while (h && h->next != c)
+                h = h->next;
+            if (h) {
+                h->next = nx;
+                prev = h;
+            }
+        }
+    };
 
     while (curr && budget--) {
         LHeader *next_obj = curr->next;
 
         if (curr->marked == 0 && !(curr->flags & (LFLAG_REMEMBERED | LFLAG_GC_PIN))) {
-            if (prev) {
-                prev->next = next_obj;
-            } else {
-                if (curr != allocated_objects) {
-                    LHeader *h = allocated_objects;
-                    while (h && h->next != curr)
-                        h = h->next;
-                    if (h) {
-                        h->next = next_obj;
-                        prev = h;
-                    }
-                } else {
-                    allocated_objects = next_obj;
-                }
-            }
+            unlink(curr, next_obj);
             gc_dispose_swept(this, curr);
             curr = next_obj;
         } else {
@@ -872,7 +899,18 @@ bool LState::gc_step() {
             }
             curr->marked = 0;
             object_count++;
-            prev = curr;
+            if (!gc_sweep_old && curr->age == AGE_OLD) {
+                //------------------ an old object belongs on the old chain, which this sweep has not reached: park it on a side list that is joined to the old chain at the end
+                unlink(curr, next_obj);
+                curr->next = nullptr;
+                if (gc_promoted_tail)
+                    gc_promoted_tail->next = curr;
+                else
+                    gc_promoted_head = curr;
+                gc_promoted_tail = curr;
+            } else {
+                prev = curr;
+            }
             curr = next_obj;
         }
     }
@@ -880,234 +918,324 @@ bool LState::gc_step() {
     gc_sweep_cursor = curr;
     gc_prev = prev;
 
-    if (!gc_sweep_cursor) {
-        if (gc_draining)
-            return true;
-        gc_draining = true;
-        gc_drain_finalizables(this);
+    if (!gc_sweep_cursor && !gc_sweep_old) {
+        gc_sweep_old = true;
+        gc_sweep_cursor = old_objects;
         gc_prev = nullptr;
-        gc_phase = GCPhase::Idle;
-        overflow_heap_used = 0;
-
-        if (gc_mode == GCMode::Generational) {
-
-            gc_bytes_at_minor = allocated_bytes;
-        }
-
-        size_t live = allocated_bytes;
-        //------------------ Pacing: one collection is a synchronous mark+sweep of O(heap), so
-
-        size_t headroom = std::clamp(live / 2, size_t(1 * 1024 * 1024), size_t(256 * 1024 * 1024));
-        gc_bytes_threshold = live + headroom;
-        //------------------ the old set that survived this collection is live: the next major waits until it has grown by half, otherwise a live old set above the floor would re-trigger a full collection after every minor
-        if (gc_mode == GCMode::Generational)
-            gc_major_threshold = std::max(gc_major_floor, gc_old_bytes + gc_old_bytes / 2);
-        gc_draining = false;
-        return true;
     }
-    return false;
-}
+    if (gc_sweep_cursor)
+        return false;
 
-//------------------ LState::collect_garbage — full mark-sweep collection (entry point)
-
-void LState::collect_garbage() {
-    //------------------ re-entrancy guard: gc_minor() drains finalizables before dropping gc_minor_active,
-    //------------------ so a __gc that calls collectgarbage() must not start a full collection mid-drain.
-    if (gc_minor_active)
-        return;
-    ++gc_stats_collects;
-    if (gc_mode == GCMode::Generational && !gc_draining && gc_phase == GCPhase::Idle)
-        gc_minor();
-    size_t before = allocated_bytes;
-    struct timespec _M0, _M1;
-    clock_gettime(CLOCK_MONOTONIC, &_M0);
-    collect_garbage_full();
-    clock_gettime(CLOCK_MONOTONIC, &_M1);
-    gc_stats_major_us += static_cast<uint64_t>(((int64_t)_M1.tv_sec - (int64_t)_M0.tv_sec) * 1000000
-        + ((int64_t)_M1.tv_nsec - (int64_t)_M0.tv_nsec) / 1000);
-    gc_stats_major_freed += (before > allocated_bytes) ? (before - allocated_bytes) : 0;
-    if (gc_mode == GCMode::Generational)
-        gc_major_pending = false;
-}
-
-//------------------ LState::collect_garbage_full — mark-sweep collection
-void LState::collect_garbage_full() {
     if (gc_draining)
-        return;
-    //------------------ Reunite generations: gc_step sweeps a single chain, so splice old_objects
-    //------------------ back onto the young chain before marking (O(old) on a cold path). Partitioned
-    //------------------ again after the sweep below.
-    while (old_objects) {
-        LHeader *o = old_objects;
-        old_objects = o->next;
-        o->next = allocated_objects;
-        allocated_objects = o;
+        return true;
+    if (gc_promoted_head) {
+        gc_promoted_tail->next = old_objects;
+        old_objects = gc_promoted_head;
+        gc_promoted_head = gc_promoted_tail = nullptr;
     }
-    auto &wl = gc_worklist;
-    wl.clear();
+    gc_draining = true;
+    gc_barrier_all = false;
+    gc_ud_set.clear();
+    gc_ud_ready = false;
+    gc_drain_finalizables(this);
+    gc_prev = nullptr;
+    gc_sweep_old = false;
+    gc_phase = GCPhase::Idle;
+    overflow_heap_used = 0;
 
+    if (gc_mode == GCMode::Generational) {
+
+        gc_bytes_at_minor = allocated_bytes;
+    }
+
+    size_t live = allocated_bytes;
+    //------------------ Pacing: one collection is a synchronous mark+sweep of O(heap), so
+
+    size_t headroom = std::clamp(live / 2, size_t(1 * 1024 * 1024), size_t(256 * 1024 * 1024));
+    gc_bytes_threshold = live + headroom;
+    //------------------ the old set that survived this collection is live: the next major waits until it has grown by half, otherwise a live old set above the floor would re-trigger a full collection after every minor
+    if (gc_mode == GCMode::Generational)
+        gc_major_threshold = std::max(gc_major_floor, gc_old_bytes + gc_old_bytes / 2);
+    gc_draining = false;
+    return true;
+}
+
+//------------------ gc_children: calls visit(LValue) for each reference a table, thread, function or userdata holds, and returns the work it took (slots looked at)
+template <class F>
+static size_t gc_children(LHeader *curr, F &&visit) {
+    size_t work = 4;
+    if (curr->type == static_cast<uint8_t>(Table)) {
+        LTable *t = static_cast<LTable *>(curr);
+        {
+            const uint8_t *types_raw = reinterpret_cast<const uint8_t *>(t->array_types);
+            size_t i = 0;
+            work += t->array_size / 8;
+#if defined(CLX_HAS_AVX2)
+            const __m256i zero256 = _mm256_setzero_si256();
+            for (; i + 32 <= t->array_size; i += 32) {
+                __m256i types = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(types_raw + i));
+                __m256i cmp = _mm256_cmpeq_epi8(types, zero256);
+                uint32_t mask = ~_mm256_movemask_epi8(cmp);
+                while (mask) {
+                    int bit = clx_ctz(mask);
+                    visit(LValue(t->array[i + bit], t->array_types[i + bit]));
+                    ++work;
+                    mask &= mask - 1;
+                }
+            }
+            for (; i + 16 <= t->array_size; i += 16) {
+                __m128i types = _mm_loadu_si128(reinterpret_cast<const __m128i *>(types_raw + i));
+                __m128i cmp = _mm_cmpeq_epi8(types, _mm_setzero_si128());
+                uint32_t mask = static_cast<uint32_t>(~_mm_movemask_epi8(cmp)) & 0xFFFF;
+                while (mask) {
+                    int bit = clx_ctz(mask);
+                    visit(LValue(t->array[i + bit], t->array_types[i + bit]));
+                    ++work;
+                    mask &= mask - 1;
+                }
+            }
+#elif defined(CLX_HAS_SSE2)
+            const __m128i zero = _mm_setzero_si128();
+            for (; i + 16 <= t->array_size; i += 16) {
+                __m128i types = _mm_loadu_si128(reinterpret_cast<const __m128i *>(types_raw + i));
+                __m128i cmp = _mm_cmpeq_epi8(types, zero);
+                uint32_t mask = static_cast<uint32_t>(~_mm_movemask_epi8(cmp)) & 0xFFFF;
+                while (mask) {
+                    int bit = clx_ctz(mask);
+                    visit(LValue(t->array[i + bit], t->array_types[i + bit]));
+                    ++work;
+                    mask &= mask - 1;
+                }
+            }
+#elif defined(CLX_HAS_NEON)
+            const uint8x16_t zero = vdupq_n_u8(0);
+            for (; i + 16 <= t->array_size; i += 16) {
+                uint8x16_t types = vld1q_u8(types_raw + i);
+                uint8x16_t cmp = vceqq_u8(types, zero);
+                uint8_t lane_vals[16];
+                vst1q_u8(lane_vals, vmvnq_u8(cmp));
+                for (int k = 0; k < 16; ++k) {
+                    if (lane_vals[k]) {
+                        visit(LValue(t->array[i + k], t->array_types[i + k]));
+                        ++work;
+                    }
+                }
+            }
+#endif
+            for (; i < t->array_size; ++i) {
+                visit(LValue(t->array[i], t->array_types[i]));
+                ++work;
+            }
+        }
+        LTableExt *ex = t->ext;
+        if (ex) {
+            work += ex->hash_size / 4;
+            if (ex->hash_bitmap) {
+                size_t bm_words = (ex->hash_size + 63) / 64;
+                for (size_t word = 0; word < bm_words; ++word) {
+                    uint64_t bits = ex->hash_bitmap[word];
+                    while (bits) {
+                        size_t idx = word * 64 + clx_ctzll(bits);
+                        if (idx >= ex->hash_size)
+                            break;
+                        visit(LValue(ex->entries[idx].key, ex->entries[idx].ktype));
+                        visit(LValue(ex->entries[idx].val, ex->entries[idx].vtype));
+                        work += 2;
+                        bits &= bits - 1;
+                    }
+                }
+            } else {
+                for (size_t _i = 0; _i < ex->hash_size; ++_i) {
+                    if (ex->entries[_i].ktype == Nil)
+                        continue;
+                    visit(LValue(ex->entries[_i].key, ex->entries[_i].ktype));
+                    visit(LValue(ex->entries[_i].val, ex->entries[_i].vtype));
+                    work += 2;
+                }
+            }
+            if (ex->metatable)
+                visit(LValue(Table, ex->metatable));
+        }
+    } else if (curr->type == static_cast<uint8_t>(Thread)) {
+        LThread *th = static_cast<LThread *>(curr);
+        visit(th->function);
+        if (th->caller)
+            visit(LValue(Thread, th->caller));
+        for (size_t i = 0; i < th->yield_args.count; ++i)
+            visit(th->yield_args[i]);
+        for (size_t i = 0; i < th->resume_args.count; ++i)
+            visit(th->resume_args[i]);
+        gc_walk_roots(th->top_root, [&](const LValue &v) {
+            visit(v);
+            ++work;
+        });
+    } else if (curr->type == static_cast<uint8_t>(Function)) {
+        LCFunction *f = static_cast<LCFunction *>(curr);
+        if (f->env)
+            visit(LValue(Table, f->env));
+        for (const LUpValue &cell : f->gc_cells) {
+            if (cell)
+                visit(*cell);
+            ++work;
+        }
+    } else if (curr->type == static_cast<uint8_t>(UserData)) {
+        LUserdata *ud = static_cast<LUserdata *>(curr);
+        if (ud->metatable)
+            visit(LValue(Table, ud->metatable));
+    }
+    return work;
+}
+
+//------------------ gc_userdata_known: a UserData value is a heap object only if the heap says so (the Lua C API also makes light userdata out of plain pointers)
+bool LState::gc_userdata_known(const LHeader *h) const {
+    if (gc_ud_ready)
+        return gc_ud_set.count(h) != 0;
+    return is_allocated_userdata(h);
+}
+
+//------------------ gc_mark_gray: white -> marked and queued, for the roots, for the children of a traced object and for the write barrier
+void LState::gc_mark_gray(const LValue &v) {
+    if (!v.is_gc_obj())
+        return;
+    LHeader *h = v.as_pointer();
+    if (!h || h->marked != 0 || h->type != static_cast<uint8_t>(v.type))
+        return;
+    if (v.type == ValueType::UserData && !gc_userdata_known(h))
+        return;
+    h->marked = 1;
+    gc_worklist.push(h);
+}
+
+//------------------ gc_drain_recent: everything allocated since the last drain counts as reachable (it is new; nothing can have been traced through it yet)
+void LState::gc_drain_recent() {
+    for (size_t i = 0; i < gc_recent.top; ++i) {
+        LHeader *h = gc_recent.data[i];
+        if (h->marked != 0)
+            continue;
+        h->marked = 1;
+        uint8_t ty = h->type;
+        if (ty == static_cast<uint8_t>(Table) || ty == static_cast<uint8_t>(Thread) || ty == static_cast<uint8_t>(Function)
+            || ty == static_cast<uint8_t>(UserData))
+            gc_worklist.push(h);
+    }
+    gc_recent.clear();
+}
+
+void LState::gc_mark_roots() {
+    auto mark = [&](const LValue &v) { gc_mark_gray(v); };
+    if (_G)
+        mark(LValue(Table, _G));
+    if (main_thread)
+        mark(LValue(Thread, main_thread));
+    if (running_thread && running_thread != main_thread)
+        mark(LValue(Thread, running_thread));
+    gc_walk_roots(top_root, mark);
+    for (const LValue &r : permanent_roots)
+        mark(r);
+    gc_drain_recent();
+    if (clx_mark_vm_proxies_ptr)
+        clx_mark_vm_proxies_ptr(this, gc_worklist);
+}
+
+//------------------ gc_trace_major: marks what one queued object references; returns the work done
+static size_t gc_trace_major(LState *L, LHeader *curr) {
+    if (curr->flags & LFLAG_VM_PROXY)
+        return 1;
+    if (curr->type == static_cast<uint8_t>(Thread))
+        L->gc_marked_threads.push_back(static_cast<LThread *>(curr));
+    return gc_children(curr, [L](const LValue &v) { L->gc_mark_gray(v); });
+}
+
+//------------------ gc_start_major: begins a cycle. Nothing is paused; the work happens in gc_mark_step.
+void LState::gc_start_major() {
+    if (gc_phase != GCPhase::Idle || gc_draining || gc_minor_active)
+        return;
+    ++gc_stats_cycles;
+    gc_major_pending = false;
+    gc_worklist.clear();
+    gc_marked_threads.clear();
+    gc_ud_set.clear();
+    gc_ud_ready = false;
+    gc_scan_cursor = allocated_objects;
+    gc_scan_old = false;
+    gc_mark_stage = MarkStage::Scan;
+    gc_step_alloc_mark = allocated_bytes;
     //------------------ arena tables: reset stale marks (never cleared by sweep)
     for (FuncArena *ar = active_arenas; ar; ar = ar->next_active)
         for (LTable *at = ar->tables; at; at = static_cast<LTable *>(at->next))
             at->marked = 0;
+    gc_phase = GCPhase::Marking;
+}
 
-    auto mark_gc = [&](LValue v, uint8_t mark) -> LHeader * { return gc_mark_value(this, v, mark); };
-    auto push_if_needed = [&](LValue v) {
-        LHeader *h = mark_gc(v, 1);
-        if (!h)
-            return;
-        ValueType t = v.type;
-        if (t == Table || t == Thread || t == Function || t == UserData)
-            wl.push(h);
-    };
+//------------------ gc_mark_step: `units` of marking work. Returns true once marking is complete and the sweep has been set up.
+bool LState::gc_mark_step(size_t units) {
+    if (gc_phase != GCPhase::Marking)
+        return true;
+    const uint64_t t0 = gc_now_us();
+    size_t spent = 0;
+    bool done = false;
 
-    if (_G)
-        push_if_needed(LValue(Table, _G));
-    if (main_thread)
-        push_if_needed(LValue(Thread, main_thread));
-    if (running_thread && running_thread != main_thread)
-        push_if_needed(LValue(Thread, running_thread));
-    gc_walk_roots(top_root, push_if_needed);
-
-    for (const LValue &r : permanent_roots)
-        push_if_needed(r);
-
-    if (!gc_recent.empty()) {
-        for (size_t _ri = 0; _ri < gc_recent.top; ++_ri) {
-            LHeader *h = gc_recent.data[_ri];
-            if (h->marked != 0)
-                continue;
-            h->marked = 1;
-            uint8_t ty = h->type;
-            if (ty == static_cast<uint8_t>(Table) || ty == static_cast<uint8_t>(Thread)
-                || ty == static_cast<uint8_t>(Function) || ty == static_cast<uint8_t>(UserData))
-                wl.push(h);
+    if (gc_mark_stage == MarkStage::Scan) {
+        if (gc_has_userdata) {
+            LHeader *c = gc_scan_cursor;
+            for (;;) {
+                if (!c) {
+                    if (gc_scan_old)
+                        break;
+                    gc_scan_old = true;
+                    c = old_objects;
+                    continue;
+                }
+                if (spent >= units)
+                    break;
+                if (c->type == static_cast<uint8_t>(UserData))
+                    gc_ud_set.insert(c);
+                ++spent;
+                c = c->next;
+            }
+            gc_scan_cursor = c;
+            if (c)
+                goto out;
         }
-        gc_recent.clear();
+        gc_ud_ready = true;
+        gc_mark_stage = MarkStage::Roots;
     }
-
-    if (clx_mark_vm_proxies_ptr)
-        clx_mark_vm_proxies_ptr(this, wl);
-
-    while (!wl.empty()) {
-        LHeader *curr = wl.back();
-        wl.pop_back();
-
-        if (curr->flags & LFLAG_VM_PROXY) {
-            continue;
-        }
-
-        if (curr->type == static_cast<uint8_t>(Table)) {
-            LTable *t = static_cast<LTable *>(curr);
-            {
-                const uint8_t *types_raw = reinterpret_cast<const uint8_t *>(t->array_types);
-                size_t i = 0;
-#if defined(CLX_HAS_AVX2)
-                const __m256i zero256 = _mm256_setzero_si256();
-                for (; i + 32 <= t->array_size; i += 32) {
-                    __m256i types = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(types_raw + i));
-                    __m256i cmp = _mm256_cmpeq_epi8(types, zero256);
-                    uint32_t mask = ~_mm256_movemask_epi8(cmp);
-                    while (mask) {
-                        int bit = clx_ctz(mask);
-                        push_if_needed(LValue(t->array[i + bit], t->array_types[i + bit]));
-                        mask &= mask - 1;
-                    }
-                }
-                for (; i + 16 <= t->array_size; i += 16) {
-                    __m128i types = _mm_loadu_si128(reinterpret_cast<const __m128i *>(types_raw + i));
-                    __m128i cmp = _mm_cmpeq_epi8(types, _mm_setzero_si128());
-                    uint32_t mask = static_cast<uint32_t>(~_mm_movemask_epi8(cmp)) & 0xFFFF;
-                    while (mask) {
-                        int bit = clx_ctz(mask);
-                        push_if_needed(LValue(t->array[i + bit], t->array_types[i + bit]));
-                        mask &= mask - 1;
-                    }
-                }
-#elif defined(CLX_HAS_SSE2)
-                const __m128i zero = _mm_setzero_si128();
-                for (; i + 16 <= t->array_size; i += 16) {
-                    __m128i types = _mm_loadu_si128(reinterpret_cast<const __m128i *>(types_raw + i));
-                    __m128i cmp = _mm_cmpeq_epi8(types, zero);
-                    uint32_t mask = static_cast<uint32_t>(~_mm_movemask_epi8(cmp)) & 0xFFFF;
-                    while (mask) {
-                        int bit = clx_ctz(mask);
-                        push_if_needed(LValue(t->array[i + bit], t->array_types[i + bit]));
-                        mask &= mask - 1;
-                    }
-                }
-#elif defined(CLX_HAS_NEON)
-                const uint8x16_t zero = vdupq_n_u8(0);
-                for (; i + 16 <= t->array_size; i += 16) {
-                    uint8x16_t types = vld1q_u8(types_raw + i);
-                    uint8x16_t cmp = vceqq_u8(types, zero);
-                    uint8_t lane_vals[16];
-                    vst1q_u8(lane_vals, vmvnq_u8(cmp));
-                    for (int k = 0; k < 16; ++k) {
-                        if (lane_vals[k])
-                            push_if_needed(LValue(t->array[i + k], t->array_types[i + k]));
-                    }
-                }
-#endif
-                for (; i < t->array_size; ++i)
-                    push_if_needed(LValue(t->array[i], t->array_types[i]));
+    if (gc_mark_stage == MarkStage::Roots) {
+        gc_barrier_all = true;
+        gc_mark_roots();
+        gc_mark_stage = MarkStage::Propagate;
+    }
+    {
+        auto &wl = gc_worklist;
+        for (;;) {
+            gc_drain_recent();
+            while (!wl.empty() && spent < units) {
+                LHeader *c = wl.back();
+                wl.pop_back();
+                spent += gc_trace_major(this, c);
             }
-            LTableExt *ex = t->ext;
-            if (ex) {
-                if (ex->hash_bitmap) {
-                    size_t bm_words = (ex->hash_size + 63) / 64;
-                    for (size_t word = 0; word < bm_words; ++word) {
-                        uint64_t bits = ex->hash_bitmap[word];
-                        while (bits) {
-                            size_t idx = word * 64 + clx_ctzll(bits);
-                            if (idx >= ex->hash_size)
-                                break;
-                            LValue kv(ex->entries[idx].key, ex->entries[idx].ktype);
-                            push_if_needed(kv);
-                            push_if_needed(LValue(ex->entries[idx].val, ex->entries[idx].vtype));
-                            bits &= bits - 1;
-                        }
-                    }
-                } else {
-                    for (size_t _i = 0; _i < ex->hash_size; ++_i) {
-                        if (ex->entries[_i].ktype == Nil)
-                            continue;
-                        LValue kv(ex->entries[_i].key, ex->entries[_i].ktype);
-                        push_if_needed(kv);
-                        push_if_needed(LValue(ex->entries[_i].val, ex->entries[_i].vtype));
-                    }
-                }
-                if (ex->metatable && ex->metatable->marked == 0) {
-                    ex->metatable->marked = 1;
-                    wl.push(ex->metatable);
-                }
-            }
-        } else if (curr->type == static_cast<uint8_t>(Thread)) {
-            LThread *th = static_cast<LThread *>(curr);
-            push_if_needed(th->function);
-            if (th->caller)
-                push_if_needed(LValue(Thread, th->caller));
-            for (size_t i = 0; i < th->yield_args.count; ++i)
-                push_if_needed(th->yield_args[i]);
-            for (size_t i = 0; i < th->resume_args.count; ++i)
-                push_if_needed(th->resume_args[i]);
-            gc_walk_roots(th->top_root, push_if_needed);
-        } else if (curr->type == static_cast<uint8_t>(Function)) {
-            LCFunction *f = static_cast<LCFunction *>(curr);
-            if (f->env)
-                push_if_needed(LValue(Table, f->env));
-            for (const LUpValue &cell : f->gc_cells)
-                if (cell)
-                    push_if_needed(*cell);
-        } else if (curr->type == static_cast<uint8_t>(UserData)) {
-            LUserdata *ud = static_cast<LUserdata *>(curr);
-            if (ud->metatable && ud->metatable->marked == 0) {
-                ud->metatable->marked = 1;
-                wl.push(ud->metatable);
+            if (!wl.empty())
+                break;
+            if (gc_recent.empty()) {
+                if (spent >= units)
+                    break;
+                gc_atomic();
+                done = true;
+                break;
             }
         }
     }
+out:
+    const uint64_t dt = gc_now_us() - t0;
+    gc_stats_major_us += dt;
+    ++gc_stats_steps;
+    if (dt > gc_stats_step_max_us)
+        gc_stats_step_max_us = dt;
+    return done;
+}
 
+//------------------ gc_protect_finalizable_metatables: a dead object's finalizer still needs its metatable, and what that references. Marked 2 so the sweep keeps them this cycle.
+void LState::gc_protect_finalizable_metatables() {
     std::vector<LHeader *> protect_wl;
     for (LTable *obj = metatabled_tables; obj; obj = obj->ext->meta_next) {
         if (obj->marked == 0 && !(obj->flags & LFLAG_VM_PROXY)) {
@@ -1127,174 +1255,219 @@ void LState::collect_garbage_full() {
             }
         }
     }
+    auto visit = [&](const LValue &v) {
+        if (LHeader *h = gc_mark_value(this, v, 2))
+            protect_wl.push_back(h);
+    };
     while (!protect_wl.empty()) {
         LHeader *curr = protect_wl.back();
         protect_wl.pop_back();
-        if (curr->type == static_cast<uint8_t>(Table)) {
-            LTable *tt = static_cast<LTable *>(curr);
-            {
-                const uint8_t *types_raw = reinterpret_cast<const uint8_t *>(tt->array_types);
-                size_t i = 0;
-#if defined(CLX_HAS_AVX2)
-                const __m256i zero256 = _mm256_setzero_si256();
-                for (; i + 32 <= tt->array_size; i += 32) {
-                    __m256i types = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(types_raw + i));
-                    __m256i cmp = _mm256_cmpeq_epi8(types, zero256);
-                    uint32_t mask = ~_mm256_movemask_epi8(cmp);
-                    while (mask) {
-                        int bit = clx_ctz(mask);
-                        LValue v = LValue(tt->array[i + bit], tt->array_types[i + bit]);
-                        if (LHeader *h = mark_gc(v, 2))
-                            protect_wl.push_back(h);
-                        mask &= mask - 1;
-                    }
-                }
-                for (; i + 16 <= tt->array_size; i += 16) {
-                    __m128i types = _mm_loadu_si128(reinterpret_cast<const __m128i *>(types_raw + i));
-                    __m128i cmp = _mm_cmpeq_epi8(types, _mm_setzero_si128());
-                    uint32_t mask = static_cast<uint32_t>(~_mm_movemask_epi8(cmp)) & 0xFFFF;
-                    while (mask) {
-                        int bit = clx_ctz(mask);
-                        LValue v = LValue(tt->array[i + bit], tt->array_types[i + bit]);
-                        if (LHeader *h = mark_gc(v, 2))
-                            protect_wl.push_back(h);
-                        mask &= mask - 1;
-                    }
-                }
-#elif defined(CLX_HAS_SSE2)
-                const __m128i zero = _mm_setzero_si128();
-                for (; i + 16 <= tt->array_size; i += 16) {
-                    __m128i types = _mm_loadu_si128(reinterpret_cast<const __m128i *>(types_raw + i));
-                    __m128i cmp = _mm_cmpeq_epi8(types, zero);
-                    uint32_t mask = static_cast<uint32_t>(~_mm_movemask_epi8(cmp)) & 0xFFFF;
-                    while (mask) {
-                        int bit = clx_ctz(mask);
-                        LValue v = LValue(tt->array[i + bit], tt->array_types[i + bit]);
-                        if (LHeader *h = mark_gc(v, 2))
-                            protect_wl.push_back(h);
-                        mask &= mask - 1;
-                    }
-                }
-#elif defined(CLX_HAS_NEON)
-                const uint8x16_t zero = vdupq_n_u8(0);
-                for (; i + 16 <= tt->array_size; i += 16) {
-                    uint8x16_t types = vld1q_u8(types_raw + i);
-                    uint8x16_t cmp = vceqq_u8(types, zero);
-                    uint8_t lane_vals[16];
-                    vst1q_u8(lane_vals, vmvnq_u8(cmp));
-                    for (int k = 0; k < 16; ++k) {
-                        if (lane_vals[k]) {
-                            LValue v = LValue(tt->array[i + k], tt->array_types[i + k]);
-                            if (LHeader *h = mark_gc(v, 2))
-                                protect_wl.push_back(h);
-                        }
-                    }
-                }
-#endif
-                for (; i < tt->array_size; ++i) {
-                    LValue v = LValue(tt->array[i], tt->array_types[i]);
-                    if (LHeader *h = mark_gc(v, 2))
-                        protect_wl.push_back(h);
-                }
-            }
-            LTableExt *tt_ex = tt->ext;
-            if (tt_ex) {
-                if (tt_ex->hash_bitmap) {
-                    size_t bm_words = (tt_ex->hash_size + 63) / 64;
-                    for (size_t word = 0; word < bm_words; ++word) {
-                        uint64_t bits = tt_ex->hash_bitmap[word];
-                        while (bits) {
-                            size_t idx = word * 64 + clx_ctzll(bits);
-                            if (idx >= tt_ex->hash_size)
-                                break;
-                            LValue kv(tt_ex->entries[idx].key, tt_ex->entries[idx].ktype);
-                            for (LValue v : { kv, LValue(tt_ex->entries[idx].val, tt_ex->entries[idx].vtype) }) {
-                                if (LHeader *h = mark_gc(v, 2))
-                                    protect_wl.push_back(h);
-                            }
-                            bits &= bits - 1;
-                        }
-                    }
-                } else {
-                    for (size_t _pi = 0; _pi < tt_ex->hash_size; ++_pi) {
-                        if (tt_ex->entries[_pi].ktype == Nil)
-                            continue;
-                        LValue kv(tt_ex->entries[_pi].key, tt_ex->entries[_pi].ktype);
-                        for (LValue v : { kv, LValue(tt_ex->entries[_pi].val, tt_ex->entries[_pi].vtype) }) {
-                            if (LHeader *h = mark_gc(v, 2))
-                                protect_wl.push_back(h);
-                        }
-                    }
-                }
-            }
-        }
+        if (curr->type == static_cast<uint8_t>(Table))
+            gc_children(curr, visit);
     }
-    //------------------ A major marks from roots, so LFLAG_REMEMBERED no longer says anything about
-    //------------------ reachability. gc_step() never disposes a remembered object and minors skip AGE_OLD
-    //------------------ entirely, so a dead old table mutated by a write barrier would survive every
-    //------------------ collection. Drop the entries this mark proved dead *before* sweeping, so the sweep
-    //------------------ below can free them and gc_remembered holds no pointer to a soon-freed object.
+}
 
-    {
-        size_t w = 0;
-        for (size_t i = 0; i < gc_remembered.size(); ++i) {
-            LHeader *h = gc_remembered[i];
-            if (!h)
-                continue;
-            if (h->marked != 0)
-                gc_remembered[w++] = h;
-            else
-                h->flags &= ~LFLAG_REMEMBERED;
-        }
-        gc_remembered.resize(w);
-
-        size_t wc = 0;
-        for (size_t i = 0; i < gc_remembered_cells.size(); ++i) {
-            const LUpValue &cell = gc_remembered_cells[i];
-            bool live = false;
-            if (cell && cell->is_gc_obj()) {
-                LHeader *ch = static_cast<LHeader *>(cell->as_pointer());
-                live = ch && ch->type == static_cast<uint8_t>(cell->type) && ch->marked != 0;
-            }
-            if (live)
-                gc_remembered_cells[wc++] = cell;
-        }
-        gc_remembered_cells.resize(wc);
-        gc_remembered_cell_set.clear();
-        for (size_t i = 0; i < gc_remembered_cells.size(); ++i)
-            gc_remembered_cell_set.insert(gc_remembered_cells[i].get());
+//------------------ gc_prune_remembered: a major marks from the roots, so LFLAG_REMEMBERED no longer says anything about reachability.
+//------------------ gc_step() never disposes a remembered object and minors skip AGE_OLD entirely, so a dead old table mutated by a write barrier would survive every
+//------------------ collection. Drop the entries this mark proved dead *before* sweeping, so the sweep can free them and gc_remembered holds no pointer to a soon-freed object.
+void LState::gc_prune_remembered() {
+    size_t w = 0;
+    for (size_t i = 0; i < gc_remembered.size(); ++i) {
+        LHeader *h = gc_remembered[i];
+        if (!h)
+            continue;
+        if (h->marked != 0)
+            gc_remembered[w++] = h;
+        else
+            h->flags &= ~LFLAG_REMEMBERED;
     }
+    gc_remembered.resize(w);
 
+    size_t wc = 0;
+    for (size_t i = 0; i < gc_remembered_cells.size(); ++i) {
+        const LUpValue &cell = gc_remembered_cells[i];
+        bool live = false;
+        if (cell && cell->is_gc_obj()) {
+            LHeader *ch = static_cast<LHeader *>(cell->as_pointer());
+            live = ch && ch->type == static_cast<uint8_t>(cell->type) && ch->marked != 0;
+        }
+        if (live)
+            gc_remembered_cells[wc++] = cell;
+    }
+    gc_remembered_cells.resize(wc);
+    gc_remembered_cell_set.clear();
+    for (size_t i = 0; i < gc_remembered_cells.size(); ++i)
+        gc_remembered_cell_set.insert(gc_remembered_cells[i].get());
+}
+
+//------------------ gc_verify_marks (CLX_GC_VERIFY=1): at the end of the marking, everything reachable from the roots must be marked. A violation is a missing write barrier.
+void LState::gc_verify_marks() {
+    std::unordered_set<const LHeader *> seen;
+    std::vector<LHeader *> stack;
+    auto visit = [&](const LValue &v) {
+        if (!v.is_gc_obj())
+            return;
+        LHeader *h = v.as_pointer();
+        if (!h || h->type != static_cast<uint8_t>(v.type))
+            return;
+        if (v.type == ValueType::UserData && !gc_userdata_known(h))
+            return;
+        if (!seen.insert(h).second)
+            return;
+        if (h->marked == 0) {
+            std::fprintf(stderr, "clx: GC verify failed: a %s reachable from the roots is unmarked at the end of marking (missing write barrier)\n",
+                v.type == Table ? "table" : v.type == Function ? "function" : v.type == Thread ? "thread" : "userdata");
+            std::abort();
+        }
+        stack.push_back(h);
+    };
+    if (_G)
+        visit(LValue(Table, _G));
+    if (main_thread)
+        visit(LValue(Thread, main_thread));
+    if (running_thread && running_thread != main_thread)
+        visit(LValue(Thread, running_thread));
+    gc_walk_roots(top_root, visit);
+    for (const LValue &r : permanent_roots)
+        visit(r);
+    while (!stack.empty()) {
+        LHeader *h = stack.back();
+        stack.pop_back();
+        if (h->flags & LFLAG_VM_PROXY)
+            continue;
+        gc_children(h, visit);
+    }
+}
+
+//------------------ gc_atomic: the one pause of a cycle. The roots, the threads and the objects allocated during the marking are marked again, with the program stopped.
+void LState::gc_atomic() {
+    const uint64_t t0 = gc_now_us();
+    auto &wl = gc_worklist;
+    gc_mark_roots();
+    //------------------ a thread's stack is mutated without a barrier: look at every thread that was traced again
+    for (size_t i = 0; i < gc_marked_threads.size(); ++i)
+        gc_children(gc_marked_threads[i], [this](const LValue &v) { gc_mark_gray(v); });
+    for (;;) {
+        gc_drain_recent();
+        while (!wl.empty()) {
+            LHeader *c = wl.back();
+            wl.pop_back();
+            gc_trace_major(this, c);
+        }
+        if (gc_recent.empty())
+            break;
+    }
+    if (gc_verify)
+        gc_verify_marks();
+    gc_protect_finalizable_metatables();
+    gc_prune_remembered();
+    gc_marked_threads.clear();
+    gc_start_sweep();
+    const uint64_t dt = gc_now_us() - t0;
+    if (dt > gc_stats_atomic_max_us)
+        gc_stats_atomic_max_us = dt;
+}
+
+//------------------ gc_start_sweep: the sweep walks the young chain, then the old chain; survivors that are old by then are moved onto the old chain as they are passed
+void LState::gc_start_sweep() {
     gc_phase = GCPhase::Sweeping;
+    gc_sweep_old = false;
     gc_sweep_cursor = allocated_objects;
     gc_prev = nullptr;
+    gc_promoted_head = gc_promoted_tail = nullptr;
     gc_finalizable = nullptr;
     gc_finalizable_ud = nullptr;
     object_count = 0;
-    while (!gc_step())
-        ;
+}
 
-    //------------------ Re-partition: minors walk only allocated_objects, so move every AGE_OLD
-    //------------------ survivor back to old_objects. Single O(heap) pass on a cold path.
-    {
-        LHeader **link = &allocated_objects;
-        while (*link) {
-            LHeader *o = *link;
-            if (o->age == AGE_OLD) {
-                *link = o->next;
-                o->next = old_objects;
-                old_objects = o;
-            } else {
-                link = &o->next;
-            }
-        }
+//------------------ gc_run_cycle_to_end: finishes the cycle in progress without giving the program a turn
+void LState::gc_run_cycle_to_end() {
+    while (gc_phase == GCPhase::Marking)
+        gc_mark_step(~size_t(0));
+    const uint64_t t0 = gc_now_us();
+    while (gc_phase == GCPhase::Sweeping)
+        gc_step();
+    gc_stats_major_us += gc_now_us() - t0;
+}
+
+//------------------ gc_abort_cycle: the state is being destroyed; the marks left on objects do not matter any more
+void LState::gc_abort_cycle() {
+    if (gc_phase != GCPhase::Marking)
+        return;
+    gc_barrier_all = false;
+    gc_phase = GCPhase::Idle;
+    gc_worklist.clear();
+    gc_ud_set.clear();
+    gc_ud_ready = false;
+    gc_marked_threads.clear();
+}
+
+//------------------ gc_incremental_tick: called from the allocation hook while a cycle runs. The marking is paid for by what the program allocates.
+void LState::gc_incremental_tick() {
+    if (gc_phase == GCPhase::Sweeping) {
+        const uint64_t t0 = gc_now_us();
+        gc_step();
+        const uint64_t dt = gc_now_us() - t0;
+        gc_stats_major_us += dt;
+        if (dt > gc_stats_step_max_us)
+            gc_stats_step_max_us = dt;
+        return;
     }
-
-    //------------------ generational bookkeeping: the remembered set is NOT cleared here —
-
-    if (gc_mode == GCMode::Generational) {
-        gc_bytes_at_minor = allocated_bytes;
+    if (gc_stress_incr) {
+        gc_mark_step(gc_stress_units);
+        return;
     }
+    if (allocated_bytes < gc_step_alloc_mark)
+        gc_step_alloc_mark = allocated_bytes;
+    const size_t delta = allocated_bytes - gc_step_alloc_mark;
+    if (delta < kMarkStepBytes)
+        return;
+    gc_step_alloc_mark = allocated_bytes;
+    //------------------ one slot of marking per (800 / gc_stepmul) bytes allocated, never less than a slice that keeps the cycle moving
+    const size_t units = std::max(kMarkStepMinUnits, delta * static_cast<size_t>(gc_stepmul) / 800);
+    gc_mark_step(units);
+}
+
+//------------------ LState::gc_trigger_major — starts a major collection: incremental when enabled, else one pause
+void LState::gc_trigger_major() {
+    if (!gc_incremental_major) {
+        collect_garbage();
+        return;
+    }
+    if (gc_minor_active || gc_draining || gc_phase != GCPhase::Idle)
+        return;
+    ++gc_stats_collects;
+    if (gc_mode == GCMode::Generational)
+        gc_minor();
+    gc_start_major();
+}
+
+//------------------ LState::collect_garbage — full mark-sweep collection (entry point)
+
+void LState::collect_garbage() {
+    //------------------ re-entrancy guard: gc_minor() drains finalizables before dropping gc_minor_active,
+    //------------------ so a __gc that calls collectgarbage() must not start a full collection mid-drain.
+    if (gc_minor_active)
+        return;
+    ++gc_stats_collects;
+    //------------------ a cycle already in progress is finished first: what the program allocated meanwhile is not collected by it
+    if (gc_phase != GCPhase::Idle)
+        gc_run_cycle_to_end();
+    if (gc_mode == GCMode::Generational && !gc_draining && gc_phase == GCPhase::Idle)
+        gc_minor();
+    size_t before = allocated_bytes;
+    collect_garbage_full();
+    gc_stats_major_freed += (before > allocated_bytes) ? (before - allocated_bytes) : 0;
+    if (gc_mode == GCMode::Generational)
+        gc_major_pending = false;
+}
+
+//------------------ LState::collect_garbage_full — mark-sweep collection in one go: the incremental cycle, run without interruption
+void LState::collect_garbage_full() {
+    if (gc_draining || gc_phase != GCPhase::Idle)
+        return;
+    gc_start_major();
+    gc_run_cycle_to_end();
 }
 
 }

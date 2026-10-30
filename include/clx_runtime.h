@@ -950,14 +950,23 @@ CLX_INLINE T &&site_restore(State *L, Site enclosing, T &&value) {   // State is
 
 void gc_barrier_header(LState *L, LHeader *owner, const LValue &newval);
 
-CLX_INLINE_HOT void gc_barrier(LState *L, LHeader *owner, const LValue &newval) {
-    if (owner->age == AGE_YOUNG || !newval.is_gc_obj())
+//------------------ L is a template parameter so the member `gc_barrier_all` is looked up where the barrier is used (LState is only declared this early).
+//------------------ While a major collection is marking or sweeping, every pointer store goes to the slow path whatever the owner's age: while marking the owner may already be traced, while
+//------------------ sweeping it may be about to be promoted.
+template <class State>
+CLX_INLINE_HOT void gc_barrier(State *L, LHeader *owner, const LValue &newval) {
+    if (!newval.is_gc_obj())
+        return;
+    if (owner->age == AGE_YOUNG && !L->gc_barrier_all)
         return;
     gc_barrier_header(L, owner, newval);
 }
 
-CLX_INLINE_HOT void gc_barrier_table(LState *L, const LTable *owner, const LValue &newval) {
-    if (owner->age == AGE_YOUNG || !newval.is_gc_obj())
+template <class State>
+CLX_INLINE_HOT void gc_barrier_table(State *L, const LTable *owner, const LValue &newval) {
+    if (!newval.is_gc_obj())
+        return;
+    if (owner->age == AGE_YOUNG && !L->gc_barrier_all)
         return;
     gc_barrier_header(L, const_cast<LTable *>(owner), newval);
 }
@@ -965,8 +974,11 @@ CLX_INLINE_HOT void gc_barrier_table(LState *L, const LTable *owner, const LValu
 //------------------ Tag-based table barrier for sites that already hold a raw TValue/ValueType pair
 //------------------ (in-place array swap/store fast paths). Skips boxing the pair into a temporary
 //------------------ LValue; the box happens lazily inside the cold slow path only when it fires.
-CLX_INLINE_HOT void gc_barrier_table(LState *L, const LTable *owner, const TValue &v, ValueType t) {
-    if (owner->age == AGE_YOUNG || !is_gc_obj_tag(t))
+template <class State>
+CLX_INLINE_HOT void gc_barrier_table(State *L, const LTable *owner, const TValue &v, ValueType t) {
+    if (!is_gc_obj_tag(t))
+        return;
+    if (owner->age == AGE_YOUNG && !L->gc_barrier_all)
         return;
     gc_barrier_header(L, const_cast<LTable *>(owner), LValue(v, t));
 }
@@ -1639,9 +1651,10 @@ struct LState {
         }
     }
 
-    enum class GCPhase : uint8_t { Idle, Sweeping };
+    enum class GCPhase : uint8_t { Idle, Marking, Sweeping };
     enum class GCMode : uint8_t { Incremental, Generational };
     GCPhase gc_phase = GCPhase::Idle;
+    bool gc_barrier_all = false;   //------------------ true while a major cycle is marking or sweeping: every pointer store then takes the barrier's slow path, whatever the owner's age
     bool gc_minor_active = false;
     GCMode gc_mode = GCMode::Generational;
     LHeader *gc_sweep_cursor = nullptr;
@@ -1735,18 +1748,24 @@ struct LState {
         //------------------ collection while that minor's sweep state is still live.
         if (gc_minor_active)
             return;
-        if (gc_phase == GCPhase::Sweeping) {
-            gc_step();
+        if (gc_phase != GCPhase::Idle) {
+            gc_incremental_tick();
             return;
         }
+        if (gc_stress_incr)
+            gc_stress_count++;
         if (gc_mode == GCMode::Generational) {
             if (allocated_bytes - gc_bytes_at_minor >= gc_minor_threshold)
                 gc_minor();
             if (gc_mode == GCMode::Generational && gc_old_bytes >= gc_major_threshold
                 && allocated_bytes >= gc_bytes_threshold)
-                collect_garbage();
+                gc_trigger_major();
         } else if (allocated_bytes >= gc_bytes_threshold) {
-            collect_garbage();
+            gc_trigger_major();
+        }
+        if (gc_stress_incr && gc_stress_count >= gc_stress_incr && gc_phase == GCPhase::Idle && !gc_draining) {
+            gc_stress_count = 0;
+            gc_start_major();
         }
     }
 
@@ -1758,6 +1777,28 @@ struct LState {
     void collect_garbage();
     void collect_garbage_full();
     bool gc_step();
+
+    //------------------ Incremental major collection. A cycle is: scan (directory of the heap's userdata), roots, propagate (marking in increments while the program runs;
+    //------------------ the write barrier keeps the marking sound), atomic (roots, threads and the objects allocated meanwhile are marked again with the program stopped), then the
+    //------------------ sweep (gc_step, incremental as before). No minor collection runs during a cycle.
+    enum class MarkStage : uint8_t { Scan, Roots, Propagate };
+    void gc_start_major();
+    bool gc_mark_step(size_t units);
+    void gc_atomic();
+    void gc_start_sweep();
+    void gc_run_cycle_to_end();
+    void gc_abort_cycle();
+    void gc_mark_gray(const LValue &v);
+    bool gc_userdata_known(const LHeader *h) const;
+    void gc_mark_roots();
+    void gc_drain_recent();
+    void gc_protect_finalizable_metatables();
+    void gc_prune_remembered();
+    void gc_verify_marks();
+    void gc_incremental_tick();
+    void gc_trigger_major();
+    static constexpr size_t kMarkStepBytes = 4096;      //------------------ marking advances once per this many bytes allocated
+    static constexpr size_t kMarkStepMinUnits = 256;    //------------------ and by at least this many slots, so a cycle finishes even when the program allocates slowly
     void invoke_gc_finalizer(LUserdata *ud, const char *tag);
     bool is_allocated_userdata(const LHeader *h) const;
 
@@ -1780,11 +1821,32 @@ struct LState {
 
     void register_module(const std::string &name, LValue (*func)(LState *));
     void register_loaded_module(const std::string &name, const LValue &module);
+    //------------------ Incremental major collection state (declared last so the offsets of the older members stay where they were; the reserve below gives back the space)
+    bool gc_incremental_major = true;   //------------------ false: a major collection is one uninterrupted pause (CLX_GC_INCREMENTAL=0, collectgarbage("incmajor", false))
+    bool gc_has_userdata = false;       //------------------ a heap userdata was ever created (light userdata pointers are not heap objects and need the directory below)
+    MarkStage gc_mark_stage = MarkStage::Scan;
+    bool gc_ud_ready = false;
+    LHeader *gc_scan_cursor = nullptr;
+    bool gc_scan_old = false;
+    std::unordered_set<const LHeader *> gc_ud_set;
+    std::vector<LThread *> gc_marked_threads;
+    size_t gc_step_alloc_mark = 0;      //------------------ allocated_bytes at the last increment: the allocation since then is what pays for the next one
+    bool gc_sweep_old = false;          //------------------ the sweep covers the young chain first, then the old chain
+    LHeader *gc_promoted_head = nullptr;
+    LHeader *gc_promoted_tail = nullptr;
+    int gc_verify = 0;                  //------------------ CLX_GC_VERIFY=1: before the sweep, check that everything reachable from the roots is marked
+    size_t gc_stress_incr = 0;          //------------------ CLX_GC_STRESS_INCR=n: start a cycle every n allocations and give each allocation one object of marking work
+    size_t gc_stress_count = 0;
+    size_t gc_stress_units = 1;         //------------------ CLX_GC_STRESS_UNITS=n: slots of marking per allocation in stress mode (default 1: the cycle crawls and the program races ahead of it)
+    size_t gc_stats_cycles = 0;
+    size_t gc_stats_steps = 0;
+    uint64_t gc_stats_step_max_us = 0;      //------------------ longest single increment of a major cycle (marking, atomic or sweep), the pause a frame can see
+    uint64_t gc_stats_atomic_max_us = 0;    //------------------ longest atomic phase
     //------------------ _layout_reserve: holds sizeof(LState) at its pre-call-site-refactor footprint.
     //------------------ Shrinking the struct shifts every later heap allocation; that changed table
     //------------------ inline-cache cache-set aliasing and slowed nbody ~1.7x. The reserve keeps the
     //------------------ established allocation layout. Re-validate hot table benchmarks before resizing.
-    char _layout_reserve[256] = {};
+    char _layout_reserve[56] = {};
 };
 
 //------------------ RootRange — one GC-root frame. The constructor links it into the owning thread's chain, the
@@ -3460,13 +3522,11 @@ CLX_INLINE void table_fill_gap(LTable *t, size_t from, size_t to) {
 //------------------ Generational write barrier for stores into an LTable without an
 
 CLX_INLINE_HOT void gc_barrier_table(LTable *owner, const LValue &newval) {
-    if (owner->age == AGE_YOUNG || !newval.is_gc_obj())
+    if (!newval.is_gc_obj() || !clx_current_L)
         return;
-    LHeader *nv = static_cast<LHeader *>(newval.as_pointer());
-    if (!nv || nv->age == AGE_OLD)
+    if (owner->age == AGE_YOUNG && !clx_current_L->gc_barrier_all)
         return;
-    if (clx_current_L)
-        clx_current_L->gc_remember(static_cast<LHeader *>(owner));
+    gc_barrier_header(clx_current_L, static_cast<LHeader *>(owner), newval);
 }
 
 //------------------ Upvalue cell write barrier for LState-less hot paths.
@@ -3474,9 +3534,7 @@ CLX_INLINE_HOT void gc_barrier_table(LTable *owner, const LValue &newval) {
 CLX_INLINE_HOT void gc_barrier_cell(const LUpValue &cell, const LValue &newval) {
     if (!clx_current_L || !newval.is_gc_obj() || !cell)
         return;
-    LHeader *nv = static_cast<LHeader *>(newval.as_pointer());
-    if (nv && nv->age != AGE_OLD)
-        clx_current_L->gc_remember_cell(cell);
+    gc_barrier_cell(clx_current_L, cell, newval);
 }
 
 //------------------ Store into an upvalue cell + generational write barrier.
@@ -3491,6 +3549,9 @@ CLX_INLINE_HOT void upval_store(const LUpValue &cell, const LValue &v) {
 //------------------ remembered-set entry. Without this every such closure was a root of the next minor collection and was promoted even when dead.
 CLX_INLINE_HOT void upval_init(const LUpValue &cell, const LValue &v) {
     *cell = v;
+    //------------------ the exception above is the generational one; a marking collection may already have traced the closure that holds this cell
+    if (clx_current_L && clx_current_L->gc_barrier_all && v.is_gc_obj())
+        gc_barrier_cell(clx_current_L, cell, v);
 }
 
 //------------------ Table write with __newindex fallback

@@ -155,7 +155,7 @@ MultiValue collectgarbage(LState *L, const LValue *args, size_t arg_count) {
     }
     if (opt == "minor") {
         //------------------ one young-generation collection now (a program that stops the collector can run these at frame boundaries)
-        if (L->gc_mode == LState::GCMode::Generational && !L->gc_minor_active)
+        if (L->gc_mode == LState::GCMode::Generational && !L->gc_minor_active && L->gc_phase == LState::GCPhase::Idle)
             L->gc_minor();
         return MultiValue(clx::number(0.0));
     }
@@ -178,11 +178,20 @@ MultiValue collectgarbage(LState *L, const LValue *args, size_t arg_count) {
         int64_t step_size = (arg_count >= 2) ? clx::check_integer(L, args[1]) : 0;
         if (step_size > 0) {
             L->allocated_bytes += static_cast<size_t>(step_size);
-            if (L->allocated_bytes >= L->gc_bytes_threshold)
-                L->collect_garbage();
+            if (L->gc_phase == LState::GCPhase::Idle && L->allocated_bytes >= L->gc_bytes_threshold)
+                L->gc_trigger_major();
         }
         bool finished = L->gc_step();
         return MultiValue(clx::boolean(finished));
+    }
+    if (opt == "startmajor") {
+        //------------------ begins a major collection that runs in increments (collectgarbage("step") or allocation advances it); false when one is already running or the collector cannot start one now
+        bool idle = L->gc_phase == LState::GCPhase::Idle && !L->gc_minor_active && !L->gc_draining;
+        if (idle) {
+            L->gc_incremental_major = true;
+            L->gc_start_major();
+        }
+        return MultiValue(clx::boolean(idle));
     }
     if (opt == "incremental") {
         L->gc_mode = LState::GCMode::Incremental;
@@ -196,7 +205,7 @@ MultiValue collectgarbage(LState *L, const LValue *args, size_t arg_count) {
         return MultiValue(clx::string(L, L->gc_mode == LState::GCMode::Generational ? "generational" : "incremental"));
     }
     if (opt == "stats") {
-        LTable *st = static_cast<LTable *>(L->create_table(0, 12).as_pointer());
+        LTable *st = static_cast<LTable *>(L->create_table(0, 20).as_pointer());
         st->settable(LValue(L->intern_string("mode")),
             clx::string(L, L->gc_mode == LState::GCMode::Generational ? "generational" : "incremental"));
         st->settable(LValue(L->intern_string("collects")), LValue(static_cast<int64_t>(L->gc_stats_collects)));
@@ -207,6 +216,21 @@ MultiValue collectgarbage(LState *L, const LValue *args, size_t arg_count) {
             LValue(L->intern_string("major_freed_kb")), LValue(static_cast<double>(L->gc_stats_major_freed) / 1024.0));
         st->settable(LValue(L->intern_string("minor_ms")), LValue(static_cast<double>(L->gc_stats_minor_us) / 1000.0));
         st->settable(LValue(L->intern_string("major_ms")), LValue(static_cast<double>(L->gc_stats_major_us) / 1000.0));
+        {
+            //------------------ where a running major cycle is: 0 idle, 1 scanning the heap for userdata, 2 marking, 3 sweeping
+            int64_t ph = 0;
+            if (L->gc_phase == LState::GCPhase::Marking)
+                ph = L->gc_mark_stage == LState::MarkStage::Scan ? 1 : 2;
+            else if (L->gc_phase == LState::GCPhase::Sweeping)
+                ph = 3;
+            st->settable(LValue(L->intern_string("phase")), LValue(ph));
+        }
+        st->settable(LValue(L->intern_string("cycles")), LValue(static_cast<int64_t>(L->gc_stats_cycles)));
+        st->settable(LValue(L->intern_string("major_steps")), LValue(static_cast<int64_t>(L->gc_stats_steps)));
+        st->settable(
+            LValue(L->intern_string("major_step_max_ms")), LValue(static_cast<double>(L->gc_stats_step_max_us) / 1000.0));
+        st->settable(
+            LValue(L->intern_string("atomic_max_ms")), LValue(static_cast<double>(L->gc_stats_atomic_max_us) / 1000.0));
         st->settable(LValue(L->intern_string("old_kb")), LValue(static_cast<double>(L->gc_old_bytes) / 1024.0));
         st->settable(LValue(L->intern_string("minor_kb")), LValue(static_cast<double>(L->gc_minor_threshold) / 1024.0));
         st->settable(
@@ -238,6 +262,13 @@ MultiValue collectgarbage(LState *L, const LValue *args, size_t arg_count) {
                 if (v == 1 && !L->gc_minor_threshold_env)
                     L->gc_minor_threshold = L->gc_policy_min;
             }
+            return MultiValue(clx::integer(old_val));
+        }
+        if (param == "incmajor") {
+            //------------------ 1 (default): a major collection runs in increments between allocations; 0: one pause per major collection
+            int old_val = L->gc_incremental_major ? 1 : 0;
+            if (arg_count >= 3)
+                L->gc_incremental_major = clx::check_integer(L, args[2]) != 0;
             return MultiValue(clx::integer(old_val));
         }
         if (param == "majorkb") {

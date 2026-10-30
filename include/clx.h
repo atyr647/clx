@@ -524,7 +524,7 @@ CLX_INLINE void setmetatable(LState* L, const LValue& obj, const LValue& mt)
             }
         }
         tbl_set_metatable(t, new_mt);
-        if (new_mt && new_mt->age == AGE_YOUNG && t->age == AGE_OLD)
+        if (new_mt && ((new_mt->age == AGE_YOUNG && t->age == AGE_OLD) || L->gc_barrier_all))
             gc_barrier_header(L, t, mt);
         if (new_mt)
             meta_list_add(L, t);
@@ -533,7 +533,7 @@ CLX_INLINE void setmetatable(LState* L, const LValue& obj, const LValue& mt)
     } else if (obj.type == ValueType::UserData) {
         LUserdata* ud = static_cast<LUserdata*>(obj.as_pointer());
         ud->metatable = new_mt;
-        if (new_mt && new_mt->age == AGE_YOUNG && ud->age == AGE_OLD)
+        if (new_mt && ((new_mt->age == AGE_YOUNG && ud->age == AGE_OLD) || L->gc_barrier_all))
             gc_barrier_header(L, ud, mt);
         if (new_mt)
             meta_ud_list_add(L, ud);
