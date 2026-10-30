@@ -6,6 +6,7 @@
 // └─────────────────────────────────────────────┘
 
 #include "clx.h"
+#include "internal.h"
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -119,9 +120,15 @@ MultiValue os_execute(LState *L, const LValue *args, size_t count) {
 //------------------ os_exit: terminates the program with a status code
 MultiValue os_exit(LState *L, const LValue *args, size_t count) {
     int64_t code = 0;
-    if (count >= 1 && args[0].type != Nil) {
+    if (count >= 1 && args[0].type == ValueType::Boolean) {
+        code = args[0].as_bool() ? 0 : 1;   // os.exit(true) is EXIT_SUCCESS, os.exit(false) EXIT_FAILURE
+    } else if (count >= 1 && args[0].type != Nil) {
         code = check_integer(L, args[0]);
     }
+    //------------------ print/io.write batch their output per FILE*; std::exit does not know about those buffers, so everything written since the last flush was lost (a script that printed its
+    //------------------ result and then called os.exit(n) produced no output, to a pipe or a terminal alike)
+    if (clx_io_flush_all_ptr)
+        clx_io_flush_all_ptr();
     std::exit(static_cast<int>(code));
     return MultiValue();
 }

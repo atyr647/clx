@@ -933,6 +933,13 @@ CLX_INLINE_HOT size_t table_array_prefix_len(LTable *t) {
 //------------------ directly follow the 16-byte LHeader, so header + hot fields occupy the first 64-byte cache
 //------------------ line on the t[i] fast path. (No offsetof assert: LTable is non-standard-layout via LHeader.)
 
+//------------------ line_restore: puts the enclosing source line back after an operation that recorded its own (generated code for multi-line statements); forwards the value unchanged
+template <class T, class State>
+CLX_INLINE T &&line_restore(State *L, int enclosing, T &&value) {   // State is deduced so the member access is checked where it is used (LState is only declared this early)
+    L->current_line = enclosing;
+    return std::forward<T>(value);
+}
+
 //------------------ Generational write barrier
 
 void gc_barrier_header(LState *L, LHeader *owner, const LValue &newval);

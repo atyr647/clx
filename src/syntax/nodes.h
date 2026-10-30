@@ -102,8 +102,8 @@ enum class UnaryOp : int { Len = 1, Minus = 2, BNot = 3, Not = 4 };
 struct ASTNode {
     //------------------ type: discriminator for the active union variant
     NodeType type;
-    //------------------ line: source line number for error reporting
-    int line;
+    //------------------ line: source line number for error reporting (0 = unknown: nodes that never got one used to hold whatever memory they were created in)
+    int line = 0;
 
     union {
         //------------------ block: statement block with first statement index and count

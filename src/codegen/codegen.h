@@ -68,6 +68,8 @@ private:
     std::ofstream out;
     std::vector<LocalVar> locals;
     AnalysisState &state;
+    //------------------ emit_line: the source line L->current_line holds at this point of the emitted code (set per statement; a line-sensitive expression on another line of a multi-line statement sets it again)
+    int emit_line = 0;
 
     //------------------ is_local: checks if name is a local and sets out_is_boxed
     bool is_local(std::string_view name, bool &out_is_boxed);
@@ -113,6 +115,7 @@ private:
 
     //------------------ emit_node: dispatches to the emitXxx method matching node's type
     void emit_node(uint32_t node_idx);
+    void emit_node_unlined(const ASTNode &node, uint32_t node_idx);
 
     //------------------ emit_native: emits an expression coerced to a raw C++ double
     void emit_native(uint32_t n_idx);

@@ -509,8 +509,10 @@ void CodeEmitter::emitBlock(const ASTNode &node, uint32_t node_idx, DeferredBloc
         if (stmt.type == NodeType::CallExpression) {
             out << "#line " << stmt.line << " \"" << ctx.filename << "\"\n";
         }
-        if (stmt.line > 0)
+        if (stmt.line > 0) {
             out << "L->current_line = " << stmt.line << ";\n";
+            emit_line = static_cast<int>(stmt.line);
+        }
         //------------------ in a block with a goto, an assignment or call gets its own C++ scope: the temporaries it declares
         //------------------ (multiple assignment, argument buffers) must not lie between a goto and its label (C++ may not jump
         //------------------ over an initialisation); locals are hoisted instead (above)
@@ -675,6 +677,13 @@ void CodeEmitter::emit_multi_impl_def(std::string_view name, uint32_t v_idx, uin
 
 //------------------ emitFunctionDef: handles NodeType::FunctionDef
 void CodeEmitter::emitFunctionDef(const ASTNode &node, uint32_t node_idx) {
+    //------------------ the body's statements set their own lines when the function runs; the line in effect for the code around the definition is unchanged
+    struct EmitLineRestore {
+        int &ref;
+        int saved;
+        explicit EmitLineRestore(int &r) : ref(r), saved(r) { }
+        ~EmitLineRestore() { ref = saved; }
+    } emit_line_restore(emit_line);
     bool is_raw = state.emit_raw_lambda;
     bool is_fast = state.emit_fast_lambda;
     bool is_multi = state.emit_multi_impl;

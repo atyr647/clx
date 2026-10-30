@@ -770,6 +770,24 @@ void CodeEmitter::emit_node(uint32_t node_idx) {
         return;
     const ASTNode &node = ctx.nodes[node_idx];
 
+    //------------------ an operation that can raise an error on another line of a multi-line statement (a call, an index, an operator) records its own line while it runs, so the message names
+    //------------------ the line of the operation like Lua's does and not the line where the statement starts. The line is set before the operands are evaluated and put back to the enclosing
+    //------------------ one after the value exists, so an operand that sets its own line cannot leave the wrong one behind for the operation (C++ evaluates the pieces of an expression in no fixed
+    //------------------ order). Only emitted when the line differs from the one in effect.
+    if (node.line > 0 && static_cast<int>(node.line) != emit_line
+        && (node.type == NodeType::CallExpression || node.type == NodeType::TableAccess || node.type == NodeType::BinaryOp || node.type == NodeType::UnaryOp)) {
+        const int enclosing = emit_line;
+        emit_line = static_cast<int>(node.line);
+        out << "(L->current_line = " << node.line << ", clx::line_restore(L, " << enclosing << ", ";
+        emit_node_unlined(node, node_idx);
+        out << "))";
+        emit_line = enclosing;
+        return;
+    }
+    emit_node_unlined(node, node_idx);
+}
+
+void CodeEmitter::emit_node_unlined(const ASTNode &node, uint32_t node_idx) {
     switch (node.type) {
     case NodeType::IntrinsicCall:
         emitIntrinsicCall(node, node_idx);

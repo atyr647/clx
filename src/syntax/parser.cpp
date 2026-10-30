@@ -429,25 +429,30 @@ uint32_t Parser::parse_postfix_expression() {
                 expr = add_node(node);
             }
         } else if (current_token.type == TokenType::TokDot) {
+            const int access_line = current_token.line;
             advance();
             ASTNode key;
             key.type = NodeType::String;
+            key.line = current_token.line;
             key.as.string.text = current_token.text.data();
             key.as.string.length = current_token.text.length();
             uint32_t key_idx = add_node(key);
             advance();
             ASTNode node;
             node.type = NodeType::TableAccess;
+            node.line = access_line;
             node.as.table_access.table = expr;
             node.as.table_access.key = key_idx;
             expr = add_node(node);
         } else if (current_token.type == TokenType::TokLBracket) {
+            const int access_line = current_token.line;
             advance();
             uint32_t key_idx = parse_expression();
             if (current_token.type == TokenType::TokRBracket)
                 advance();
             ASTNode node;
             node.type = NodeType::TableAccess;
+            node.line = access_line;
             node.as.table_access.table = expr;
             node.as.table_access.key = key_idx;
             expr = add_node(node);
