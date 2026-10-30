@@ -7,6 +7,7 @@
 
 #ifndef SYNTAX_PARSER_H
 #define SYNTAX_PARSER_H
+#include <map>
 #include "lexer.h"
 #include "nodes.h"
 #include <string_view>
@@ -22,6 +23,13 @@ public:
     uint32_t parse();
 
 private:
+    //------------------ statement splitting: parse_statement may return one statement and queue more (local a, b = {}, {} becomes
+    //------------------ local a = {}; local b = {}); only the statement-list loops set split_ok_ and drain split_extra_
+    bool split_ok_ = false;
+    //------------------ local renaming (see add_symbol): declarations seen per name, and the alias of the last resolved symbol
+    std::map<std::string, int, std::less<>> decl_counts_;
+    std::string_view resolved_alias_;
+    std::vector<uint32_t> split_extra_;
     Lexer lexer;
     ASTContext &ctx;
     Token current_token;

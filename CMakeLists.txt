@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.15)
 project(clx VERSION 0.4.0 LANGUAGES C CXX ASM)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)   # costack.cpp (stackless coroutines) needs C++20
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -15,6 +15,15 @@ include(GNUInstallDirs)
 set(CLX_LTO_FLAG -flto=auto)
 if(MINGW)
     set(CLX_LTO_FLAG "")
+endif()
+# GCC miscompiles the runtime under LTO with identical code folding (seen with GCC 13.3, -Os and -O3): ICF merges functions whose
+# code is identical but whose types differ (std::deque iterator copy constructors over different element types), the merged
+# function keeps one type-based mod/ref summary, and stores through the other type are then treated as dead -- in luaapi.cpp a
+# std::vector built from a deque range read its size from uninitialised stack (tests/run.sh capi_mod: SIGSEGV or length_error).
+# -fno-ipa-icf (or -fno-ipa-modref, or -fno-tree-dse) avoids it; the flag must be given when compiling, it is recorded in the LTO
+# bytecode. The clx driver passes it for programs it builds with GCC (src/clx.cpp).
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CLX_LTO_FLAG)
+    add_compile_options(-fno-ipa-icf)
 endif()
 
 set(MI_BUILD_SHARED OFF CACHE INTERNAL "")
@@ -61,6 +70,7 @@ endif()
 # because LState::open() opens base + package on every state.
 set(RUNTIME_SOURCES
     src/runtime/threads.cpp
+    src/runtime/costack.cpp
     src/runtime/values.cpp
     src/runtime/tables.cpp
     src/runtime/state.cpp

@@ -7,6 +7,7 @@
 
 #include "clx.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -120,8 +121,18 @@ static MultiValue pkg_searcher_preload(LState *L, const LValue *args, size_t cou
     LValue preload = get_package_field(L, "preload", 7);
     if (preload.type == Table) {
         LValue loader = static_cast<LTable *>(preload.as_pointer())->gettable(name);
-        if (loader.type == Function)
+        if (loader.type == Function) {
+            static const bool log_tiers = std::getenv("CLX_LOG_REQUIRE") != nullptr;   // CLX_LOG_REQUIRE=1: say which version of a module require picked
+            if (source_differs_hook && source_differs_hook(L, args[0].as_string(), args[0].string_len())) {   // a newer file wins over the compiled module
+                if (log_tiers)
+                    std::fprintf(stderr, "clx: require '%.*s': file differs from the compiled module, loading the file\n", (int)args[0].string_len(), args[0].as_string());
+                std::string stale = "\n\tcompiled module '" + std::string(args[0].as_string(), args[0].string_len()) + "' is older than its file";
+                return MultiValue(LValue(), LValue(L->intern_string(stale.data(), stale.size())));
+            }
+            if (log_tiers)
+                std::fprintf(stderr, "clx: require '%.*s': compiled module\n", (int)args[0].string_len(), args[0].as_string());
             return MultiValue(loader);
+        }
     }
     std::string msg = "\n\tno field package.preload['";
     msg.append(args[0].as_string(), args[0].string_len());
@@ -262,6 +273,23 @@ void luastd_package(LState *L) {
     set_global(L, "require", require_func);
 
     static_cast<LTable *>(loaded_tbl.as_pointer())->settable(LValue(L->intern_string("package")), pack_tbl);
+}
+
+bool (*source_differs_hook)(LState *L, const char *name, size_t len) = nullptr;
+
+//------------------ register_module_hash: records the hash of the source a compiled module was built from (package.clx_hashes)
+void register_module_hash(LState *L, const char *name, uint64_t hash) {
+    LValue pack_val = get_global(L, "package");
+    if (pack_val.type != Table)
+        return;
+    LTable *pack = static_cast<LTable *>(pack_val.as_pointer());
+    LValue key = LValue(L->intern_string("clx_hashes"));
+    LValue tbl = pack->gettable(key);
+    if (tbl.type != Table) {
+        tbl = L->create_table();
+        pack->settable(key, tbl);
+    }
+    static_cast<LTable *>(tbl.as_pointer())->settable(LValue(L->intern_string(name)), LValue(static_cast<int64_t>(hash)));
 }
 
 //------------------ register_static_preload: registers a static preload loader for a module

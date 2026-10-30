@@ -368,8 +368,7 @@ void CodeEmitter::emitBlock(const ASTNode &node, uint32_t node_idx, DeferredBloc
     bool has_goto = false;
     for (uint32_t i = 0; i < node.as.block.count; ++i) {
         uint32_t stmt_idx = ctx.block_statements[node.as.block.first_statement + i];
-        auto t = ctx.nodes[stmt_idx].type;
-        if (t == NodeType::GotoStatement) {
+        if (contains_goto(ctx, stmt_idx)) {
             has_goto = true;
             break;
         }
@@ -379,7 +378,7 @@ void CodeEmitter::emitBlock(const ASTNode &node, uint32_t node_idx, DeferredBloc
         for (uint32_t i = 0; i < node.as.block.count; ++i) {
             uint32_t stmt_idx = ctx.block_statements[node.as.block.first_statement + i];
             const auto &st = ctx.nodes[stmt_idx];
-            if (st.type == NodeType::GotoStatement)
+            if (contains_goto(ctx, stmt_idx))
                 after_goto = true;
             if (st.type == NodeType::LabelStatement)
                 after_goto = false;
@@ -505,7 +504,15 @@ void CodeEmitter::emitBlock(const ASTNode &node, uint32_t node_idx, DeferredBloc
         if (stmt.line > 0 && !state.in_fast_function) {
             std::string _ssite = emit_call_site(stmt.line, false, false);
             out << "L->current_site = " << _ssite << ";\n";
+            emit_line = static_cast<int>(stmt.line);
+            emit_site = _ssite;
         }
+        //------------------ in a block with a goto, an assignment or call gets its own C++ scope: the temporaries it declares
+        //------------------ (multiple assignment, argument buffers) must not lie between a goto and its label (C++ may not jump
+        //------------------ over an initialisation); locals are hoisted instead (above)
+        bool own_scope = has_goto && (stmt.type == NodeType::Assignment || stmt.type == NodeType::CallExpression);
+        if (own_scope)
+            out << "{\n";
         emit_node(stmt_idx);
         if (stmt.type != NodeType::Block && stmt.type != NodeType::Assignment
             && stmt.type != NodeType::GlobalDeclStatement && stmt.type != NodeType::LocalDecl
@@ -516,6 +523,8 @@ void CodeEmitter::emitBlock(const ASTNode &node, uint32_t node_idx, DeferredBloc
             && stmt.type != NodeType::LabelStatement && stmt.type != NodeType::DoStatement) {
             out << ";\n";
         }
+        if (own_scope)
+            out << "}\n";
     }
 
     if (def) {
@@ -690,6 +699,21 @@ void CodeEmitter::emit_multi_impl_def(std::string_view name, uint32_t v_idx, uin
 
 //------------------ emitFunctionDef: handles NodeType::FunctionDef
 void CodeEmitter::emitFunctionDef(const ASTNode &node, uint32_t node_idx) {
+    //------------------ the body's statements set their own call sites when the function runs; the site in effect for the code around the definition is unchanged, and the body starts with none
+    struct EmitSiteRestore {
+        int &line_ref;
+        std::string &site_ref;
+        int saved_line;
+        std::string saved_site;
+        EmitSiteRestore(int &l, std::string &s) : line_ref(l), site_ref(s), saved_line(l), saved_site(s) {
+            line_ref = 0;
+            site_ref.clear();
+        }
+        ~EmitSiteRestore() {
+            line_ref = saved_line;
+            site_ref = saved_site;
+        }
+    } emit_site_restore(emit_line, emit_site);
     bool is_raw = state.emit_raw_lambda;
     bool is_fast = state.emit_fast_lambda;
     bool is_multi = state.emit_multi_impl;
@@ -974,7 +998,7 @@ void CodeEmitter::emitFunctionDef(const ASTNode &node, uint32_t node_idx) {
                 out << "_fr.push(*l_" << cpp_name << ");\n";
             }
         } else if (is_native) {
-            out << "double l_" << cpp_name << " = (" << i << " < arg_count) ? args[" << i << "].as_number() : 0.0;\n";
+            out << "double l_" << cpp_name << " = clx::coerce_number(L, (" << i << " < arg_count) ? args[" << i << "] : clx::LValue());\n";
             out << "bool _intf_l_" << cpp_name << " = (" << i << " < arg_count) && args[" << i
                 << "].type == clx::ValueType::Int64;\n";
             out << "int64_t _ii_l_" << cpp_name << " = (" << i << " < arg_count) ? args[" << i
@@ -1256,7 +1280,7 @@ void CodeEmitter::emitReturnStatement(const ASTNode &node, uint32_t node_idx) {
 
         if (last_expands) {
             out << "    size_t _ssave_dyn = _fr.mark();\n";
-            out << "    clx::LValue _dyn_buf[16];\n    size_t _dyn_count = 0;\n";
+            out << "    clx::DynArgs _dyn_buf(" << call_node.as.call_expr.arg_count << ");\n    size_t _dyn_count = 0;\n";
             for (uint32_t a = 0; a < call_node.as.call_expr.arg_count - 1; ++a) {
                 if (a > 0)
                     out << "    _fr.push(_dyn_buf[" << (a - 1) << "]);\n";
@@ -1269,6 +1293,7 @@ void CodeEmitter::emitReturnStatement(const ASTNode &node, uint32_t node_idx) {
             emit_node(last_arg);
             out << ";\n";
             state.expect_multivalue = false;
+            out << "    _dyn_buf.reserve(_dyn_count + _mret.count);\n";
             out << "    for (size_t _mi = 0; _mi < _mret.count; ++_mi) _dyn_buf[_dyn_count++] = _mret[_mi];\n";
             if (is_direct) {
                 if (state.in_function_def) {

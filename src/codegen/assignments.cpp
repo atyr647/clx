@@ -200,10 +200,11 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
         if (is_local) {
             bool init_is_int_single = v_count == 0
                 || clx::is_purely_integer_expr(ctx, state, ctx.block_statements[first_v]);
-            if (!init_is_int_single)
+            //------------------ a hoisted local (declared after a goto) was declared as a double with integer flags: it keeps that form
+            if (!init_is_int_single || state.hoisted_locals.count(single_name))
                 state.native_integers.erase(std::string(single_name));
             bool is_int_single = init_is_int_single && state.native_integers.count(single_name) > 0;
-            if (!is_int_single && v_count > 0) {
+            if (!is_int_single && v_count > 0 && !state.hoisted_locals.count(single_name)) {
                 uint32_t v_idx_single = ctx.block_statements[first_v];
                 bool redecl_of_native = false;
                 for (auto it = locals.rbegin(); it != locals.rend(); ++it) {
@@ -228,6 +229,10 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
             }
             bool use_rhs_tmp = is_shadow_decl && (v_count > 0)
                 && yields_number(ctx, state, ctx.block_statements[first_v], nullptr, state.current_fast_func);
+            //------------------ a double-tracked variable initialised from an expression with a run-time-typed `#x`: evaluate it once, boxed (box_rhs_if_dynamic_len)
+            BoxedRhsGuard bx_decl;
+            if (v_count > 0 && !is_int_single)
+                bx_decl = box_rhs_if_dynamic_len(ctx.block_statements[first_v]);
             std::string rhs_flag_text;
             if (v_count > 0)
                 rhs_flag_text = int_flag_expr(ctx.block_statements[first_v], 1);
@@ -308,7 +313,13 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                             bool r_self = is_self(rgt);
                             bool l_native = yields_number(ctx, state, lft, nullptr, state.current_fast_func);
                             bool r_native = yields_number(ctx, state, rgt, nullptr, state.current_fast_func);
-                            if ((l_self && !r_native) || (r_self && !l_native)) {
+                            //------------------ `#x` counts as non-native here: its subtype is integer unless a __len metamethod says otherwise, and it
+                            //------------------ has to be evaluated exactly once, which the boxed path below does and the flag/value expressions would not
+                            auto is_len = [&](uint32_t e) {
+                                return ctx.nodes[e].type == NodeType::UnaryOp
+                                    && ctx.nodes[e].as.unary_op.op == static_cast<int>(UnaryOp::Len);
+                            };
+                            if ((l_self && (!r_native || is_len(rgt))) || (r_self && (!l_native || is_len(lft)))) {
                                 for (auto it = locals.rbegin(); it != locals.rend(); ++it) {
                                     if (it->name == single_name && it->has_intf) {
                                         uint32_t other = l_self ? rgt : lft;
@@ -336,6 +347,16 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                     }
                 }
                 if (!handled_compound) {
+                    BoxedRhsGuard bx_asg;
+                    if (is_loc && v_count > 0) {
+                        for (auto it = locals.rbegin(); it != locals.rend(); ++it) {
+                            if (it->name == single_name) {
+                                if (it->has_intf)
+                                    bx_asg = box_rhs_if_dynamic_len(ctx.block_statements[first_v]);
+                                break;
+                            }
+                        }
+                    }
                     out << "l_" << single_name << " = ";
                     if (v_count > 0) {
                         uint32_t v_idx = ctx.block_statements[first_v];
@@ -419,7 +440,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                         << "(_fr";
                                 }
                                 for (uint32_t a = 0; a < state.func_param_counts[name]; ++a) {
-                                    out << ", (" << a << " < arg_count ? args[" << a << "].as_number() : 0.0)";
+                                    out << ", clx::coerce_number(L, " << a << " < arg_count ? args[" << a << "] : clx::LValue())";
                                 }
                                 if (state.int_returning_funcs.count(name))
                                     out << "))));\n";
@@ -473,7 +494,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                 out << "l_" << name << " = L->create_closure(*_impl_" << name
                                     << ", static_cast<clx::LTable*>(_ENV.as_pointer())"
                                     << (cells_c.empty() ? "" : ", " + cells_c) << ");\n";
-                                out << "clx::upval_store(l_" << name << "_cell, l_" << name << ");\n";
+                                out << "clx::upval_init(l_" << name << "_cell, l_" << name << ");\n";
                                 out << "_fr.push(l_" << name << ");\n";
                                 {
                                     size_t _sfi = state.string_pool_index.at(name);
@@ -562,7 +583,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                             }
                             locals.push_back({ name, true });
                             if (is_func) {
-                                out << "clx::upval_store(l_" << name << ", ";
+                                out << "clx::upval_init(l_" << name << ", ";
                                 emit_node(ctx.block_statements[first_v]);
                                 out << ");\n";
                             } else {
@@ -591,9 +612,15 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                     } else {
                         if (state.hoisted_locals.count(name)) {
                             if (v_count > 0) {
+                                //------------------ the value is evaluated once into l_name (a boxed value); the flag and exact value read it back instead of re-evaluating the expression
                                 out << "l_" << name << " = ";
                                 emit_node(ctx.block_statements[first_v]);
                                 out << ";\n";
+                                BoxedRhsGuard hv_guard;
+                                if (rhs_has_dynamic_len(ctx.block_statements[first_v], 0)) {
+                                    boxed_rhs[ctx.block_statements[first_v]] = "l_" + std::string(name);
+                                    hv_guard = BoxedRhsGuard(this, ctx.block_statements[first_v]);
+                                }
                                 bool hv_native
                                     = std::find(state.native_numbers.begin(), state.native_numbers.end(), name)
                                     != state.native_numbers.end();
@@ -758,7 +785,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                         << "(_fr";
                                 }
                                 for (uint32_t a = 0; a < state.func_param_counts[name]; ++a) {
-                                    out << ", (" << a << " < arg_count ? args[" << a << "].as_number() : 0.0)";
+                                    out << ", clx::coerce_number(L, " << a << " < arg_count ? args[" << a << "] : clx::LValue())";
                                 }
                                 if (state.int_returning_funcs.count(name))
                                     out << "))));\n";
@@ -787,7 +814,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                             state.direct_callables.insert(name);
                             std::string _gc_cells_d = gc_cells_arg(std::string(name));
                             if (is_boxed)
-                                out << "clx::upval_store(l_" << name << ", L->create_closure(_impl_" << name
+                                out << "clx::upval_init(l_" << name << ", L->create_closure(_impl_" << name
                                     << ", static_cast<clx::LTable*>(_ENV.as_pointer())"
                                     << (_gc_cells_d.empty() ? "" : ", " + _gc_cells_d) << "));\n";
                             else
@@ -873,6 +900,18 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                     }
                 }
                 if (!intercepted) {
+                    BoxedRhsGuard bx_asg2;
+                    if (v_count > 0 && !is_boxed
+                        && std::find(state.native_numbers.begin(), state.native_numbers.end(), name)
+                            != state.native_numbers.end()) {
+                        for (auto it = locals.rbegin(); it != locals.rend(); ++it) {
+                            if (it->name == name) {
+                                if (it->has_intf)
+                                    bx_asg2 = box_rhs_if_dynamic_len(ctx.block_statements[first_v]);
+                                break;
+                            }
+                        }
+                    }
                     if (is_boxed)
                         out << "clx::upval_store(l_" << name << ", ";
                     else
@@ -1275,6 +1314,8 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
 
     std::vector<bool> tmp_is_native(v_count, false);
     std::vector<bool> tmp_is_integer(v_count, false);
+    std::vector<bool> tmp_has_flag(v_count, false);   // the flag and exact value of a double temporary were captured with it (before any target is assigned)
+    std::vector<BoxedRhsGuard> bx_tmps;   // run-time-typed `#x` values evaluated once and boxed; they stay registered until the flags below are emitted
     if (v_count > 0) {
         out << "size_t _rg_base_" << node_idx << " = _fr.mark();\n";
         for (size_t i = 0; i < v_count; ++i) {
@@ -1329,7 +1370,7 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                     << "(_fr";
                             }
                             for (uint32_t a = 0; a < state.func_param_counts[fname]; ++a) {
-                                out << ", (" << a << " < arg_count ? args[" << a << "].as_number() : 0.0)";
+                                out << ", clx::coerce_number(L, " << a << " < arg_count ? args[" << a << "] : clx::LValue())";
                             }
                             if (state.int_returning_funcs.count(fname))
                                 out << "))));\n";
@@ -1439,6 +1480,8 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                         is_int_tmp = clx::is_purely_integer_expr(ctx, state, v_idx)
                             && !var_reassigned_non_int(tname, state.current_func_body, v_idx);
                     }
+                    if (!is_int_tmp)
+                        bx_tmps.push_back(box_rhs_if_dynamic_len(v_idx));
                     if (is_int_tmp) {
                         tmp_is_integer[i] = true;
                         out << "int64_t _tmp_" << node_idx << "_" << i << " = ";
@@ -1447,6 +1490,17 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                     }
                     emit_native(v_idx);
                     out << ";\n";
+                    if (!is_int_tmp) {
+                        //------------------ the integer flag and exact value are read now, with the temporary: after the targets are assigned, `a, b = b, a` would read the
+                        //------------------ new values
+                        std::string tf = int_flag_expr(v_idx, 1);
+                        if (tf != "false") {
+                            tmp_has_flag[i] = true;
+                            out << "bool _tmpf_" << node_idx << "_" << i << " = (" << tf << ");\n";
+                            out << "int64_t _tmpi_" << node_idx << "_" << i << " = _tmpf_" << node_idx << "_" << i << " ? (int64_t)("
+                                << int_value_expr(v_idx, 1) << ") : 0;\n";
+                        }
+                    }
                 } else {
                     out << "clx::LValue _tmp_" << node_idx << "_" << i << " = ";
                     emit_node(v_idx);
@@ -1583,6 +1637,10 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                     num_str = "_tmp_" + std::to_string(node_idx) + "_" + std::to_string(i);
                     if (tmp_is_integer[i]) {
                         val_str = "clx::LValue(static_cast<int64_t>(" + num_str + "))";
+                    } else if (tmp_has_flag[i]) {
+                        //------------------ a boxed target takes the temporary with its integer subtype (flag and exact value captured with it)
+                        std::string sfx = std::to_string(node_idx) + "_" + std::to_string(i);
+                        val_str = "(_tmpf_" + sfx + " ? clx::LValue(_tmpi_" + sfx + ") : clx::LValue(static_cast<double>(" + num_str + ")))";
                     } else {
                         val_str = "clx::LValue(static_cast<double>(" + num_str + "))";
                     }
@@ -1635,9 +1693,15 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                     if (sit->has_ii)
                                         out << "_ii_l_" << name << " = " << num_str << ";\n";
                                 } else {
-                                    out << "_intf_l_" << name << " = false;\n";
-                                    if (sit->has_ii)
-                                        out << "_ii_l_" << name << " = 0;\n";
+                                    if (tmp_has_flag[i]) {
+                                        out << "_intf_l_" << name << " = _tmpf_" << node_idx << "_" << i << ";\n";
+                                        if (sit->has_ii)
+                                            out << "_ii_l_" << name << " = _tmpi_" << node_idx << "_" << i << ";\n";
+                                    } else {
+                                        out << "_intf_l_" << name << " = false;\n";
+                                        if (sit->has_ii)
+                                            out << "_ii_l_" << name << " = 0;\n";
+                                    }
                                 }
                             } else if (last_is_call && i + 1 >= v_count) {
                                 std::string mi = std::to_string(i) + " - " + std::to_string(v_count - 1);
@@ -1891,11 +1955,13 @@ void CodeEmitter::emitTableConstructor(const ASTNode &node, uint32_t node_idx) {
     } else {
         out << implicit_count;
     }
+    //------------------ the table is rooted while it is built, arena or not: an arena table is never freed, but the values stored into it so far are
+    //------------------ reachable only through it, and a collection while a later item is built (`{ a = {..}, b = {..} }`) freed them
     if (_is_arena) {
         size_t hsize_pow2 = 8;
         while (hsize_pow2 < explicit_count)
             hsize_pow2 <<= 1;
-        out << ", " << hsize_pow2 << ");\n";
+        out << ", " << hsize_pow2 << ");\n_fr.push(_t);\n";
     } else {
         out << ", " << explicit_count << ");\n_fr.push(_t);\n";
     }
@@ -1948,8 +2014,7 @@ void CodeEmitter::emitTableConstructor(const ASTNode &node, uint32_t node_idx) {
             out << "}\n";
         }
     }
-    if (!_is_arena)
-        out << "_fr.pop();\n";
+    out << "_fr.pop();\n";
     out << "return _t;\n}())";
 }
 

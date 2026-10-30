@@ -54,6 +54,27 @@ void clx_coro_save(CoroutineContext *ctx);
 void clx_coro_switch(CoroutineContext *from, CoroutineContext *to);
 void clx_coro_init(CoroutineContext *ctx, void *stack_top, void *entry);
 }
+#elif defined(__wasi__)
+//------------------ WASI: WebAssembly has no stack switching and wasi-libc no ucontext. With the SDK's cooperative-threads sysroot
+//------------------ (__wasi_cooperative_threads__) each coroutine is a green thread handed control by a binary semaphore; without it,
+//------------------ coroutine.create/wrap raise a Lua error.
+#if defined(__wasi_cooperative_threads__)
+#include <pthread.h>
+struct CoroutineContext {
+    pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
+    bool go = false;
+    bool has_thread = false;
+    pthread_t th;
+};
+#elif defined(CLX_WASM_STACK_SWITCHING)
+//------------------ WebAssembly stack switching (src/runtime/wasm_costack.cpp): a coroutine runs on a pooled worker -- a continuation that never
+//------------------ finishes, plus a stack of its own in linear memory. The worker is acquired at the first resume and released when the body ends.
+struct CoWorker;
+struct CoroutineContext { CoWorker *worker = nullptr; };
+#else
+struct CoroutineContext { };
+#endif
 #else
 #if defined(__APPLE__)
 #define _XOPEN_SOURCE
@@ -245,7 +266,9 @@ struct TValue {
 
     CLX_INLINE_HOT TValue(double d) { payload.f64 = d; }
 
-    CLX_INLINE_HOT TValue(void *p) { payload.ptr = p; }
+    //------------------ through uintptr_t: on a 32-bit target (wasm32) writing .ptr leaves the payload's upper half uninitialised, and hashing,
+    //------------------ equality and the HASH_EMPTY/HASH_TOMBSTONE tests all read the whole u64
+    CLX_INLINE_HOT TValue(void *p) { payload.u64 = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p)); }
 
     CLX_INLINE_HOT TValue(uint64_t u) { payload.u64 = u; }
 };
@@ -279,9 +302,8 @@ struct LValue {
         , type(ValueType::Int64) { }
 
     CLX_INLINE_HOT explicit LValue(const char *s)
-        : type(ValueType::String) {
-        val.payload.ptr = const_cast<char *>(s);
-    }
+        : val(static_cast<void *>(const_cast<char *>(s)))
+        , type(ValueType::String) { }
 
     CLX_INLINE_HOT LValue(const TValue &v, ValueType t)
         : val(v)
@@ -637,6 +659,32 @@ struct MultiValue {
     void overflow_init(const clx::LValue *arr, size_t c);
 };
 
+//------------------ DynArgs: the argument buffer of a call whose last argument expands to several values (`f(a, g())`). The generated code used a fixed
+//------------------ `LValue[16]`, so g() returning more than 15 values wrote past it (stack smashing). Sixteen slots inline, the heap beyond that.
+struct DynArgs {
+    LValue small_[16];
+    LValue *data_ = small_;
+    size_t cap_ = 16;
+    std::unique_ptr<LValue[]> heap_;
+    DynArgs() = default;
+    explicit DynArgs(size_t n) { reserve(n); }
+    DynArgs(const DynArgs &) = delete;
+    DynArgs &operator=(const DynArgs &) = delete;
+    void reserve(size_t n) {
+        if (n <= cap_)
+            return;
+        std::unique_ptr<LValue[]> bigger(new LValue[n]);
+        for (size_t i = 0; i < cap_; ++i)
+            bigger[i] = data_[i];
+        heap_ = std::move(bigger);
+        data_ = heap_.get();
+        cap_ = n;
+    }
+    LValue &operator[](size_t i) { return data_[i]; }
+    operator LValue *() { return data_; }
+    operator const LValue *() const { return data_; }
+};
+
 struct LState;
 struct LTable;
 struct RootRange;
@@ -644,6 +692,18 @@ struct CallSite;
 
 //------------------ default_call_site: no-file/no-line descriptor used when a call has no source context
 const CallSite *default_call_site();
+
+//------------------ Compiled modules and --dynamic reloads (tiered loading). Every module clx compiles records a hash of the Lua source it was built from
+//------------------ (package.clx_hashes[name]). With --dynamic, require looks for the module's file first: when the file exists and its hash differs, the
+//------------------ compiled version is stale and the file is loaded by the embedded interpreter instead; when it matches, or there is no file (a release build
+//------------------ ships none), the compiled version runs. One loader serves development, hot reload and mods.
+CLX_INLINE uint64_t source_hash(const char *data, size_t len) {   // FNV-1a, 64 bit
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < len; ++i) { h ^= static_cast<unsigned char>(data[i]); h *= 1099511628211ULL; }
+    return h;
+}
+void register_module_hash(LState *L, const char *name, uint64_t hash);
+extern bool (*source_differs_hook)(LState *L, const char *name, size_t len);   // set by the --dynamic bridge
 
 //------------------ Shared upvalue type
 using LUpValue = std::shared_ptr<LValue>;
@@ -720,8 +780,15 @@ private:
     }
 };
 
+//------------------ Coroutine form of a function that can yield (stackless coroutines, include/clx_co.h): creates the function's C++20
+//------------------ coroutine, suspended at its start, and returns the address of its frame (ownership passes to the caller)
+using CoInvokeFn = void *(*)(void *box, LState *L, const LValue *args, size_t count);
+
 struct LCFunction : public LHeader {
     CFunctionType func;
+    //---------- co_box/co_invoke: the coroutine form (null when the function cannot yield); the plain form above stays valid
+    std::shared_ptr<void> co_box;
+    CoInvokeFn co_invoke = nullptr;
     MultiValue (*direct)(LState *, const LValue *, size_t) = nullptr;
     LTable *env = nullptr;
     LValue self_ref;
@@ -803,6 +870,8 @@ struct LTableExt {
     LTableInlineCache *ic = nullptr;
     LTable *metatable = nullptr;
     LTable *meta_next = nullptr;
+    //------------------ an arena table's hash entries as created (arena memory); a resize replaces them with a heap buffer, which the arena's reset must free
+    const void *arena_entries = nullptr;
 };
 
 struct LTable : public LHeader {
@@ -869,6 +938,13 @@ CLX_INLINE_HOT size_t table_array_prefix_len(LTable *t) {
 //------------------ Layout note (#4): hot array fields (array, array_types, array_size, array_cap, array_lim)
 //------------------ directly follow the 16-byte LHeader, so header + hot fields occupy the first 64-byte cache
 //------------------ line on the t[i] fast path. (No offsetof assert: LTable is non-standard-layout via LHeader.)
+
+//------------------ site_restore: puts the enclosing source site back after an operation that recorded its own (generated code for multi-line statements); forwards the value unchanged
+template <class T, class State, class Site>
+CLX_INLINE T &&site_restore(State *L, Site enclosing, T &&value) {   // State is deduced so the member access is checked where it is used (LState is only declared this early)
+    L->current_site = enclosing;
+    return std::forward<T>(value);
+}
 
 //------------------ Generational write barrier
 
@@ -1334,6 +1410,8 @@ struct LThread : public LHeader {
     bool is_main;
     bool has_error;
     bool close_requested;
+    //---------- kill_requested: set when an unfinished thread is destroyed; its next resume unwinds the body with CoKill (wasm stack switching)
+    bool kill_requested = false;
     size_t stack_bytes = 0;
     bool fiber_started = false;
     bool pre_unwind = false;
@@ -1345,9 +1423,18 @@ struct LThread : public LHeader {
     void *luaapi = nullptr;
     //---------- top_root: this thread's root-frame chain head; empty while the thread is running (the head lives in LState)
     RootRange *top_root = nullptr;
+    //---------- co_kind: 0 = runs on its own stack (fiber / green thread); 1 = stackless, the body has a coroutine form; 2 = stackless
+    //---------- but the body has none, so it runs to completion at its first resume and cannot yield (a yield raises Lua's C-boundary error)
+    uint8_t co_kind = 0;
+    //---------- co_root/co_leaf: frame addresses of the root coroutine and of the innermost suspended one (where the next resume continues)
+    void *co_root = nullptr;
+    void *co_leaf = nullptr;
 #if defined(_WIN32)
     LPVOID fiber;
 #elif (defined(__APPLE__) || defined(__linux__)) && (defined(__aarch64__) || defined(__x86_64__))
+    CoroutineContext ctx;
+    char *stack_memory;
+#elif defined(__wasi__)
     CoroutineContext ctx;
     char *stack_memory;
 #else
@@ -1386,6 +1473,7 @@ struct LState {
     //------------------ chains before sweeping and re-partition after; close/membership walks cover both.
     LHeader *old_objects = nullptr;
     LTable *free_tables;
+    static constexpr size_t kPooledHashMax = 64;   // hash entries a pooled (dead, reusable) table may keep
     //------------------ Big-buffer free list: tables retaining a heap array park here so size-unknown
     //------------------ creations ({}) never inherit a 90KB array they will not use while the table that
     //------------------ needs it allocates another (linear pool growth wave-over-wave; see create_table).
@@ -1409,6 +1497,9 @@ struct LState {
 
     LThread *main_thread = nullptr;
     LThread *running_thread = nullptr;
+    //---------- stack_limit: lowest address generated code may reach on the running thread's stack in linear memory (wasm stack switching only;
+    //---------- 0 = unchecked). FrameBase raises Lua's "stack overflow" error below it, which linear memory has no guard page to do.
+    uintptr_t stack_limit = 0;
 
     //---------- top_root: head of the running thread's RootRange chain (one frame per generated function)
     RootRange *top_root = nullptr;
@@ -1577,7 +1668,12 @@ struct LState {
     bool gc_minor_threshold_env = false;
     static constexpr size_t kMinorThresholdMin = 256 * 1024;
     static constexpr size_t kMinorThresholdMax = 8 * 1024 * 1024;
+    //------------------ Survival-based pacing (gc_policy 1): the nursery is sized by what survives it, not by the heap size.
+    int gc_policy = 0;
+    size_t gc_policy_min = 128 * 1024, gc_policy_max = 8 * 1024 * 1024;
+    int gc_policy_grow_pct = 25, gc_policy_shrink_pct = 8;
     size_t gc_major_threshold = 32 * 1024 * 1024;
+    size_t gc_major_floor = 32 * 1024 * 1024;   //------------------ the major threshold never drops below this; after each full collection it is max(floor, 1.5 x the live old set)
     size_t gc_old_bytes = 0;
     size_t gc_bytes_at_minor = 0;
     bool gc_major_pending = false;
@@ -1593,6 +1689,8 @@ struct LState {
     //------------------ GC instrumentation (generational.md step 1)
     size_t gc_stats_collects = 0;
     size_t gc_stats_minors = 0;
+    uint64_t gc_stats_minor_us = 0;   // time spent in young-generation collections
+    uint64_t gc_stats_major_us = 0;   // time spent in full collections
     size_t gc_stats_minor_freed = 0;
     size_t gc_stats_major_freed = 0;
     size_t gc_stats_remembered_high = 0;
@@ -1600,7 +1698,8 @@ struct LState {
     CLX_INLINE size_t gc_heap_object_size(const LHeader *h) const {
         switch (h->type) {
         case static_cast<uint8_t>(Table):
-            return sizeof(LTable);
+            //------------------ the same bytes allocated_bytes counts for it (header + side buffers), so the major trigger measures the real old set
+            return sizeof(LTable) + table_heap_bytes(static_cast<const LTable *>(h));
         case static_cast<uint8_t>(Function):
             return sizeof(LCFunction);
         case static_cast<uint8_t>(Thread): {
@@ -1722,13 +1821,21 @@ struct RootRange {
 //------------------ aliases; blocks save it and restore it, which reuses slots across disjoint blocks.
 //------------------ `compact(base, mid)` folds callee-pushed tail entries down over a discarded base region
 //------------------ (the old multi-assign compaction), handling the empty-tail case the same way.
+#if defined(CLX_WASM_STACK_SWITCHING)
+[[noreturn]] void stack_overflow(LState *L);   // raises Lua's "stack overflow" error (src/runtime/wasm_costack.cpp)
+#endif
 struct FrameBase : RootRange {
     size_t used = 0;
     LValue **_heap = nullptr;
     size_t _cap = 0;
 
     CLX_INLINE_HOT explicit FrameBase(LState *L)
-        : RootRange(L, nullptr, 0, nullptr, 0) { }
+        : RootRange(L, nullptr, 0, nullptr, 0) {
+#if defined(CLX_WASM_STACK_SWITCHING)
+        if (__builtin_expect(reinterpret_cast<uintptr_t>(this) < L->stack_limit, 0))
+            stack_overflow(L);
+#endif
+    }
 
     CLX_INLINE_HOT ~FrameBase() { delete[] _heap; }
 
@@ -2349,6 +2456,16 @@ struct FuncArena {
     ~FuncArena();
 };
 
+//------------------ Ownership of an arena table's buffers. LFLAG_ARENA stays set for the table's life; a buffer is the arena's own only while it is the one the table was created with
+//------------------ (the array sits right after the header, the hash entries are recorded in the ext). A grown or resized buffer is heap memory that nothing but the arena's reset can free.
+CLX_INLINE bool arena_owns_array(const LTable *t) {
+    return (t->flags & LFLAG_ARENA)
+        && t->array == reinterpret_cast<const TValue *>(reinterpret_cast<const char *>(t) + ((sizeof(LTable) + 7) & ~static_cast<size_t>(7)));
+}
+CLX_INLINE bool arena_owns_entries(const LTable *t) {
+    return (t->flags & LFLAG_ARENA) && t->ext && t->ext->entries == t->ext->arena_entries;
+}
+
 //------------------ Unlink an arena from the state's active-arena registry.
 CLX_INLINE void arena_unregister(FuncArena *a) {
     LState *L = a->owner;
@@ -2392,6 +2509,17 @@ CLX_INLINE_HOT void *arena_alloc(FuncArena *a, size_t bytes, size_t align = 8) {
 }
 
 CLX_INLINE_HOT void arena_reset(FuncArena *a) {
+    //------------------ the tables live in the blocks freed below, but not everything they point to: grown arrays, resized hashes and inline caches are heap memory
+    for (LTable *t = a->tables; t; t = static_cast<LTable *>(t->next)) {
+        if (t->array && !arena_owns_array(t))
+            table_free_array(t->array, t->array_types, t->small_array);
+        if (t->ext) {
+            if (t->ext->entries && !arena_owns_entries(t))
+                table_free_hash(t->ext->entries, t->ext->hash_bitmap);
+            delete[] t->ext->ic;
+            t->ext->ic = nullptr;
+        }
+    }
     arena_unregister(a);
     FuncArenaBlock *b = a->blocks;
     while (b) {
@@ -2445,6 +2573,7 @@ CLX_INLINE_HOT LValue arena_create_table(LState *L, FuncArena *a, size_t asize, 
         LTableExt *ex = static_cast<LTableExt *>(arena_alloc(a, sizeof(LTableExt)));
         t->ext = ex;
         ex->entries = reinterpret_cast<HashEntry *>(mem + header_sz + array_sz + types_sz);
+        ex->arena_entries = ex->entries;
         ex->hash_size = hsize;
         ex->hash_count = 0;
         ex->hash_tombs = 0;
@@ -2782,11 +2911,9 @@ CLX_INLINE_HOT LValue eq(LState *L, const LValue &a, const LValue &b) {
                                                       : static_cast<LUserdata *>(a.as_pointer())->metatable;
             LTable *mt_b = (b.type == ValueType::Table) ? tbl_metatable(static_cast<LTable *>(b.as_pointer()))
                                                         : static_cast<LUserdata *>(b.as_pointer())->metatable;
-            if (mt && mt == mt_b) {
-                LValue mm = mt->gettable(L->str_eq);
-                if (mm.type != ValueType::Nil)
-                    return LValue(call_bin_metamethod(L, a, b, L->str_eq, "__eq").as_bool());
-            }
+            //------------------ Lua 5.3+: the first operand's __eq, else the second's -- the metatables need not be the same (5.2 rule)
+            if ((mt && mt->gettable(L->str_eq).type != ValueType::Nil) || (mt_b && mt_b->gettable(L->str_eq).type != ValueType::Nil))
+                return LValue(call_bin_metamethod(L, a, b, L->str_eq, "__eq").as_bool());
         }
         return LValue(a.val.payload.ptr == b.val.payload.ptr);
     }
@@ -3359,6 +3486,13 @@ CLX_INLINE_HOT void upval_store(const LUpValue &cell, const LValue &v) {
     gc_barrier_cell(cell, v);
 }
 
+//------------------ First store into a cell its declaration has just made (`local function f` ties the closure to its own variable). No older object can hold a cell that did not exist
+//------------------ a moment ago, and a closure that later survives into the old generation is remembered by the promotion itself (it checks its cells), so the cell needs no
+//------------------ remembered-set entry. Without this every such closure was a root of the next minor collection and was promoted even when dead.
+CLX_INLINE_HOT void upval_init(const LUpValue &cell, const LValue &v) {
+    *cell = v;
+}
+
 //------------------ Table write with __newindex fallback
 CLX_INLINE void table_set(LState *L, const LValue &obj, const LValue &key, const LValue &val) {
     LTable *mt = nullptr;
@@ -3686,6 +3820,14 @@ LValue create_thread(LState *L, const LValue &func, double stack_size = 262144.0
 LValue newuserdata(LState *L, size_t size);
 //------------------ Resumes a coroutine
 MultiValue resume(LState *L, const LValue &thread, const LValue *args, size_t count);
+//------------------ Stackless coroutines (src/runtime/costack.cpp, C++20): continue a stackless thread until it yields or ends (resume() has
+//------------------ already switched the root chains and the running thread), and release a stackless thread's frames (close / collection)
+void co_run(LState *L, LThread *t);
+void co_release(LState *L, LThread *t);
+//------------------ Chooses how a new thread runs: sets t->co_kind from the body (a function with a coroutine form, or none)
+void co_choose_kind(LThread *t, const LValue &func);
+//------------------ True when a body without a coroutine form cannot yield (no stack to switch); false when such bodies get a fiber
+bool co_stackless_only();
 //------------------ Yields from a coroutine
 MultiValue yield(LState *L, const LValue *args, size_t count);
 //------------------ Closes a coroutine
@@ -3694,7 +3836,7 @@ MultiValue close_thread(LState *L, const LValue &thread);
 //------------------ Opens CLX state
 LState *open(int argc = 0, char *argv[] = nullptr);
 //------------------ Opens CLX state without registering any std library (driver-emitted filtered open
-//------------------ sequences register only the referenced base functions afterwards)
+//------------------ sequences register only the referenced base functions afterwards). Returns with collection off (gc_running = false): set it to true after registering.
 LState *open_bare(int argc = 0, char *argv[] = nullptr);
 //------------------ Opens all standard libraries
 void openlibs(LState *L);

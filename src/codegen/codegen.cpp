@@ -135,10 +135,59 @@ bool CodeEmitter::is_local(std::string_view name, bool &out_is_boxed, std::strin
     return false;
 }
 
+//------------------ len_static_int: `#x` is statically an integer when x is a native numeric array (its size) or a table of known fixed length
+bool CodeEmitter::len_static_int(uint32_t len_idx) {
+    const auto &n = ctx.nodes[len_idx];
+    if (n.type != NodeType::UnaryOp || n.as.unary_op.op != static_cast<int>(UnaryOp::Len))
+        return false;
+    const auto &op = ctx.nodes[n.as.unary_op.expr];
+    if (op.type != NodeType::Identifier || op.as.ident.is_global)
+        return false;
+    std::string_view nm(op.as.ident.name, op.as.ident.length);
+    bool boxed = false;
+    if (!is_local(nm, boxed) || boxed)
+        return false;
+    return state.pure_numeric_arrays.count(nm) > 0
+        || (state.known_table_lengths.count(nm) > 0 && state.tables_with_dynamic_length.count(nm) == 0);
+}
+
+//------------------ rhs_has_dynamic_len: does the arithmetic expression contain a `#x` whose subtype is only known at run time (a string, or a table that may have __len)?
+bool CodeEmitter::rhs_has_dynamic_len(uint32_t idx, int depth) {
+    if (depth > 24 || idx == 0xFFFFFFFF || idx >= ctx.nodes.size())
+        return false;
+    const auto &n = ctx.nodes[idx];
+    if (n.type == NodeType::ParenExpression)
+        return rhs_has_dynamic_len(n.as.paren_expr.expr, depth + 1);
+    if (n.type == NodeType::UnaryOp) {
+        if (n.as.unary_op.op == static_cast<int>(UnaryOp::Len))
+            return !len_static_int(idx);
+        return rhs_has_dynamic_len(n.as.unary_op.expr, depth + 1);
+    }
+    if (n.type == NodeType::BinaryOp)
+        return rhs_has_dynamic_len(n.as.bin_op.left, depth + 1) || rhs_has_dynamic_len(n.as.bin_op.right, depth + 1);
+    return false;
+}
+
+//------------------ box_rhs_if_dynamic_len: when a native variable is assigned an expression with a run-time-typed `#x`, evaluate the whole expression once as a
+//------------------ boxed Lua value (emit_node: Lua's rules and evaluation order, a __len metamethod runs once) and let emit_native / int_flag_expr / int_value_expr
+//------------------ read that value, so the variable's integer flag and exact value follow the result instead of a re-evaluation. The guard unregisters it.
+CodeEmitter::BoxedRhsGuard CodeEmitter::box_rhs_if_dynamic_len(uint32_t rhs_idx) {
+    if (!rhs_has_dynamic_len(rhs_idx, 0))
+        return BoxedRhsGuard();
+    std::string name = "_bx" + std::to_string(rhs_idx);
+    out << "clx::LValue " << name << " = ";
+    emit_node(rhs_idx);
+    out << ";\n";
+    boxed_rhs[rhs_idx] = name;
+    return BoxedRhsGuard(this, rhs_idx);
+}
+
 //------------------ int_flag_expr: C++ bool expression for the runtime integer subtype of an expression
 std::string CodeEmitter::int_flag_expr(uint32_t expr_idx, int depth) {
     if (depth > 24 || expr_idx == 0xFFFFFFFF || expr_idx >= ctx.nodes.size())
         return "false";
+    if (auto bx = boxed_rhs.find(expr_idx); bx != boxed_rhs.end())
+        return "(" + bx->second + ".type == clx::ValueType::Int64)";
     const auto &n = ctx.nodes[expr_idx];
     if (n.type == NodeType::Integer)
         return "true";
@@ -151,7 +200,8 @@ std::string CodeEmitter::int_flag_expr(uint32_t expr_idx, int depth) {
         if (is_local(nm, boxed, cpp)) {
             for (auto it = locals.rbegin(); it != locals.rend(); ++it) {
                 if (it->name == nm) {
-                    if (it->is_int_counter)
+                    //------------------ a native int64 local is always an integer (int_value_expr already reads it that way)
+                    if (it->is_int_counter || state.native_integers.count(std::string(nm)))
                         return "true";
                     if (!it->has_intf)
                         return "false";
@@ -171,11 +221,22 @@ std::string CodeEmitter::int_flag_expr(uint32_t expr_idx, int depth) {
             || bop == static_cast<int>(BinaryOp::FloorDiv) || bop == static_cast<int>(BinaryOp::Mod);
         if (!int_op)
             return "false";
-        return "(" + int_flag_expr(n.as.bin_op.left, depth + 1) + " && " + int_flag_expr(n.as.bin_op.right, depth + 1)
-            + ")";
+        //------------------ fold constants: a side that can never be an integer makes the whole flag the literal "false" (callers compare against that string to
+        //------------------ pick the boxed path; "(f && false)" used to slip through as an exact-arithmetic request and the result printed as a float)
+        std::string lf = int_flag_expr(n.as.bin_op.left, depth + 1);
+        std::string rf = int_flag_expr(n.as.bin_op.right, depth + 1);
+        if (lf == "false" || rf == "false")
+            return "false";
+        if (lf == "true")
+            return rf;
+        if (rf == "true")
+            return lf;
+        return "(" + lf + " && " + rf + ")";
     }
     if (n.type == NodeType::UnaryOp && n.as.unary_op.op == static_cast<int>(UnaryOp::Minus))
         return int_flag_expr(n.as.unary_op.expr, depth + 1);
+    if (n.type == NodeType::UnaryOp && n.as.unary_op.op == static_cast<int>(UnaryOp::Len))
+        return len_static_int(expr_idx) ? "true" : "false";
     //------------------ math.maxinteger/mininteger are always Int64 (stock Lua guarantees the
     //------------------ constants); huge/pi are floats and stay "false". The global check keeps a
     //------------------ shadowing local named `math` on the conservative path.
@@ -188,6 +249,12 @@ std::string CodeEmitter::int_flag_expr(uint32_t expr_idx, int depth) {
             std::string_view tn(ctx.nodes[tbl_idx].as.ident.name, ctx.nodes[tbl_idx].as.ident.length);
             std::string_view mk(ctx.nodes[key_idx].as.string.text, ctx.nodes[key_idx].as.string.length);
             if (tn == "math" && (mk == "maxinteger" || mk == "mininteger"))
+                return "true";
+        }
+        //------------------ an element of a promoted int array (a native vector<int64_t>) is always an integer
+        if (tbl_idx < ctx.nodes.size() && ctx.nodes[tbl_idx].type == NodeType::Identifier && !ctx.nodes[tbl_idx].as.ident.is_global) {
+            std::string_view tn(ctx.nodes[tbl_idx].as.ident.name, ctx.nodes[tbl_idx].as.ident.length);
+            if (state.pure_numeric_arrays.count(tn) && state.int_numeric_arrays.count(tn))
                 return "true";
         }
     }
@@ -224,6 +291,8 @@ std::string CodeEmitter::fast_call_box_flag(std::string_view fname, uint32_t fir
 std::string CodeEmitter::int_value_expr(uint32_t expr_idx, int depth) {
     if (depth > 24 || expr_idx == 0xFFFFFFFF || expr_idx >= ctx.nodes.size())
         return "0";
+    if (auto bx = boxed_rhs.find(expr_idx); bx != boxed_rhs.end())
+        return bx->second + ".val.payload.i64";
     const auto &n = ctx.nodes[expr_idx];
     if (n.type == NodeType::Integer)
         return "static_cast<int64_t>(" + std::to_string(n.as.integer.val) + ")";
@@ -269,6 +338,12 @@ std::string CodeEmitter::int_value_expr(uint32_t expr_idx, int depth) {
     }
     if (n.type == NodeType::UnaryOp && n.as.unary_op.op == static_cast<int>(UnaryOp::Minus))
         return "clx::int_neg(" + int_value_expr(n.as.unary_op.expr, depth + 1) + ")";
+    if (n.type == NodeType::UnaryOp && n.as.unary_op.op == static_cast<int>(UnaryOp::Len) && len_static_int(expr_idx)) {
+        std::string_view nm(ctx.nodes[n.as.unary_op.expr].as.ident.name, ctx.nodes[n.as.unary_op.expr].as.ident.length);
+        if (state.pure_numeric_arrays.count(nm))
+            return "static_cast<int64_t>(l_" + std::string(nm) + ".size())";
+        return "static_cast<int64_t>(" + std::to_string(state.known_table_lengths.find(nm)->second) + ")";
+    }
     //------------------ math.maxinteger/mininteger shadows (mirrors the int_flag_expr case above).
     if (n.type == NodeType::TableAccess) {
         uint32_t tbl_idx = n.as.table_access.table;
@@ -282,6 +357,12 @@ std::string CodeEmitter::int_value_expr(uint32_t expr_idx, int depth) {
                 return "INT64_MAX";
             if (tn == "math" && mk == "mininteger")
                 return "INT64_MIN";
+        }
+        //------------------ the element itself (bounds were proven by pass_array_safety, as for the vector read path)
+        if (tbl_idx < ctx.nodes.size() && ctx.nodes[tbl_idx].type == NodeType::Identifier && !ctx.nodes[tbl_idx].as.ident.is_global) {
+            std::string_view tn(ctx.nodes[tbl_idx].as.ident.name, ctx.nodes[tbl_idx].as.ident.length);
+            if (state.pure_numeric_arrays.count(tn) && state.int_numeric_arrays.count(tn))
+                return "l_" + std::string(tn) + "[static_cast<size_t>(" + int_value_expr(key_idx, depth + 1) + ") - 1]";
         }
     }
     if (n.type == NodeType::CallExpression) {
@@ -582,6 +663,16 @@ void CodeEmitter::emit(uint32_t root_node, std::string_view module_name) {
 
     out << "#include <clx.h>\n";
     out << "#include <atomic>\n\n";
+    if (!native_registry().empty()) {   // the natives manifest's C functions (clx --natives)
+        for (const auto &ne : native_registry()) {
+            auto ct = [](const std::string &ty) { return ty == "int64" ? std::string("int64_t") : ty == "int32" ? std::string("int") : ty; };
+            out << "extern \"C\" " << ct(ne.ret) << " " << ne.cname << "(";
+            for (size_t i = 0; i < ne.params.size(); ++i)
+                out << (i ? ", " : "") << ct(ne.params[i]);
+            out << ");\n";
+        }
+        out << "\n";
+    }
 
     if (!state.string_pool.empty()) {
         out << "static clx::LValue cstr_[" << state.string_pool.size() << "];\n";
@@ -695,6 +786,28 @@ void CodeEmitter::emit_node(uint32_t node_idx) {
         return;
     const ASTNode &node = ctx.nodes[node_idx];
 
+    //------------------ an operation that can raise an error on another line of a multi-line statement (a call, an index, an operator) records its own call site while it runs, so the message names
+    //------------------ the line of the operation like Lua's does and not the line where the statement starts. The site is set before the operands are evaluated and put back to the enclosing
+    //------------------ one after the value exists, so an operand that sets its own site cannot leave the wrong one behind for the operation (C++ evaluates the pieces of an expression in no fixed
+    //------------------ order). Only emitted when the line differs from the one in effect.
+    if (node.line > 0 && static_cast<int>(node.line) != emit_line && !emit_site.empty() && !state.in_fast_function
+        && (node.type == NodeType::CallExpression || node.type == NodeType::TableAccess || node.type == NodeType::BinaryOp || node.type == NodeType::UnaryOp)) {
+        const int enclosing_line = emit_line;
+        const std::string enclosing_site = emit_site;
+        const std::string site = "([]() { static constexpr clx::CallSite s = { \"" + ctx.filename + "\", " + std::to_string(node.line) + ", false, false }; return &s; }())";
+        emit_line = static_cast<int>(node.line);
+        emit_site = site;
+        out << "(L->current_site = " << site << ", clx::site_restore(L, " << enclosing_site << ", ";
+        emit_node_unlined(node, node_idx);
+        out << "))";
+        emit_line = enclosing_line;
+        emit_site = enclosing_site;
+        return;
+    }
+    emit_node_unlined(node, node_idx);
+}
+
+void CodeEmitter::emit_node_unlined(const ASTNode &node, uint32_t node_idx) {
     switch (node.type) {
     case NodeType::IntrinsicCall:
         emitIntrinsicCall(node, node_idx);

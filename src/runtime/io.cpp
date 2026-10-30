@@ -27,6 +27,12 @@
 #else
 #include <unistd.h>
 #endif
+#if defined(__wasi__)
+//------------------ WASI has no processes: io.popen fails like a popen that cannot start the shell
+#include <cerrno>
+static FILE *popen(const char *, const char *) { errno = ENOSYS; return nullptr; }
+static int pclose(FILE *) { errno = ENOSYS; return -1; }
+#endif
 
 namespace clx {
 
@@ -258,9 +264,11 @@ static LValue read_all(LState *L, FILE *fp) {
     std::string content;
     if (hint > 0)
         content.reserve(std::min(hint, SINGLE_SHOT_LIMIT));
-    char buf[CHUNK];
+    //------------------ on the heap: a 64 KiB array on the stack is the whole default wasm stack (64 KiB), and read("a") of an existing file overflowed it (memory fault in ftell)
+    std::unique_ptr<char[]> bufp(new char[CHUNK]);
+    char *buf = bufp.get();
     size_t r;
-    while ((r = std::fread(buf, 1, sizeof(buf), fp)) > 0)
+    while ((r = std::fread(buf, 1, CHUNK, fp)) > 0)
         content.append(buf, r);
     if (content.empty())
         return LValue(L->intern_string("", 0));
@@ -433,9 +441,9 @@ static LValue make_file(LState *L, FILE *fp, bool close_on_gc, bool is_pipe = fa
     f->close_on_gc = close_on_gc;
     f->is_pipe = is_pipe;
 
+    L->root_value(LValue(UserData, ud));   // before the next allocation: create_table can collect, and ud is reachable from nowhere yet
     LTable *mt = static_cast<LTable *>(L->create_table().as_pointer());
     LValue file_mt(Table, mt);
-    L->root_value(LValue(UserData, ud));
     L->root_value(file_mt);
 
     auto meth_close = [](LState *L, const LValue *a, size_t c) -> MultiValue {
@@ -577,9 +585,9 @@ static LValue get_std_file(LState *L, FILE *fp) {
     f->close_on_gc = false;
     f->is_pipe = false;
 
+    L->root_value(LValue(UserData, ud));   // before the next allocation (see make_file)
     LTable *mt = static_cast<LTable *>(L->create_table().as_pointer());
     LValue file_mt(Table, mt);
-    L->root_value(LValue(UserData, ud));
     L->root_value(file_mt);
 
     auto meth_close = [](LState *L, const LValue *a, size_t c) -> MultiValue { return MultiValue(boolean(true)); };

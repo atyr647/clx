@@ -159,22 +159,23 @@ LCFunction::LCFunction(CFunctionType f)
 
 //------------------ find_bin_metamethod — returns the binary-op metamethod from either operand's metatable, or Nil
 LValue find_bin_metamethod(LState *L, const LValue &a, const LValue &b, const LValue &key) {
-    LTable *mt = nullptr;
-    if (a.type == Table)
-        mt = tbl_metatable(static_cast<LTable *>(a.as_pointer()));
-    else if (a.type == UserData)
-        mt = static_cast<LUserdata *>(a.as_pointer())->metatable;
-    if (!mt && b.type == Table)
-        mt = tbl_metatable(static_cast<LTable *>(b.as_pointer()));
-    else if (!mt && b.type == UserData)
-        mt = static_cast<LUserdata *>(b.as_pointer())->metatable;
-
-    if (mt) {
-        LValue method = mt->gettable(key);
-        if (method.type != Nil && method.type == Function)
-            return method;
-    }
-    return LValue();
+    //------------------ the first operand's handler, else the second's (Lua 5.4 luaT_trybinTM): a metatable on the first operand
+    //------------------ that lacks this event no longer hides the second operand's handler
+    auto handler = [&](const LValue &v) -> LValue {
+        LTable *mt = nullptr;
+        if (v.type == Table)
+            mt = tbl_metatable(static_cast<LTable *>(v.as_pointer()));
+        else if (v.type == UserData)
+            mt = static_cast<LUserdata *>(v.as_pointer())->metatable;
+        if (mt) {
+            LValue method = mt->gettable(key);
+            if (method.type == Function)
+                return method;
+        }
+        return LValue();
+    };
+    LValue m = handler(a);
+    return m.type == Function ? m : handler(b);
 }
 
 //------------------ find_bin_metamethod (event-name overload: interns and forwards)

@@ -28,6 +28,13 @@ namespace clx {
 //------------------ emit_intrinsic_native_body: raw double-context emission of an IntrinsicCall node
 void CodeEmitter::emit_intrinsic_native_body(const ASTNode &n) {
     const char *_cn = n.as.intrinsic_call.cname;
+    //------------------ a natives-manifest call in a double context (only double-returning entries are marked numeric)
+    if (const NativeEntry *ne = native_by_intrinsic(_cn)) {
+        out << "(";
+        emit_native_entry_call(*ne, n);
+        out << ").as_number()";
+        return;
+    }
     if (strcmp(_cn, "__clx_deg") == 0 || strcmp(_cn, "__clx_rad") == 0) {
         if (n.as.intrinsic_call.arg_count > 0) {
             emit_native(ctx.block_statements[n.as.intrinsic_call.first_arg]);
@@ -63,6 +70,10 @@ void CodeEmitter::emit_intrinsic_native_body(const ASTNode &n) {
 
 //------------------ emit_native: emits an expression coerced to a raw C++ double
 void CodeEmitter::emit_native(uint32_t n_idx) {
+    if (auto bx = boxed_rhs.find(n_idx); bx != boxed_rhs.end()) {
+        out << bx->second << ".as_number()";
+        return;
+    }
 
     if (yields_number(ctx, state, n_idx, nullptr, state.current_fast_func)) {
         const auto &n = ctx.nodes[n_idx];
@@ -453,8 +464,68 @@ void CodeEmitter::emit_condition(uint32_t c_idx) {
 }
 
 //------------------ emitIntrinsicCall: handles NodeType::IntrinsicCall
+//------------------ emit_native_entry_call: a natives-manifest call as a C++ expression yielding the boxed result. Arguments are
+//------------------ evaluated into temporaries in order (Lua evaluates left to right; C++ argument order is unspecified), proven
+//------------------ numbers pass unboxed, anything else goes through clx::native_arg_* (Lua's argument errors). Arguments beyond
+//------------------ the signature are evaluated and dropped, as a C function would ignore them.
+void CodeEmitter::emit_native_entry_call(const NativeEntry &ne, const ASTNode &node) {
+    std::string fn = ne.module + "." + ne.name;
+    out << "([&]() -> clx::LValue { ";
+    uint32_t n = node.as.intrinsic_call.arg_count;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint32_t a = ctx.block_statements[node.as.intrinsic_call.first_arg + i];
+        if (i >= ne.params.size()) {
+            out << "(void)(";
+            emit_node(a);
+            out << "); ";
+            continue;
+        }
+        bool want_int = ne.params[i] != "double";
+        bool i32 = ne.params[i] == "int32";
+        out << (want_int ? "int64_t" : "double") << " _na" << i << " = ";
+        if (i32)
+            out << "clx::native_arg_int32(L, ";
+        if (want_int && clx::is_purely_integer_expr(ctx, state, a)) {
+            out << "static_cast<int64_t>(";
+            emit_native(a);
+            out << ")";
+        } else if (yields_number(ctx, state, a, nullptr, state.current_fast_func)) {
+            if (want_int) {
+                out << "clx::native_arg_int(L, static_cast<double>(";
+                emit_native(a);
+                out << "), \"" << fn << "\", " << (i + 1) << ")";
+            } else {
+                out << "static_cast<double>(";
+                emit_native(a);
+                out << ")";
+            }
+        } else {
+            out << (want_int ? "clx::native_arg_int(L, " : "clx::native_arg_double(L, ");
+            emit_node(a);
+            out << ", \"" << fn << "\", " << (i + 1) << ")";
+        }
+        if (i32)
+            out << ", \"" << fn << "\", " << (i + 1) << ")";
+        out << "; ";
+    }
+    std::string call = ne.cname + "(";
+    for (size_t i = 0; i < ne.params.size(); ++i)
+        call += std::string(i ? ", " : "") + (ne.params[i] == "int32" ? "static_cast<int>(_na" : "(_na") + std::to_string(i) + ")";
+    call += ")";
+    if (ne.ret == "void")
+        out << call << "; return clx::LValue(); }())";
+    else if (ne.ret == "int64" || ne.ret == "int32")
+        out << "return clx::integer(static_cast<int64_t>(" << call << ")); }())";
+    else
+        out << "return clx::LValue(static_cast<double>(" << call << ")); }())";
+}
+
 void CodeEmitter::emitIntrinsicCall(const ASTNode &node, uint32_t node_idx) {
     const char *_cn = node.as.intrinsic_call.cname;
+    if (const NativeEntry *ne = native_by_intrinsic(_cn)) {
+        emit_native_entry_call(*ne, node);
+        return;
+    }
     if (strcmp(_cn, "__clx_type") == 0) {
         uint32_t va = ctx.block_statements[node.as.intrinsic_call.first_arg];
         out << "([&](){ static const char* "
@@ -718,7 +789,7 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
     }
 
     if (last_expands) {
-        out << "    clx::LValue _dyn_buf[16];\n    size_t _dyn_count = 0;\n";
+        out << "    clx::DynArgs _dyn_buf(" << node.as.call_expr.arg_count << ");\n    size_t _dyn_count = 0;\n";
         if (node.as.call_expr.arg_count > 1) {
             for (uint32_t i = 0; i < node.as.call_expr.arg_count - 1; ++i) {
                 if (i > 0)
@@ -744,6 +815,7 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
             out << ";\n";
             state.expect_multivalue = false;
 
+            out << "    _dyn_buf.reserve(_dyn_count + _mret.count);\n";
             out << "    for (size_t _mi = 0; _mi < _mret.count; ++_mi) _dyn_buf[_dyn_count++] = _mret[_mi];\n";
         }
         out << "    for (size_t _mi = 0; _mi < _dyn_count; ++_mi) _fr.push(_dyn_buf[_mi]);\n";
@@ -1747,6 +1819,30 @@ void CodeEmitter::emitNilLiteral(const ASTNode &node, uint32_t node_idx) {
 }
 
 void CodeEmitter::emitTableOp(int bin_op, uint32_t lhs_tbl, uint32_t lhs_key, uint32_t const_idx, bool nil_ok) {
+    //------------------ a promoted numeric array is a native vector: t[k] = t[k] <op> c is one native op. Every access to a promoted
+    //------------------ array was proven in bounds by pass_array_safety (the same guarantee the vector read path relies on).
+    if (lhs_tbl < ctx.nodes.size() && ctx.nodes[lhs_tbl].type == NodeType::Identifier) {
+        std::string_view tn(ctx.nodes[lhs_tbl].as.ident.name, ctx.nodes[lhs_tbl].as.ident.length);
+        if (state.pure_numeric_arrays.count(tn)) {
+            //------------------ an int array (vector<int64_t>) only ever receives integer values (int_numeric_arrays), so its element
+            //------------------ type is int64_t and the Lua integer ops wrap like clx's int_add_lv/int_sub_lv/int_mul_lv
+            bool int_arr = state.int_numeric_arrays.count(std::string(tn)) > 0;
+            const char *op = bin_op == static_cast<int>(BinaryOp::Add) ? "+" : bin_op == static_cast<int>(BinaryOp::Sub) ? "-"
+                : bin_op == static_cast<int>(BinaryOp::Mul) ? "*" : "/";
+            out << "{ auto &_e = l_" << tn << "[static_cast<size_t>(";
+            emit_native(lhs_key);
+            if (int_arr) {
+                out << ") - 1]; _e = static_cast<int64_t>(static_cast<uint64_t>(_e) " << op << " static_cast<uint64_t>(static_cast<int64_t>(";
+                emit_native(const_idx);
+                out << "))); }\n";
+            } else {
+                out << ") - 1]; _e = _e " << op << " static_cast<double>(";
+                emit_native(const_idx);
+                out << "); }\n";
+            }
+            return;
+        }
+    }
     const char *fn = nullptr;
     if (bin_op == static_cast<int>(BinaryOp::Add))
         fn = "table_increment";

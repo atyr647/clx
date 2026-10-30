@@ -227,7 +227,7 @@ void pass_goto_labels(const ASTContext &ctx, AnalysisState &state, uint32_t root
 void pass_name_scans(const ASTContext &ctx, AnalysisState &state, PassScratch &sk, uint32_t root_node) {
     auto &for_vars = sk.for_vars;
     state.reassigned_vars.clear();
-    std::map<std::string_view, uint32_t> var_assign_counts;
+    std::map<std::string_view, uint32_t> var_assign_counts, binding_counts;
     for (const auto &node : ctx.nodes) {
         if (node.type == NodeType::LocalDecl || node.type == NodeType::GlobalDeclStatement
             || node.type == NodeType::Assignment) {
@@ -247,11 +247,41 @@ void pass_name_scans(const ASTContext &ctx, AnalysisState &state, PassScratch &s
                 }
             }
         }
+        //------------------ parameters and loop variables are declared without a LocalDecl: their binding counts as the first
+        //------------------ assignment, so one write in the body makes them reassigned (a captured parameter written by a closure
+        //------------------ was taken for a constant upvalue: local function f(s) local function add(x) s = s .. x end ... end)
+        auto declared = [&](uint32_t id) {
+            if (id < ctx.nodes.size() && ctx.nodes[id].type == NodeType::Identifier)
+                binding_counts[std::string_view(ctx.nodes[id].as.ident.name, ctx.nodes[id].as.ident.length)]++;
+        };
+        if (node.type == NodeType::FunctionDef)
+            for (uint32_t i = 0; i < node.as.func_def.param_count; ++i)
+                declared(ctx.block_statements[node.as.func_def.first_param + i]);
+        if (node.type == NodeType::GenericForStatement)
+            for (uint32_t i = 0; i < node.as.generic_for.var_count; ++i)
+                declared(ctx.block_statements[node.as.generic_for.first_var + i]);
+        if (node.type == NodeType::ForStatement)
+            declared(node.as.for_stmt.var_ident);
+        //------------------ a local declared between a goto and the next label of its block is hoisted by the code generator: bound
+        //------------------ (to nil) before the goto and assigned at its declaration, so it is never a constant
+        if (node.type == NodeType::Block) {
+            bool after_goto = false;
+            for (uint32_t i = 0; i < node.as.block.count; ++i) {
+                const auto &st = ctx.nodes[ctx.block_statements[node.as.block.first_statement + i]];
+                if (contains_goto(ctx, ctx.block_statements[node.as.block.first_statement + i]))
+                    after_goto = true;
+                else if (st.type == NodeType::LabelStatement)
+                    after_goto = false;
+                else if (after_goto && st.type == NodeType::LocalDecl)
+                    for (uint32_t j = 0; j < st.as.local_decl.ident_count; ++j)
+                        declared(ctx.block_statements[st.as.local_decl.first_ident + j]);
+            }
+        }
     }
     state.assigned_targets.clear();
     for (const auto &pair : var_assign_counts) {
         state.assigned_targets.insert(pair.first);
-        if (pair.second > 1)
+        if (pair.second + (binding_counts.count(pair.first) ? binding_counts[pair.first] : 0) > 1)
             state.reassigned_vars.insert(pair.first);
     }
 

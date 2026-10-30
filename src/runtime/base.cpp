@@ -153,6 +153,12 @@ MultiValue collectgarbage(LState *L, const LValue *args, size_t arg_count) {
             L->collect_garbage();
         return MultiValue(clx::number(0.0));
     }
+    if (opt == "minor") {
+        //------------------ one young-generation collection now (a program that stops the collector can run these at frame boundaries)
+        if (L->gc_mode == LState::GCMode::Generational && !L->gc_minor_active)
+            L->gc_minor();
+        return MultiValue(clx::number(0.0));
+    }
     if (opt == "count") {
         double mem_kb = static_cast<double>(L->get_memory_usage()) / 1024.0;
         return MultiValue(clx::number(mem_kb));
@@ -190,7 +196,7 @@ MultiValue collectgarbage(LState *L, const LValue *args, size_t arg_count) {
         return MultiValue(clx::string(L, L->gc_mode == LState::GCMode::Generational ? "generational" : "incremental"));
     }
     if (opt == "stats") {
-        LTable *st = static_cast<LTable *>(L->create_table(0, 8).as_pointer());
+        LTable *st = static_cast<LTable *>(L->create_table(0, 12).as_pointer());
         st->settable(LValue(L->intern_string("mode")),
             clx::string(L, L->gc_mode == LState::GCMode::Generational ? "generational" : "incremental"));
         st->settable(LValue(L->intern_string("collects")), LValue(static_cast<int64_t>(L->gc_stats_collects)));
@@ -199,6 +205,8 @@ MultiValue collectgarbage(LState *L, const LValue *args, size_t arg_count) {
             LValue(L->intern_string("minor_freed_kb")), LValue(static_cast<double>(L->gc_stats_minor_freed) / 1024.0));
         st->settable(
             LValue(L->intern_string("major_freed_kb")), LValue(static_cast<double>(L->gc_stats_major_freed) / 1024.0));
+        st->settable(LValue(L->intern_string("minor_ms")), LValue(static_cast<double>(L->gc_stats_minor_us) / 1000.0));
+        st->settable(LValue(L->intern_string("major_ms")), LValue(static_cast<double>(L->gc_stats_major_us) / 1000.0));
         st->settable(LValue(L->intern_string("old_kb")), LValue(static_cast<double>(L->gc_old_bytes) / 1024.0));
         st->settable(LValue(L->intern_string("minor_kb")), LValue(static_cast<double>(L->gc_minor_threshold) / 1024.0));
         st->settable(
@@ -209,6 +217,39 @@ MultiValue collectgarbage(LState *L, const LValue *args, size_t arg_count) {
         if (arg_count < 2)
             clx::error(L, bad_arg_msg(L, 2, "collectgarbage", "option expected").c_str());
         std::string_view param = clx::check_string(L, args[1]);
+        if (param == "youngkb") {
+            //------------------ the size of the young generation in KB (allocation between minor collections), pinned: the adaptive pacing leaves a pinned value alone
+            int64_t old_kb = static_cast<int64_t>(L->gc_minor_threshold / 1024);
+            if (arg_count >= 3) {
+                int64_t kb = std::clamp<int64_t>(clx::check_integer(L, args[2]), 1, 1 << 20);
+                L->gc_minor_threshold = static_cast<size_t>(kb) * 1024;
+                L->gc_minor_threshold_env = true;
+            }
+            return MultiValue(clx::integer(old_kb));
+        }
+        if (param == "policy") {
+            //------------------ 0: the default nursery pacing; 1: the nursery is sized by what survives it (grows when more than 25% of a window survives, shrinks below 8%), between 128 KB and 8 MB
+            int old_val = L->gc_policy;
+            if (arg_count >= 3) {
+                int v = static_cast<int>(clx::check_integer(L, args[2]));
+                if (v < 0 || v > 1)
+                    clx::error(L, "bad value for collectgarbage('param', 'policy')");
+                L->gc_policy = v;
+                if (v == 1 && !L->gc_minor_threshold_env)
+                    L->gc_minor_threshold = L->gc_policy_min;
+            }
+            return MultiValue(clx::integer(old_val));
+        }
+        if (param == "majorkb") {
+            //------------------ the floor of the major-collection trigger in KB: a full collection starts when the old set exceeds max(floor, 2 x the live old set after the previous one)
+            int64_t old_kb = static_cast<int64_t>(L->gc_major_floor / 1024);
+            if (arg_count >= 3) {
+                int64_t kb = std::clamp<int64_t>(clx::check_integer(L, args[2]), 64, 1 << 22);
+                L->gc_major_floor = static_cast<size_t>(kb) * 1024;
+                L->gc_major_threshold = std::max(L->gc_major_floor, L->gc_old_bytes * 2);
+            }
+            return MultiValue(clx::integer(old_kb));
+        }
         int *target = nullptr;
         int old_val;
         if (param == "pause")

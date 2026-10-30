@@ -18,6 +18,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <random>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -109,6 +110,29 @@ static fs::path clx_install_includedir()
 #else
     return {};
 #endif
+}
+
+//------------------ clx_work_dir: a private directory per clx run for intermediate files (<module>_tmp.cpp, _tmp.o). They were
+//------------------ written straight into the system temp directory, named after the input file, so two clx runs on files with the
+//------------------ same name at the same time overwrote each other's generated C++ (a parallel build linked the wrong program).
+//------------------ Created atomically, removed at exit; the system temp directory itself is the fallback.
+static const fs::path& clx_work_dir()
+{
+    static const fs::path* dir = [] {
+        fs::path base = fs::temp_directory_path();
+        std::random_device rd;
+        for (int i = 0; i < 64; ++i) {
+            fs::path p = base / ("clx-" + std::to_string(rd()) + "-" + std::to_string(rd()));
+            std::error_code ec;
+            if (fs::create_directory(p, ec)) {
+                static fs::path* created = new fs::path(p);   // never destroyed: the exit handler below still reads it
+                std::atexit([] { std::error_code e; fs::remove_all(*created, e); });
+                return static_cast<const fs::path*>(created);
+            }
+        }
+        return static_cast<const fs::path*>(new fs::path(base));
+    }();
+    return *dir;
 }
 
 //------------------ clx lib roots - candidate root dirs that contain clx's own libraries and native modules
@@ -370,6 +394,7 @@ void print_help()
               << "  --modules <a,b>       Link std modules (string,table,math,io,os,utf8,coroutine)\n"
               << "                        or precompiled user archives\n"
               << "  --dynamic             Link the embedded Lua 5.5 VM (load/loadfile/dofile)\n"
+              << "  --natives <file>      Call the engine functions declared in <file> directly (see src/builtins.h)\n"
               << "  --version             Print version and exit\n"
               << "  --cxx                 Print the C++ compiler dialect and path clx drives\n"
               << "  --help                Display this help message\n\n"
@@ -414,6 +439,17 @@ int main(int argc, char* argv[])
         } else if (arg == "--output" || arg == "-o") {
             if (i + 1 < argc)
                 custom_output_name = argv[++i];
+        } else if (arg == "--natives") {
+            //------------------ natives manifest: engine functions called directly with unboxed arguments (src/builtins.h)
+            if (i + 1 >= argc) {
+                std::cerr << "clx: --natives needs a file\n";
+                return 1;
+            }
+            std::string err = clx::load_natives_manifest(argv[++i]);
+            if (!err.empty()) {
+                std::cerr << "clx: " << err << "\n";
+                return 1;
+            }
         } else if (arg == "--minimal") {
             minimal_active = true;
         } else if (arg == "--dynamic") {
@@ -570,6 +606,12 @@ int main(int argc, char* argv[])
 #endif
         msvc_opt_flags = "/O2 /Ot" + msvc_wpo + " /GR- /MD /EHsc /GS- /fp:fast /Gw /Gy /utf-8";
     }
+
+    //------------------ GCC: no identical code folding. The runtime archives are LTO bytecode, so user code and runtime are
+    //------------------ optimised together, and GCC's ICF can merge same-code functions over different types while keeping one
+    //------------------ type-based mod/ref summary, which turns live stores into dead ones (CMakeLists.txt, next to CLX_LTO_FLAG)
+    if (cc.name == "GNU" && !debug_mode)
+        opt_flags += " -fno-ipa-icf";
 
 #ifndef CLX_ARCH_GCC_FLAG
 #define CLX_ARCH_GCC_FLAG ""
@@ -729,7 +771,7 @@ int main(int argc, char* argv[])
                 fs::create_directories(cpp_dir);
             cpp_file = per_name + ".cpp";
         } else {
-            cpp_file = fs::temp_directory_path() / (module_name + "_tmp.cpp");
+            cpp_file = clx_work_dir() / (module_name + "_tmp.cpp");
         }
 
         clx::CodeEmitter emitter(ctx, cpp_file.string().c_str(), analysis);
@@ -795,7 +837,10 @@ int main(int argc, char* argv[])
                 need_base.insert("next"); //------------------ pairs() returns the global next iterator
         }
         if (need_full) {
-            appender << "    clx::LState* L = clx::open(argc, argv);\n";
+            //------------------ what clx::open() does, spelled out: open() returns with collection on, and registration must finish before it is
+            appender << "    clx::LState* L = clx::open_bare(argc, argv);\n";
+            appender << "    clx::luastd_base(L);\n";
+            appender << "    clx::luastd_package(L);\n";
         } else {
             appender << "    clx::LState* L = clx::open_bare(argc, argv);\n";
             for (const char** f = kBaseFns; *f; ++f) {
@@ -822,6 +867,8 @@ int main(int argc, char* argv[])
             appender << "    //   Installed: <libdir>/libclx_lua.a (or <ProgramFiles>/clx/lib/clx_lua.lib)\n";
             appender << "    clx_register_load_builtins(L);\n";
         }
+        //------------------ open_bare returns with collection off (see state.cpp): the registration above ran without it, user code runs with it
+        appender << "    L->gc_running = true;\n";
         appender << "    try {\n";
 
         for (size_t i = 1; i < input_files.size(); ++i) {
@@ -836,6 +883,15 @@ int main(int argc, char* argv[])
             appender << "        L->register_module(\"" << lua_mod << "\", luaopen_" << mod << ");\n";
             if (lua_mod != mod)
                 appender << "        L->register_module(\"" << mod << "\", luaopen_" << mod << ");\n";
+            {   // the hash of the source this module is built from: with --dynamic a changed file takes over from the compiled module (tiered loading)
+                std::ifstream src_in(input_files[i], std::ios::binary);
+                std::string src_text((std::istreambuf_iterator<char>(src_in)), std::istreambuf_iterator<char>());
+                uint64_t h = 1469598103934665603ULL;
+                for (unsigned char c : src_text) { h ^= c; h *= 1099511628211ULL; }
+                appender << "        clx::register_module_hash(L, \"" << lua_mod << "\", " << h << "ULL);\n";
+                if (lua_mod != mod)
+                    appender << "        clx::register_module_hash(L, \"" << mod << "\", " << h << "ULL);\n";
+            }
         }
         for (const auto& mod : precompiled_modules) {
             ModuleLinkKind kind = module_kinds.at(mod);
@@ -1152,7 +1208,7 @@ int main(int argc, char* argv[])
 
     std::string cmd;
     if (msvc_dialect) {
-        std::string tmp_dir = fs::temp_directory_path().string();
+        std::string tmp_dir = clx_work_dir().string();
         while (!tmp_dir.empty() && (tmp_dir.back() == '\\' || tmp_dir.back() == '/'))
             tmp_dir.pop_back();
 
@@ -1194,7 +1250,7 @@ int main(int argc, char* argv[])
         if (mode == BuildMode::Object)
             cmd = cc.cmd + " -c " + opt_flags + gcc_dce_cl + " -std=c++17" + include_opt + " -fPIC " + all_cpp_files
                 + " -o \""
-                + (fs::temp_directory_path() / (fs::path(input_files[0]).stem().string() + "_tmp.o")).string() + "\""
+                + (clx_work_dir() / (fs::path(input_files[0]).stem().string() + "_tmp.o")).string() + "\""
                 + cc_options_str;
         else if (mode == BuildMode::Static) {
             std::string ext = ".a";
@@ -1277,10 +1333,10 @@ int main(int argc, char* argv[])
 #endif
         }
         std::string module_name = fs::path(input_files[0]).stem().string();
-        fs::path generated_obj = fs::temp_directory_path() / (module_name + "_tmp.obj");
+        fs::path generated_obj = clx_work_dir() / (module_name + "_tmp.obj");
 
         if (!fs::exists(generated_obj)) {
-            generated_obj = fs::temp_directory_path() / (module_name + "_tmp.o");
+            generated_obj = clx_work_dir() / (module_name + "_tmp.o");
         }
 
         if (fs::exists(generated_obj)) {

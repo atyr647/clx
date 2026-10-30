@@ -76,6 +76,11 @@ void clx_to_vm_value_(LState* clx_L, lua_State* L, const LValue& v)
         return;
     }
     case Table:
+        if (v.as_pointer() && (v.as_pointer()->flags & LFLAG_VM_PROXY)) {
+            // a clx handle for a table that lives in the VM: hand the VM its own table back, not a proxy of a proxy
+            lua_rawgeti(L, LUA_REGISTRYINDEX, static_cast<VMTableProxy*>(v.as_pointer())->registry_ref);
+            return;
+        }
         if (v.as_pointer()) {
 
             LHeader* h = v.as_pointer();
@@ -128,6 +133,10 @@ void clx_to_vm_value_(LState* clx_L, lua_State* L, const LValue& v)
         }
         return;
     case Function:
+        if (v.as_pointer() && (v.as_pointer()->flags & LFLAG_VM_PROXY)) {
+            lua_rawgeti(L, LUA_REGISTRYINDEX, static_cast<VMFunction*>(v.as_pointer())->registry_ref);
+            return;
+        }
         if (v.as_pointer()) {
 
             NativeBridge* nb = create_bridge(clx_L, L, v);

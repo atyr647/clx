@@ -9,7 +9,12 @@
 #define CLX_BUILTINS_H
 
 #include <cstdint>
+#include <deque>
+#include <fstream>
+#include <sstream>
+#include <string>
 #include <string_view>
+#include <vector>
 
 namespace clx {
 
@@ -40,6 +45,98 @@ struct BuiltinConst {
     const char *native;
     bool is_int;
 };
+
+//------------------ NativeEntry: an engine function or value declared by a natives manifest (clx --natives FILE). A call
+//------------------ module.name(args) is lowered to the C function cname with unboxed arguments, through the same intrinsic
+//------------------ path as math.sqrt; a getter module.name reads cname() where a number is expected. Signatures use the
+//------------------ types void (return only), double, int64 (int64_t) and int32 (C int). An integer argument that is not an integral
+//------------------ number raises Lua's "number has no integer representation"; an int32 argument outside the int range raises
+//------------------ "integer out of range" instead of being truncated. Manifest lines (# starts a comment):
+//------------------   fn  engine.set_xy       engine_set_xy       void   int32 double double
+//------------------   get engine.dt           engine_dt           double
+//------------------ The host must keep these fields fixed at run time (the engine module table should refuse writes), since a
+//------------------ lowered call no longer looks the field up; a write to the field anywhere in the program disables lowering.
+struct NativeEntry {
+    std::string module, name, cname, ret;
+    std::vector<std::string> params;
+    bool getter = false;
+    std::string intrinsic, boxed, native_expr;
+    BuiltinEntry be {};
+    BuiltinConst bc {};
+};
+inline std::deque<NativeEntry> &native_registry() {
+    static std::deque<NativeEntry> r;   // deque: entries never move, so the string_views in be/bc stay valid
+    return r;
+}
+inline const NativeEntry *native_by_intrinsic(std::string_view cname) {
+    for (const auto &e : native_registry())
+        if (!e.getter && e.intrinsic == cname)
+            return &e;
+    return nullptr;
+}
+inline bool is_native_module_name(std::string_view m) {
+    for (const auto &e : native_registry())
+        if (e.module == m)
+            return true;
+    return false;
+}
+//------------------ load_natives_manifest: parses FILE into the registry; returns an error message, empty on success
+inline std::string load_natives_manifest(const std::string &path) {
+    std::ifstream f(path);
+    if (!f)
+        return "cannot open natives manifest " + path;
+    std::string line;
+    int ln = 0;
+    auto type_ok = [](const std::string &t, bool ret) { return t == "double" || t == "int64" || t == "int32" || (ret && t == "void"); };
+    while (std::getline(f, line)) {
+        ++ln;
+        if (auto h = line.find('#'); h != std::string::npos)
+            line.erase(h);
+        std::istringstream ss(line);
+        std::string kind, qual, cname, ret;
+        if (!(ss >> kind))
+            continue;
+        if (!(ss >> qual >> cname >> ret))
+            return path + ":" + std::to_string(ln) + ": expected '<fn|get> module.name cname type...'";
+        auto dot = qual.find('.');
+        if (dot == std::string::npos || dot == 0 || dot + 1 == qual.size())
+            return path + ":" + std::to_string(ln) + ": '" + qual + "' is not module.name";
+        NativeEntry e;
+        e.module = qual.substr(0, dot);
+        e.name = qual.substr(dot + 1);
+        e.cname = cname;
+        e.ret = ret;
+        if (kind == "fn") {
+            if (!type_ok(ret, true))
+                return path + ":" + std::to_string(ln) + ": return type must be void, double, int64 or int32";
+            std::string p;
+            while (ss >> p) {
+                if (!type_ok(p, false))
+                    return path + ":" + std::to_string(ln) + ": parameter type must be double, int64 or int32";
+                e.params.push_back(p);
+            }
+        } else if (kind == "get") {
+            if (ret != "double")
+                return path + ":" + std::to_string(ln) + ": a getter's type must be double";
+            e.getter = true;
+        } else {
+            return path + ":" + std::to_string(ln) + ": unknown kind '" + kind + "' (fn or get)";
+        }
+        native_registry().push_back(std::move(e));
+        NativeEntry &r = native_registry().back();
+        if (r.getter) {
+            r.native_expr = "static_cast<double>(" + r.cname + "())";
+            r.boxed = "clx::LValue(" + r.native_expr + ")";
+            r.bc = BuiltinConst { r.module, r.name, r.boxed.c_str(), r.native_expr.c_str(), false };
+        } else {
+            r.intrinsic = "__native_" + r.cname;
+            //------------------ int results stay boxed (numeric=false): a double context would lose the integer subtype
+            r.be = BuiltinEntry { r.module, r.name, r.intrinsic.c_str(), nullptr, static_cast<uint8_t>(r.params.size()), true,
+                r.ret == "double" };
+        }
+    }
+    return { };
+}
 
 //------------------ builtin_lookup: registry entry for module.name, else nullptr
 inline const BuiltinEntry *builtin_lookup(std::string_view module, std::string_view name) {
@@ -123,6 +220,9 @@ inline const BuiltinEntry *builtin_lookup(std::string_view module, std::string_v
         if (e.module == module && e.name == name)
             return &e;
     }
+    for (const auto &e : native_registry())
+        if (!e.getter && e.module == module && e.name == name)
+            return &e.be;
     return nullptr;
 }
 
@@ -140,6 +240,9 @@ inline const BuiltinConst *builtin_const_lookup(std::string_view module, std::st
         if (c.module == module && c.name == name)
             return &c;
     }
+    for (const auto &e : native_registry())
+        if (e.getter && e.module == module && e.name == name)
+            return &e.bc;
     return nullptr;
 }
 
@@ -152,6 +255,8 @@ inline bool is_std_module_name(std::string_view name) {
         if (m == name)
             return true;
     }
+    if (is_native_module_name(name))   // natives modules get the same write scan: a write to module.field disables lowering
+        return true;
     return false;
 }
 

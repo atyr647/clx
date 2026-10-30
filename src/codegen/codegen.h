@@ -8,6 +8,7 @@
 #ifndef CODEGEN_H
 #define CODEGEN_H
 
+#include <unordered_map>
 #include "../optimizer/analysis_state.h"
 #include "../syntax/nodes.h"
 #include <fstream>
@@ -67,6 +68,9 @@ private:
     std::ofstream out;
     std::vector<LocalVar> locals;
     AnalysisState &state;
+    //------------------ emit_line: the source line L->current_line holds at this point of the emitted code (set per statement; a line-sensitive expression on another line of a multi-line statement sets it again)
+    int emit_line = 0;
+    std::string emit_site;   // the call-site descriptor L->current_site holds at this point of the emitted code (empty when none is set, e.g. in a fast function)
 
     //------------------ is_local: checks if name is a local and sets out_is_boxed
     bool is_local(std::string_view name, bool &out_is_boxed);
@@ -84,6 +88,24 @@ private:
     std::string int_flag_expr(uint32_t expr_idx, int depth);
     //------------------ int_value_expr: C++ int64 expression for an expression proven integral by int_flag_expr
     std::string int_value_expr(uint32_t expr_idx, int depth);
+    //------------------ boxed_rhs: expression node -> name of the boxed temporary holding its value (see box_rhs_if_dynamic_len)
+    std::unordered_map<uint32_t, std::string> boxed_rhs;
+    struct BoxedRhsGuard {
+        CodeEmitter *e = nullptr;
+        uint32_t idx = 0;
+        BoxedRhsGuard() = default;
+        BoxedRhsGuard(CodeEmitter *e_, uint32_t i) : e(e_), idx(i) { }
+        BoxedRhsGuard(BoxedRhsGuard &&o) noexcept : e(o.e), idx(o.idx) { o.e = nullptr; }
+        BoxedRhsGuard &operator=(BoxedRhsGuard &&o) noexcept {
+            if (e) e->boxed_rhs.erase(idx);
+            e = o.e; idx = o.idx; o.e = nullptr;
+            return *this;
+        }
+        ~BoxedRhsGuard() { if (e) e->boxed_rhs.erase(idx); }
+    };
+    bool len_static_int(uint32_t len_idx);
+    bool rhs_has_dynamic_len(uint32_t idx, int depth);
+    BoxedRhsGuard box_rhs_if_dynamic_len(uint32_t rhs_idx);
     //------------------ fast_call_box_flag: C++ bool expression restoring the return subtype of a fast call
     std::string fast_call_box_flag(std::string_view fname, uint32_t first_arg, uint32_t arg_count);
 
@@ -98,6 +120,7 @@ private:
 
     //------------------ emit_node: dispatches to the emitXxx method matching node's type
     void emit_node(uint32_t node_idx);
+    void emit_node_unlined(const ASTNode &node, uint32_t node_idx);
 
     //------------------ emit_native: emits an expression coerced to a raw C++ double
     void emit_native(uint32_t n_idx);
@@ -228,6 +251,7 @@ private:
     void emitFalseLiteral(const ASTNode &node, uint32_t node_idx);
     void emitNilLiteral(const ASTNode &node, uint32_t node_idx);
     void emitTableOp(int bin_op, uint32_t lhs_tbl, uint32_t lhs_key, uint32_t const_idx, bool nil_ok);
+    void emit_native_entry_call(const NativeEntry &ne, const ASTNode &node);
     void emitNumber(const ASTNode &node, uint32_t node_idx);
     void emitInteger(const ASTNode &node, uint32_t node_idx);
     void emitIdentifier(const ASTNode &node, uint32_t node_idx);

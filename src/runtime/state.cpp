@@ -89,10 +89,19 @@ LState::LState()
             gc_minor_threshold_env = true;
         }
     }
+    if (const char *e = getenv("CLX_GC_POLICY")) {
+        gc_policy = atoi(e);
+        if (gc_policy == 1 && !getenv("CLX_GC_MINOR_KB"))
+            gc_minor_threshold = gc_policy_min;
+    }
+    if (const char *e = getenv("CLX_GC_MIN_KB")) { long long v = atoll(e); if (v > 0) gc_policy_min = size_t(v) * 1024; }
+    if (const char *e = getenv("CLX_GC_MAX_KB")) { long long v = atoll(e); if (v > 0) gc_policy_max = size_t(v) * 1024; }
+    if (const char *e = getenv("CLX_GC_GROW_PCT")) { long long v = atoll(e); if (v > 0) gc_policy_grow_pct = int(v); }
+    if (const char *e = getenv("CLX_GC_SHRINK_PCT")) { long long v = atoll(e); if (v > 0) gc_policy_shrink_pct = int(v); }
     if (const char *e = getenv("CLX_GC_MAJOR_KB")) {
         long long v = atoll(e);
         if (v > 0)
-            gc_major_threshold = size_t(v) * 1024;
+            gc_major_threshold = gc_major_floor = size_t(v) * 1024;
     }
 }
 
@@ -494,8 +503,12 @@ thread_local LState *clx_current_L = nullptr;
 //------------------ open_bare — create Lua state without registering any std library. Generated
 //------------------ executables use this plus a filtered registration sequence so the linker strips
 //------------------ unreferenced base functions; open() below preserves the legacy all-registered behavior.
+//------------------ It returns with collection OFF (gc_running = false): the std registrars create objects that nothing roots yet, so a collection
+//------------------ during registration (reachable with a small CLX_GC_MINOR_KB) freed them and left io.open, os.tmpname... nil. The caller sets
+//------------------ gc_running = true once registration is done (open() and the generated main do).
 LState *open_bare(int argc, char *argv[]) {
     LState *L = new LState();
+    L->gc_running = false;
     clx_current_L = L;
 
     LThread *main_th = new LThread();
@@ -506,6 +519,8 @@ LState *open_bare(int argc, char *argv[]) {
     main_th->fiber = ConvertThreadToFiber(nullptr);
 #elif (defined(__APPLE__) || defined(__linux__)) && (defined(__aarch64__) || defined(__x86_64__))
     clx_coro_save(&main_th->ctx);
+#elif defined(__wasi__)
+    // the main thread is the WASI guest's own thread: nothing to capture (see CoroutineContext in clx_runtime.h)
 #else
     getcontext(&main_th->ctx);
 #endif
@@ -529,6 +544,7 @@ LState *open(int argc, char *argv[]) {
     LState *L = open_bare(argc, argv);
     luastd_base(L);
     luastd_package(L);
+    L->gc_running = true;
     return L;
 }
 
