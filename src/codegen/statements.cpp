@@ -462,6 +462,9 @@ void CodeEmitter::emitBlock(const ASTNode &node, uint32_t node_idx, DeferredBloc
     size_t prev_locals = locals.size();
     int redecl_scopes = 0;
     std::set<std::string_view> current_block_vars;
+    //------------------ the site statics declared inside this block go out of scope with it
+    const int block_emit_line = emit_line;
+    const std::string block_emit_site = emit_site;
 
     for (uint32_t i = 0; i < node.as.block.count; ++i) {
         uint32_t stmt_idx = ctx.block_statements[node.as.block.first_statement + i];
@@ -526,6 +529,8 @@ void CodeEmitter::emitBlock(const ASTNode &node, uint32_t node_idx, DeferredBloc
         if (own_scope)
             out << "}\n";
     }
+    emit_line = block_emit_line;
+    emit_site = block_emit_site;
 
     if (def) {
         def->prev_locals = prev_locals;
