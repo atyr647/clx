@@ -64,8 +64,8 @@ static inline void root_load(LState *L, LThread *t) {
 
 #if defined(__wasi__) && defined(CLX_WASM_STACK_SWITCHING)
 //------------------ WebAssembly stack switching. Wasmtime's stack-switching instructions (cont.new / resume / suspend) cannot be emitted by clang, so the
-//------------------ four clx_costack_* functions below are stubs whose bodies tools/wasm-costack-splice.py replaces after linking (scripts/ and
-//------------------ decisions/scripting-direction.md section 3b). The stubs are noinline/optnone with a memory clobber so the optimiser infers nothing about them.
+//------------------ clx_costack_new / resume / suspend below are stubs. A post-link step rewrites their bodies in the linked module into the instructions (cont.new, resume,
+//------------------ suspend) and the exported names are what it looks for. The stubs are noinline/optnone with a memory clobber so the optimiser infers nothing about them.
 //
 //------------------ A coroutine runs on a CoWorker: a continuation that never finishes, plus a stack in linear memory (the wasm "shadow" stack, which
 //------------------ the host cannot protect). Wasmtime 49 frees no continuation until the store is dropped, so workers are created once and reused:
