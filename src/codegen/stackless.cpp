@@ -419,18 +419,18 @@ struct Analyzer {
         for_each_function([&](uint32_t f) {
             FuncResult r;
             stmt(ctx.nodes[f].as.func_def.body_block, r);
+            for (auto &rep : r.reports) {   // reported whether or not the function gets a form: without one the call raises at run time under a coroutine
+                std::string msg = ctx.filename + ":" + std::to_string(rep.first) + ": stackless: " + rep.second;
+                state.co_diagnostics.push_back(msg);
+                if (diag)
+                    std::fprintf(stderr, "%s\n", msg.c_str());
+            }
             if (r.awaited.empty())
                 return;
             state.co_lowered.insert(f);
             lowered.push_back(f);
             state.co_await_calls.insert(r.awaited.begin(), r.awaited.end());
             state.co_pcall_calls.insert(r.pcalls.begin(), r.pcalls.end());
-            for (auto &rep : r.reports) {
-                std::string msg = ctx.filename + ":" + std::to_string(rep.first) + ": stackless: " + rep.second;
-                state.co_diagnostics.push_back(msg);
-                if (diag)
-                    std::fprintf(stderr, "%s\n", msg.c_str());
-            }
         });
     }
 };

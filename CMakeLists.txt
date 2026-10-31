@@ -3,6 +3,10 @@ project(clx VERSION 0.4.0 LANGUAGES C CXX ASM)
 
 set(CMAKE_CXX_STANDARD 20)   # costack.cpp (stackless coroutines) needs C++20
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+option(CLX_STACKLESS_ONLY "Build the runtime as for a target with no stacks to switch: a thread body without a coroutine form runs to completion (programs are then compiled with -DCLX_STACKLESS_ONLY too)" OFF)
+if(CLX_STACKLESS_ONLY)
+    add_compile_definitions(CLX_STACKLESS_ONLY=1)
+endif()
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 include(CheckIPOSupported)
