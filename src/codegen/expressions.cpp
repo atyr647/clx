@@ -43,23 +43,23 @@ void CodeEmitter::emit_intrinsic_native_body(const ASTNode &n) {
             out << "0.0";
         return;
     }
-    if (strcmp(_cn, "std::log") == 0 && n.as.intrinsic_call.arg_count > 1) {
-        out << "std::log(";
+    if (strcmp(_cn, "CLX_MATH_NS::log") == 0 && n.as.intrinsic_call.arg_count > 1) {
+        out << "CLX_MATH_NS::log(";
         emit_native(ctx.block_statements[n.as.intrinsic_call.first_arg]);
-        out << ") / std::log(";
+        out << ") / CLX_MATH_NS::log(";
         emit_native(ctx.block_statements[n.as.intrinsic_call.first_arg + 1]);
         out << ")";
         return;
     }
     //------------------ Lua's math.atan(y, x) is atan2 when given two arguments
     const char *fn = _cn;
-    if (strcmp(_cn, "std::atan") == 0 && n.as.intrinsic_call.arg_count > 1)
-        fn = "std::atan2";
+    if (strcmp(_cn, "CLX_MATH_NS::atan") == 0 && n.as.intrinsic_call.arg_count > 1)
+        fn = "CLX_MATH_NS::atan2";
     out << fn << "(";
     if (n.as.intrinsic_call.arg_count > 0) {
         emit_native(ctx.block_statements[n.as.intrinsic_call.first_arg]);
         if (n.as.intrinsic_call.arg_count > 1
-            && (strcmp(fn, "std::fmod") == 0 || strcmp(fn, "std::atan2") == 0 || strcmp(fn, "std::pow") == 0)) {
+            && (strcmp(fn, "std::fmod") == 0 || strcmp(fn, "CLX_MATH_NS::atan2") == 0 || strcmp(fn, "CLX_MATH_NS::pow") == 0)) {
             out << ", ";
             emit_native(ctx.block_statements[n.as.intrinsic_call.first_arg + 1]);
         }
@@ -543,22 +543,22 @@ void CodeEmitter::emitIntrinsicCall(const ASTNode &node, uint32_t node_idx) {
         if (strcmp(_cn, "__clx_deg") == 0 || strcmp(_cn, "__clx_rad") == 0) {
             emit_native(ctx.block_statements[node.as.intrinsic_call.first_arg]);
             out << (_cn[7] == 'd' ? " * 57.29577951308232" : " * 0.017453292519943295");
-        } else if (strcmp(_cn, "std::log") == 0 && node.as.intrinsic_call.arg_count > 1) {
-            out << "std::log(";
+        } else if (strcmp(_cn, "CLX_MATH_NS::log") == 0 && node.as.intrinsic_call.arg_count > 1) {
+            out << "CLX_MATH_NS::log(";
             emit_native(ctx.block_statements[node.as.intrinsic_call.first_arg]);
-            out << ") / std::log(";
+            out << ") / CLX_MATH_NS::log(";
             emit_native(ctx.block_statements[node.as.intrinsic_call.first_arg + 1]);
             out << ")";
         } else {
             //------------------ Lua's math.atan(y, x) is atan2 when given two arguments
             const char *fn = _cn;
-            if (strcmp(_cn, "std::atan") == 0 && node.as.intrinsic_call.arg_count > 1)
-                fn = "std::atan2";
+            if (strcmp(_cn, "CLX_MATH_NS::atan") == 0 && node.as.intrinsic_call.arg_count > 1)
+                fn = "CLX_MATH_NS::atan2";
             out << fn << "(";
             if (node.as.intrinsic_call.arg_count > 0) {
                 emit_native(ctx.block_statements[node.as.intrinsic_call.first_arg]);
                 if (node.as.intrinsic_call.arg_count > 1
-                    && (strcmp(fn, "std::fmod") == 0 || strcmp(fn, "std::atan2") == 0 || strcmp(fn, "std::pow") == 0)) {
+                    && (strcmp(fn, "std::fmod") == 0 || strcmp(fn, "CLX_MATH_NS::atan2") == 0 || strcmp(fn, "CLX_MATH_NS::pow") == 0)) {
                     out << ", ";
                     emit_native(ctx.block_statements[node.as.intrinsic_call.first_arg + 1]);
                 }

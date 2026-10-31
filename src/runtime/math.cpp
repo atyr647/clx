@@ -35,14 +35,14 @@ MultiValue math_abs(LState *L, const LValue *args, size_t count) {
 MultiValue math_acos(LState *L, const LValue *args, size_t count) {
     if (count == 0)
         clx::error(L, bad_arg_msg(L, 1, "math.acos", "number expected, got no value").c_str());
-    return MultiValue(clx::number(std::acos(clx::check_number(L, args[0]))));
+    return MultiValue(clx::number(CLX_MATH_NS::acos(clx::check_number(L, args[0]))));
 }
 
 //------------------ math_asin: returns arc sine of a number
 MultiValue math_asin(LState *L, const LValue *args, size_t count) {
     if (count == 0)
         clx::error(L, bad_arg_msg(L, 1, "math.asin", "number expected, got no value").c_str());
-    return MultiValue(clx::number(std::asin(clx::check_number(L, args[0]))));
+    return MultiValue(clx::number(CLX_MATH_NS::asin(clx::check_number(L, args[0]))));
 }
 
 //------------------ math_atan: returns arc tangent (or atan2 if 2 args)
@@ -52,9 +52,9 @@ MultiValue math_atan(LState *L, const LValue *args, size_t count) {
     double y = clx::check_number(L, args[0]);
     if (count > 1) {
         double x = clx::check_number(L, args[1]);
-        return MultiValue(clx::number(std::atan2(y, x)));
+        return MultiValue(clx::number(CLX_MATH_NS::atan2(y, x)));
     }
-    return MultiValue(clx::number(std::atan(y)));
+    return MultiValue(clx::number(CLX_MATH_NS::atan(y)));
 }
 
 //------------------ math_ceil: returns smallest integer >= x
@@ -74,7 +74,7 @@ MultiValue math_ceil(LState *L, const LValue *args, size_t count) {
 MultiValue math_cos(LState *L, const LValue *args, size_t count) {
     if (count == 0)
         clx::error(L, bad_arg_msg(L, 1, "math.cos", "number expected, got no value").c_str());
-    return MultiValue(clx::number(std::cos(clx::check_number(L, args[0]))));
+    return MultiValue(clx::number(CLX_MATH_NS::cos(clx::check_number(L, args[0]))));
 }
 
 //------------------ math_deg: converts radians to degrees
@@ -88,7 +88,7 @@ MultiValue math_deg(LState *L, const LValue *args, size_t count) {
 MultiValue math_exp(LState *L, const LValue *args, size_t count) {
     if (count == 0)
         clx::error(L, bad_arg_msg(L, 1, "math.exp", "number expected, got no value").c_str());
-    return MultiValue(clx::number(std::exp(clx::check_number(L, args[0]))));
+    return MultiValue(clx::number(CLX_MATH_NS::exp(clx::check_number(L, args[0]))));
 }
 
 //------------------ math_floor: returns largest integer <= x
@@ -156,7 +156,7 @@ MultiValue math_rad(LState *L, const LValue *args, size_t count) {
 MultiValue math_sin(LState *L, const LValue *args, size_t count) {
     if (count == 0)
         clx::error(L, bad_arg_msg(L, 1, "math.sin", "number expected, got no value").c_str());
-    return MultiValue(clx::number(std::sin(clx::check_number(L, args[0]))));
+    return MultiValue(clx::number(CLX_MATH_NS::sin(clx::check_number(L, args[0]))));
 }
 
 //------------------ math_sqrt: returns square root of a number
@@ -170,7 +170,7 @@ MultiValue math_sqrt(LState *L, const LValue *args, size_t count) {
 MultiValue math_tan(LState *L, const LValue *args, size_t count) {
     if (count == 0)
         clx::error(L, bad_arg_msg(L, 1, "math.tan", "number expected, got no value").c_str());
-    return MultiValue(clx::number(std::tan(clx::check_number(L, args[0]))));
+    return MultiValue(clx::number(CLX_MATH_NS::tan(clx::check_number(L, args[0]))));
 }
 
 //------------------ math_frexp: breaks float into mantissa and exponent
@@ -199,9 +199,9 @@ MultiValue math_log(LState *L, const LValue *args, size_t count) {
     double x = clx::check_number(L, args[0]);
     if (count > 1 && args[1].type != ValueType::Nil) {
         double base = clx::check_number(L, args[1]);
-        return MultiValue(clx::number(std::log(x) / std::log(base)));
+        return MultiValue(clx::number(CLX_MATH_NS::log(x) / CLX_MATH_NS::log(base)));
     }
-    return MultiValue(clx::number(std::log(x)));
+    return MultiValue(clx::number(CLX_MATH_NS::log(x)));
 }
 
 //------------------ math_modf: splits number into integer and fractional parts

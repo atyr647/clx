@@ -8,6 +8,12 @@
 #ifndef CLX_RUNTIME_H
 #define CLX_RUNTIME_H
 
+//------------------ The transcendental functions of the runtime and of generated code (sin cos tan asin acos atan atan2 sinh cosh tanh exp log log10 pow, on double). They are the standard library's unless
+//------------------ the program is built with -DCLX_MATH_NS=<namespace>: a program that must give bit-identical results on every machine supplies its own implementations there.
+#ifndef CLX_MATH_NS
+#define CLX_MATH_NS std
+#endif
+
 #include <cctype>
 #include <cerrno>
 #include <cmath>
@@ -3336,11 +3342,11 @@ CLX_INLINE LValue pow(LState *L, const LValue &a, const LValue &b) {
         && (b.type == ValueType::Double || b.type == ValueType::Int64)) {
         double l = (a.type == ValueType::Int64) ? static_cast<double>(a.val.payload.i64) : a.val.payload.f64;
         double r = (b.type == ValueType::Int64) ? static_cast<double>(b.val.payload.i64) : b.val.payload.f64;
-        return LValue(std::pow(l, r));
+        return LValue(CLX_MATH_NS::pow(l, r));
     }
     double l, r;
     if (a.to_number(l) && b.to_number(r))
-        return LValue(std::pow(l, r));
+        return LValue(CLX_MATH_NS::pow(l, r));
     return call_bin_metamethod(L, a, b, L->str_pow, "__pow");
 }
 
