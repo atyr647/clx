@@ -513,6 +513,10 @@ void LState::gc_minor() {
     };
 
     //------------------ roots: root-frame chain, state threads, permanent roots
+    //------------------ The main thread is not on the allocation chain, so no sweep ever clears its mark: it is cleared here, or a collection
+    //------------------ that runs inside a coroutine would skip the main thread and its saved root frames.
+    if (main_thread)
+        main_thread->marked = 0;
     if (_G)
         push_if_needed(LValue(Table, _G));
     if (main_thread)
@@ -1126,6 +1130,10 @@ void LState::gc_drain_recent() {
 
 void LState::gc_mark_roots() {
     auto mark = [&](const LValue &v) { gc_mark_gray(v); };
+    //------------------ the main thread is not on the allocation chain, so no sweep clears its mark: clear it here, so that it is traced (its saved
+    //------------------ root frames are the roots of the program while a coroutine runs) in every cycle, and again in the atomic phase
+    if (main_thread)
+        main_thread->marked = 0;
     if (_G)
         mark(LValue(Table, _G));
     if (main_thread)
