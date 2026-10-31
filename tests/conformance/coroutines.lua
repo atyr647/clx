@@ -212,5 +212,25 @@ do
     assert_eq(closed_flag, true, "6.12 obj closed via __close after coroutine.close")
 end
 
+print("\n----------------- 7. Resuming a non-suspended coroutine")
+do
+    local co
+    co = coroutine.create(function()
+        local ok, msg = coroutine.resume(co)
+        assert_eq(ok, false, "7.1 a running coroutine cannot resume itself")
+        assert_eq(msg, "cannot resume non-suspended coroutine", "7.2 message for a running coroutine")
+        local outer = coroutine.create(function()
+            local ok2, msg2 = coroutine.resume(co)
+            assert_eq(ok2, false, "7.3 a coroutine that is waiting on another (normal) cannot be resumed")
+            assert_eq(msg2, "cannot resume non-suspended coroutine", "7.4 message for a normal coroutine")
+        end)
+        coroutine.resume(outer)
+        local wrapped = coroutine.wrap(function() return coroutine.resume(co) end)
+        local ok3, msg3 = wrapped()
+        assert_eq(ok3, false, "7.5 resume of a normal coroutine through wrap")
+        return "done"
+    end)
+    assert_eq(select(2, coroutine.resume(co)), "done", "7.6 the coroutine ran to completion")
+end
 
 print_summary("COROUTINES")

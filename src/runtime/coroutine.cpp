@@ -27,6 +27,10 @@ clx::MultiValue coroutine_resume(clx::LState *L, const clx::LValue *args, size_t
         clx::LValue r[2] = { clx::boolean(false), clx::string(L, "cannot resume dead coroutine") };
         return clx::MultiValue(r, 2, L);
     }
+    if (t->status == THREAD_RUNNING || t->status == THREAD_NORMAL) {   // itself, or a coroutine that is waiting for the one it resumed
+        clx::LValue r[2] = { clx::boolean(false), clx::string(L, "cannot resume non-suspended coroutine") };
+        return clx::MultiValue(r, 2, L);
+    }
 
     clx::LValue thread_val = args[0];
     size_t arg_count = count > 1 ? count - 1 : 0;
@@ -77,6 +81,8 @@ static clx::MultiValue coroutine_wrap(clx::LState *L, const clx::LValue *args, s
             LThread *t = static_cast<LThread *>(thread.as_pointer());
             if (t->status == THREAD_DEAD)
                 clx::error(L2, "cannot resume dead coroutine");
+            if (t->status == THREAD_RUNNING || t->status == THREAD_NORMAL)
+                clx::error(L2, "cannot resume non-suspended coroutine");
             clx::MultiValue result = clx::resume(L2, thread, call_args, call_arg_count);
             if (result.count == 0)
                 clx::error(L2, "cannot resume dead coroutine");
