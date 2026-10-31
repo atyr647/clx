@@ -45,6 +45,11 @@ inline CoFreeNode *&co_bin(size_t n) {
     static thread_local CoFreeNode *bins[kCoPoolMax / 64 + 1] = {};
     return bins[(n + 63) / 64];
 }
+#if defined(CLX_CO_NO_POOL)
+// a leak detector cannot see a frame that was not released while a free list still holds a stale pointer to it (the memory of a pooled frame keeps what it held): builds for leak tests turn the pool off
+inline void *co_alloc(size_t n) { return ::operator new(n); }
+inline void co_free(void *p, size_t) noexcept { ::operator delete(p); }
+#else
 inline void *co_alloc(size_t n) {
     if (n <= kCoPoolMax) {
         CoFreeNode *&head = co_bin(n);
@@ -67,6 +72,7 @@ inline void co_free(void *p, size_t n) noexcept {
     }
     ::operator delete(p);
 }
+#endif
 }   // namespace co_detail
 
 struct CoPromiseBase {
@@ -166,6 +172,14 @@ struct CoCall {
     MultiValue ready;
     void *child = nullptr;
 
+    // the awaiter owns the frame of the child it started until await_resume takes it over: a coroutine destroyed while suspended in this call never resumes, and the child frame must go with it
+    ~CoCall() {
+        if (child) {
+            CoResult dead = CoResult::adopt(child);
+            (void)dead;
+        }
+    }
+
     bool await_ready() {
         if (fn.type == Function) {
             LCFunction *f = static_cast<LCFunction *>(fn.as_pointer());
@@ -225,6 +239,13 @@ template<size_t N> struct CoCallN {
         slot[0] = fn;
     }
     CoCallN(const CoCallN &) = delete;
+    // the awaiter owns the frame of the child it started until await_resume takes it over (see CoCall): destroyed while suspended in the call, it gives the child frame back before its own roots go
+    ~CoCallN() {
+        if (child) {
+            CoResult dead = CoResult::adopt(child);
+            (void)dead;
+        }
+    }
     CoCallN &a(const LValue &v) {
         slot[1 + n++] = v;
         return *this;
