@@ -142,7 +142,7 @@ static void dtor_free_table(LTable *t) {
 //------------------ LState::slab_alloc_table — bump-allocate an LTable from the current slab
 LTable *LState::slab_alloc_table() {
     static_assert(alignof(LTable) <= 16, "slab bump assumes 16-byte-aligned table slots");
-    if (slab_current + sizeof(LTable) > slab_end) {
+    if (static_cast<size_t>(slab_end - slab_current) < sizeof(LTable)) {      // a difference, not a sum: slab_current is null before the first slab, and null + n is undefined
         constexpr size_t kAlign = 16;
 
         size_t slab_bytes = sizeof(TableSlab) + kAlign + SLAB_TABLE_COUNT * sizeof(LTable);

@@ -44,6 +44,7 @@ The format is loosely based on Keep a Changelog and the project follows Semantic
 * C++17 conformance: `using enum` in the lexer/parser is replaced by qualified enumerators, and two lambdas no longer capture structured bindings. The build is warning-free under the pinned C++17 standard
 
 ### Fixed
+* The first table allocation of a state computed `nullptr + sizeof(LTable)` (undefined behaviour, reported by UBSan); the room left in the slab is now a difference.
 
 * `coroutine.resume` (and a `coroutine.wrap` function) on a coroutine that is running or waiting on the one it resumed returned control into it and crashed; it now returns / raises "cannot resume non-suspended coroutine".
 * A collection that ran inside a coroutine skipped the main thread: its mark was never cleared, so objects held only by the main thread's frames (still young) were freed and their memory reused.
