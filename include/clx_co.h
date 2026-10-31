@@ -15,6 +15,13 @@
 
 #include "clx_runtime.h"
 #include <coroutine>
+
+// A program with coroutine forms (clx --stackless defines CLX_CO_FORMS before including this) hands control from a coroutine to the one it awaits, and
+// back, by symmetric transfer, which must be a tail call. WebAssembly has tail calls only with the tail-call feature; without it a chain of awaited calls
+// uses one wasm stack frame per call. Compile such a program with -mtail-call (Wasmtime, browsers since 2023 and wasi-sdk's clang support it).
+#if defined(CLX_CO_FORMS) && defined(__wasm__) && !defined(__wasm_tail_call__)
+#error "stackless coroutine forms on WebAssembly need the tail-call feature: compile with -mtail-call"
+#endif
 #include <exception>
 #include <memory>
 #include <utility>
