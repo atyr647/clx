@@ -495,6 +495,8 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                     << ", static_cast<clx::LTable*>(_ENV.as_pointer())"
                                     << (cells_c.empty() ? "" : ", " + cells_c) << ");\n";
                                 out << "clx::upval_init(l_" << name << "_cell, l_" << name << ");\n";
+                                if (state.co_lowered.count(v_idx))
+                                    emit_co_set("l_" + std::string(name), v_idx, std::string(name));
                                 out << "_fr.push(l_" << name << ");\n";
                                 {
                                     size_t _sfi = state.string_pool_index.at(name);
@@ -822,6 +824,8 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                             out << "l_" << name << " = L->create_closure(_impl_" << name
                                 << ", static_cast<clx::LTable*>(_ENV.as_pointer())"
                                 << (_gc_cells_d.empty() ? "" : ", " + _gc_cells_d) << ");\n";
+                            if (!is_boxed && state.co_lowered.count(v_idx))
+                                emit_co_set("l_" + std::string(name), v_idx);
                             {
                                 size_t _sfi2 = state.string_pool_index.at(name);
                                 out << "L->_G->settable(cstr_[" << _sfi2 << "], "
@@ -1400,6 +1404,8 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                         out << "clx::LValue _tmp_" << node_idx << "_" << i << " = L->create_closure(_impl_" << fname
                             << ", static_cast<clx::LTable*>(_ENV.as_pointer())"
                             << (cells_e.empty() ? "" : ", " + cells_e) << ");\n";
+                        if (state.co_lowered.count(v_idx))
+                            emit_co_set("_tmp_" + std::to_string(node_idx) + "_" + std::to_string(i), v_idx);
                         out << "_fr.push(_tmp_" << node_idx << "_" << i << ");\n";
                         state.direct_callables.insert(fname);
                         intercepted = true;

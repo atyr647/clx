@@ -283,6 +283,7 @@ set(SOURCES
     src/codegen/expressions.cpp
     src/codegen/statements.cpp
     src/codegen/loops.cpp
+    src/codegen/stackless.cpp
     src/codegen/assignments.cpp
 )
 

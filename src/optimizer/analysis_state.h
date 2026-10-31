@@ -177,6 +177,20 @@ struct AnalysisState {
     uint32_t current_func_body = 0xFFFFFFFF;
     uint32_t current_arena_func = 0xFFFFFFFF;
     uint32_t current_func_idx = 0xFFFFFFFF;
+
+    //------------------ Stackless coroutine lowering (codegen/stackless.cpp)
+    //------------------ co_lowered: FunctionDef nodes that get a coroutine form next to the ordinary one.
+    //------------------ co_await_calls: CallExpression nodes emitted as awaited coroutine calls inside a coroutine form.
+    //------------------ co_body: the emitter is inside the body of a coroutine form (statement-level returns are co_return).
+    //------------------ emit_co_form: emitFunctionDef emits the coroutine lambda instead of the ordinary function.
+    std::set<uint32_t> co_lowered;
+    std::set<uint32_t> co_await_calls;
+    std::set<uint32_t> co_pcall_calls;   // the awaited calls that are pcall
+    std::set<uint32_t> co_yield_calls;   // the awaited calls that are coroutine.yield
+    std::vector<std::string> co_diagnostics;
+    bool co_enabled = false;   // --stackless
+    bool co_body = false;
+    bool emit_co_form = false;
 };
 
 //------------------ struct_shape_key: canonical shape key for a struct local's field/kind/late layout

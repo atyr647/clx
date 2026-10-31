@@ -507,8 +507,11 @@ void CodeEmitter::emit(uint32_t root_node, std::string_view module_name) {
     state.ref_capture.clear();
     state.raw_lambda_cell.clear();
     state.holder_cell_callables.clear();
+    state.co_body = false;
+    state.emit_co_form = false;
 
     Optimizer(ctx, state).run(ctx, root_node);
+    analyze_stackless(ctx, state);
 
     std::set<std::string_view> captured_decl_names;
     for (uint32_t i = 0; i < ctx.nodes.size(); ++i) {
@@ -662,6 +665,8 @@ void CodeEmitter::emit(uint32_t root_node, std::string_view module_name) {
     }
 
     out << "#include <clx.h>\n";
+    if (!state.co_lowered.empty())
+        out << "#include <clx_co.h>\n";   // coroutine forms (C++20; the driver selects the standard)
     out << "#include <atomic>\n\n";
     if (!native_registry().empty()) {   // the natives manifest's C functions (clx --natives)
         for (const auto &ne : native_registry()) {

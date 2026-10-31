@@ -389,6 +389,7 @@ void print_help()
               << "  --debug               Enable debug symbols\n"
               << "  --size                Optimize for size (default)\n"
               << "  --fast                Optimize for speed\n"
+              << "  --stackless           Compile coroutine bodies as C++20 coroutines (needs no stack switching; implies -std=c++20)\n"
               << "  --cpp                 Generate C++ source file and exit\n"
               << "  --minimal             Link base + package only; add std modules with --modules string,io,...\n"
               << "  --modules <a,b>       Link std modules (string,table,math,io,os,utf8,coroutine)\n"
@@ -419,6 +420,7 @@ int main(int argc, char* argv[])
     bool debug_mode = false;
     bool size_mode = true;
     bool emit_cpp = false;
+    bool stackless_mode = false;   // --stackless: coroutine forms for functions that call something that can yield
     bool minimal_active = false;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -492,6 +494,8 @@ int main(int argc, char* argv[])
             mode = BuildMode::Executable;
         } else if (arg == "--debug") {
             debug_mode = true;
+        } else if (arg == "--stackless") {
+            stackless_mode = true;
         } else if (arg == "--fast") {
             size_mode = false;
         } else if (arg == "--size") {
@@ -727,6 +731,7 @@ int main(int argc, char* argv[])
     //------------------ sequence in main (only referenced base functions get registered — and linked).
     std::set<std::string> all_referenced_globals;
     bool any_dynamic_env = false;
+    bool any_co_forms = false;   // some function has a coroutine form (C++20)
 
     for (const auto& input_file : input_files) {
         std::ifstream t(input_file);
@@ -757,6 +762,7 @@ int main(int argc, char* argv[])
         std::string module_name = p_input.stem().string();
 
         clx::AnalysisState analysis;
+        analysis.co_enabled = stackless_mode;
         clx::Optimizer optimizer(ctx, analysis);
         optimizer.run(ctx, root);
 
@@ -781,6 +787,7 @@ int main(int argc, char* argv[])
             std::cerr << e.what() << "\n";
             return 1;
         }
+        any_co_forms = any_co_forms || !analysis.co_lowered.empty();
         for (const auto& g : analysis.referenced_globals)
             all_referenced_globals.insert(g);
         any_dynamic_env = any_dynamic_env || analysis.uses_dynamic_env;
@@ -1233,22 +1240,22 @@ int main(int argc, char* argv[])
         }
 
         if (mode == BuildMode::Object) {
-            cmd = cc.cmd + " /nologo /c " + msvc_opt_flags + msvc_dce_cl + " /std:c++17" + include_opt + " "
+            cmd = cc.cmd + " /nologo /c " + msvc_opt_flags + msvc_dce_cl + (any_co_forms ? " /std:c++20" : " /std:c++17") + include_opt + " "
                 + all_cpp_files + cc_compile_str + fo_arg;
         } else if (mode == BuildMode::Static) {
             std::string lib_out = output_name;
             if (!(lib_out.size() >= 4 && lib_out.compare(lib_out.size() - 4, 4, ".lib") == 0))
                 lib_out += ".lib";
-            cmd = cc.cmd + " /nologo /c " + msvc_opt_flags + msvc_dce_cl + " /std:c++17" + include_opt + " "
+            cmd = cc.cmd + " /nologo /c " + msvc_opt_flags + msvc_dce_cl + (any_co_forms ? " /std:c++20" : " /std:c++17") + include_opt + " "
                 + all_cpp_files + cc_compile_str + fo_arg + " && " + librarian + " /nologo /OUT:\"" + lib_out
                 + "\" " + msvc_obj_files;
         } else {
-            cmd = cc.cmd + " /nologo " + msvc_opt_flags + msvc_dce_cl + " /std:c++17" + include_opt + cc_compile_str
+            cmd = cc.cmd + " /nologo " + msvc_opt_flags + msvc_dce_cl + (any_co_forms ? " /std:c++20" : " /std:c++17") + include_opt + cc_compile_str
                 + " " + all_cpp_files + fo_arg + lib_link + fe_arg + " " + msvc_dce_link + cc_link_str + msvc_stack;
         }
     } else {
         if (mode == BuildMode::Object)
-            cmd = cc.cmd + " -c " + opt_flags + gcc_dce_cl + " -std=c++17" + include_opt + " -fPIC " + all_cpp_files
+            cmd = cc.cmd + " -c " + opt_flags + gcc_dce_cl + (any_co_forms ? " -std=c++20" : " -std=c++17") + include_opt + " -fPIC " + all_cpp_files
                 + " -o \""
                 + (clx_work_dir() / (fs::path(input_files[0]).stem().string() + "_tmp.o")).string() + "\""
                 + cc_options_str;
@@ -1256,24 +1263,24 @@ int main(int argc, char* argv[])
             std::string ext = ".a";
             if (output_name.size() >= ext.size()
                 && output_name.compare(output_name.size() - ext.size(), ext.size(), ext) == 0)
-                cmd = cc.cmd + " -c " + opt_flags + gcc_dce_cl + " -std=c++17" + include_opt + " " + all_cpp_files
+                cmd = cc.cmd + " -c " + opt_flags + gcc_dce_cl + (any_co_forms ? " -std=c++20" : " -std=c++17") + include_opt + " " + all_cpp_files
                     + cc_options_str + " && ar rcs " + output_name + " " + obj_files;
             else
-                cmd = cc.cmd + " -c " + opt_flags + gcc_dce_cl + " -std=c++17" + include_opt + " " + all_cpp_files
+                cmd = cc.cmd + " -c " + opt_flags + gcc_dce_cl + (any_co_forms ? " -std=c++20" : " -std=c++17") + include_opt + " " + all_cpp_files
                     + cc_options_str + " && ar rcs " + output_name + ".a " + obj_files;
         } else {
 #ifdef _WIN32
             std::string ext = ".exe";
             if (output_name.size() >= ext.size()
                 && output_name.compare(output_name.size() - ext.size(), ext.size(), ext) == 0)
-                cmd = cc.cmd + " " + opt_flags + gcc_dce_cl + " -std=c++17" + include_opt + " " + all_cpp_files
+                cmd = cc.cmd + " " + opt_flags + gcc_dce_cl + (any_co_forms ? " -std=c++20" : " -std=c++17") + include_opt + " " + all_cpp_files
                     + cc_options_str + lib_link + gcc_stack + gcc_dce_link + gcc_strip_link + " -o " + output_name;
             else
-                cmd = cc.cmd + " " + opt_flags + gcc_dce_cl + " -std=c++17" + include_opt + " " + all_cpp_files
+                cmd = cc.cmd + " " + opt_flags + gcc_dce_cl + (any_co_forms ? " -std=c++20" : " -std=c++17") + include_opt + " " + all_cpp_files
                     + cc_options_str + lib_link + gcc_stack + gcc_dce_link + gcc_strip_link + " -o " + output_name
                     + ".exe";
 #else
-            cmd = cc.cmd + " " + opt_flags + gcc_dce_cl + " -std=c++17" + include_opt + " " + all_cpp_files
+            cmd = cc.cmd + " " + opt_flags + gcc_dce_cl + (any_co_forms ? " -std=c++20" : " -std=c++17") + include_opt + " " + all_cpp_files
 #ifdef __APPLE__
 
                 + cc_options_str + lib_link + gcc_dce_link + gcc_strip_link + " -o " + output_name;

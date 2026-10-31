@@ -19,6 +19,11 @@
 #include <memory>
 #include <utility>
 
+// the coroutine frame of a boxed lambda holds the lambda's shared_ptr: a type with internal linkage when the lambda is local to a translation unit
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic ignored "-Wsubobject-linkage"
+#endif
+
 namespace clx {
 
 template<class T> class CoTask;
@@ -104,8 +109,17 @@ template<class F> void set_co_form(const LValue &fn, F make) {
     };
 }
 
+//---------- with_co_form: set_co_form on a freshly created closure, returning it (the form an anonymous function expression is emitted as)
+template<class F> LValue with_co_form(LValue fn, F make) {
+    set_co_form(fn, std::move(make));
+    return fn;
+}
+
 //---------- co_call: call a function value from a coroutine form. A function with a coroutine form runs as a child coroutine (and may
 //---------- yield); any other callable runs to completion here.
+//---------- nesting limit of coroutine frames in one coroutine: Lua's own limit on nested Lua calls is of this order (LUAI_MAXSTACK is 1,000,000 slots)
+static constexpr uint32_t kCoMaxDepth = 200000;
+
 struct CoCall {
     LState *L;
     LValue fn;
@@ -119,6 +133,10 @@ struct CoCall {
         if (fn.type == Function) {
             LCFunction *f = static_cast<LCFunction *>(fn.as_pointer());
             if (f->co_invoke) {
+                LThread *t = L->running_thread;
+                if (t->co_depth >= kCoMaxDepth)
+                    error(L, "stack overflow");
+                ++t->co_depth;
                 child = f->co_invoke(f->co_box.get(), L, args, count);
                 return false;
             }
@@ -133,6 +151,7 @@ struct CoCall {
     }
     MultiValue await_resume() {
         if (!child) return std::move(ready);
+        --L->running_thread->co_depth;
         CoResult task = CoResult::adopt(child);   // destroys the child frame on scope exit
         child = nullptr;
         return task.await_resume();

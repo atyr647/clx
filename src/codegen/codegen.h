@@ -51,6 +51,9 @@ struct LocalVar {
         , is_boxed(boxed) { }
 };
 
+//------------------ analyze_stackless: decides which functions get a coroutine form and which calls in them are awaited (stackless.cpp)
+void analyze_stackless(const ASTContext &ctx, AnalysisState &state);
+
 //------------------ lookup_builtin: maps "module.func" to its clx:: CFunc symbol name, else nullptr
 const char *lookup_builtin(std::string_view module, std::string_view func);
 
@@ -134,6 +137,10 @@ private:
     //------------------ (alias call sites synthesize a temp node, so alias lowering shares one path)
     void emit_intrinsic_native_body(const ASTNode &node);
     void emitCallExpression(const ASTNode &node, uint32_t node_idx);
+    //------------------ emit_co_call: a call awaited inside a coroutine form (a yield, or a call that can yield)
+    void emit_co_call(const ASTNode &node, uint32_t node_idx, bool want_multi);
+    //------------------ emit_co_set: attaches the coroutine form of function `v_idx` to the closure value `target` (a named function)
+    void emit_co_set(const std::string &target, uint32_t v_idx, const std::string &raw_cell = "");
 
     //------------------ impl_call: call expression for a direct-callable's impl, deref-ing heap holder cells
     std::string impl_call(std::string_view fname);

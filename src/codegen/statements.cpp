@@ -719,7 +719,17 @@ void CodeEmitter::emitFunctionDef(const ASTNode &node, uint32_t node_idx) {
             site_ref = saved_site;
         }
     } emit_site_restore(emit_line, emit_site);
-    bool is_raw = state.emit_raw_lambda;
+    //------------------ is_co: the coroutine form of this function (include/clx_co.h): no closure wrapper, a CoResult lambda, co_return
+    bool is_co = state.emit_co_form;
+    state.emit_co_form = false;
+    //------------------ the body of a function nested in a coroutine form is not itself a coroutine body, whatever variant it is emitted as
+    struct CoBodyScope {
+        bool &ref;
+        bool saved;
+        CoBodyScope(bool &r) : ref(r), saved(r) { ref = false; }
+        ~CoBodyScope() { ref = saved; }
+    } co_body_scope(state.co_body);
+    bool is_raw = state.emit_raw_lambda || is_co;
     bool is_fast = state.emit_fast_lambda;
     bool is_multi = state.emit_multi_impl;
     bool is_native = state.emit_native_impl || is_multi;
@@ -899,6 +909,9 @@ void CodeEmitter::emitFunctionDef(const ASTNode &node, uint32_t node_idx) {
         return;
     }
 
+    const bool attach_co = !is_raw && !is_co && state.co_lowered.count(node_idx) > 0;
+    if (attach_co)
+        out << "clx::with_co_form(";
     if (!is_raw)
         out << "L->create_closure(";
     if (!state.ref_capture.empty()) {
@@ -906,7 +919,7 @@ void CodeEmitter::emitFunctionDef(const ASTNode &node, uint32_t node_idx) {
     } else {
         out << "[=]";
     }
-    out << "(clx::LState* L, const clx::LValue* args, size_t arg_count) mutable -> clx::MultiValue {\n";
+    out << "(clx::LState* L, const clx::LValue* args, size_t arg_count) mutable -> " << (is_co ? "clx::CoResult" : "clx::MultiValue") << " {\n";
     if (!state.raw_lambda_cell.empty()) {
         bool param_shadows = false;
         for (uint32_t pi = 0; pi < node.as.func_def.param_count; ++pi) {
@@ -1060,9 +1073,11 @@ void CodeEmitter::emitFunctionDef(const ASTNode &node, uint32_t node_idx) {
         locals.push_back({ vaname, vararg_cpp_name, false });
     }
 
+    state.co_body = is_co;
     if (node.as.func_def.body_block != 0xFFFFFFFF) {
         emit_node(node.as.func_def.body_block);
     }
+    state.co_body = false;
 
     locals.resize(prev_locals);
     state.native_numbers.resize(prev_native_count_for_params);
@@ -1079,7 +1094,7 @@ void CodeEmitter::emitFunctionDef(const ASTNode &node, uint32_t node_idx) {
     if (state.arena_table_sizes.count(node_idx))
         out << "clx::arena_reset(&_arena);\n";
     state.current_arena_func = saved_arena_func;
-    out << "return clx::MultiValue();\n";
+    out << (is_co ? "co_return clx::MultiValue();\n" : "return clx::MultiValue();\n");
     out << "}";
     if (!is_raw) {
         out << ", static_cast<clx::LTable*>(_ENV.as_pointer())";
@@ -1088,6 +1103,27 @@ void CodeEmitter::emitFunctionDef(const ASTNode &node, uint32_t node_idx) {
             out << ", " << cells;
         out << ")";
     }
+    if (attach_co) {
+        //------------------ the coroutine form of the same function, attached to the closure just created
+        out << ", ";
+        state.emit_co_form = true;
+        emitFunctionDef(node, node_idx);
+        out << ")";
+    }
+}
+
+//------------------ emit_co_set: attaches the coroutine form of function `v_idx` to the closure value `target` (a named function)
+void CodeEmitter::emit_co_set(const std::string &target, uint32_t v_idx, const std::string &raw_cell) {
+    std::string saved_cell = state.raw_lambda_cell;
+    bool saved_raw = state.emit_raw_lambda;
+    state.raw_lambda_cell = raw_cell;
+    out << "clx::set_co_form(" << target << ", ";
+    state.emit_co_form = true;
+    emit_node(v_idx);
+    out << ");\n";
+    state.emit_co_form = false;
+    state.emit_raw_lambda = saved_raw;
+    state.raw_lambda_cell = saved_cell;
 }
 
 //------------------ emitReturnStatement: handles NodeType::ReturnStatement
@@ -1095,6 +1131,57 @@ void CodeEmitter::emitReturnStatement(const ASTNode &node, uint32_t node_idx) {
     out << "#line " << node.line << " \"" << ctx.filename << "\"\n";
     uint32_t v_count = node.as.return_stmt.value_count;
     uint32_t first_v = node.as.return_stmt.first_value;
+
+    //------------------ the body of a coroutine form returns with co_return; a returned call that can yield is awaited
+    if (state.co_body) {
+        bool co_last_call = v_count > 0 && ctx.nodes[ctx.block_statements[first_v + v_count - 1]].type == NodeType::CallExpression;
+        bool co_vararg = false;
+        for (size_t i = 0; i < v_count; ++i)
+            if (ctx.nodes[ctx.block_statements[first_v + i]].type == NodeType::Vararg)
+                co_vararg = true;
+        out << "{\n";
+        if (!co_last_call && !co_vararg) {
+            out << "    size_t _rg_rbase = _fr.mark();\n";
+            out << "    clx::LValue _ret_args[" << std::max(1u, v_count) << "];\n";
+            for (size_t i = 0; i < v_count; ++i) {
+                out << "    _ret_args[" << i << "] = ";
+                emit_node(ctx.block_statements[first_v + i]);
+                out << ";\n";
+                out << "    _fr.push(_ret_args[" << i << "]);\n";
+            }
+            if (state.current_arena_func != 0xFFFFFFFF)
+                out << "    clx::arena_reset(&_arena);\n";
+            out << "    co_return clx::MultiValue(_ret_args, " << v_count << ", L);\n";
+        } else {
+            out << "    size_t _rg_rbase = _fr.mark();\n";
+            out << "    std::vector<clx::LValue> _ret_vals;\n";
+            for (size_t i = 0; i < v_count; ++i) {
+                uint32_t v_idx = ctx.block_statements[first_v + i];
+                if (i == v_count - 1 && (co_last_call || ctx.nodes[v_idx].type == NodeType::Vararg)) {
+                    state.expect_multivalue = true;
+                    out << "    clx::MultiValue _mret = ";
+                    emit_node(v_idx);
+                    out << ";\n";
+                    state.expect_multivalue = false;
+                    out << "    for (size_t m = 0; m < _mret.count; ++m) {\n";
+                    out << "        _ret_vals.push_back(_mret[m]);\n";
+                    out << "        _fr.push(_mret[m]);\n";
+                    out << "    }\n";
+                } else {
+                    out << "    clx::LValue _tmp_" << node_idx << "_" << i << " = ";
+                    emit_node(v_idx);
+                    out << ";\n";
+                    out << "    _ret_vals.push_back(_tmp_" << node_idx << "_" << i << ");\n";
+                    out << "    _fr.push(_tmp_" << node_idx << "_" << i << ");\n";
+                }
+            }
+            if (state.current_arena_func != 0xFFFFFFFF)
+                out << "    clx::arena_reset(&_arena);\n";
+            out << "    co_return clx::MultiValue(_ret_vals, L);\n";
+        }
+        out << "}\n";
+        return;
+    }
 
     //------------------ Frames unlink by RAII at return, so no restore is emitted here. The return
     //------------------ expression is evaluated with the full root set live (see return_root_restore.lua).

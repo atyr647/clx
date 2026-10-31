@@ -36,6 +36,7 @@ static CoResult sync_body(LState *L, LValue fn, std::vector<LValue> args) {
 void co_choose_kind(LThread *t, const LValue &func) {
     t->co_root = nullptr;
     t->co_leaf = nullptr;
+    t->co_depth = 0;
     LCFunction *f = (func.type == Function) ? static_cast<LCFunction *>(func.as_pointer()) : nullptr;
     if (f && f->co_invoke) {
         t->co_kind = 1;

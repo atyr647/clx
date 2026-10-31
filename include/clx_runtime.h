@@ -1441,6 +1441,8 @@ struct LThread : public LHeader {
     //---------- co_root/co_leaf: frame addresses of the root coroutine and of the innermost suspended one (where the next resume continues)
     void *co_root = nullptr;
     void *co_leaf = nullptr;
+    //---------- co_depth: how many coroutine frames are nested in the running chain (CoCall); a runaway recursion raises "stack overflow" instead of using up the heap
+    uint32_t co_depth = 0;
 #if defined(_WIN32)
     LPVOID fiber;
 #elif (defined(__APPLE__) || defined(__linux__)) && (defined(__aarch64__) || defined(__x86_64__))

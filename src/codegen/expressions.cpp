@@ -626,7 +626,124 @@ static const char *builtin_cfunc_target(const ASTContext &ctx, const AnalysisSta
 }
 
 //------------------ emitCallExpression: handles NodeType::CallExpression
+//------------------ emit_co_call: a call awaited inside a coroutine form. It is an immediately-invoked coroutine lambda that is awaited in place,
+//------------------ so the surrounding expression is evaluated by the enclosing coroutine and a yield suspends the whole chain of frames.
+void CodeEmitter::emit_co_call(const ASTNode &node, uint32_t node_idx, bool want_multi) {
+    uint32_t tgt = node.as.call_expr.target;
+    bool is_method_call = false;
+    if (ctx.nodes[tgt].type == NodeType::TableAccess) {
+        if (node.as.call_expr.arg_count > 0
+            && ctx.block_statements[node.as.call_expr.first_arg] == ctx.nodes[tgt].as.table_access.table)
+            is_method_call = true;
+    }
+    const bool is_yield = state.co_yield_calls.count(node_idx) > 0;
+    bool last_expands = false;
+    uint32_t last_arg = 0xFFFFFFFF;
+    if (node.as.call_expr.arg_count > 0) {
+        last_arg = ctx.block_statements[node.as.call_expr.first_arg + node.as.call_expr.arg_count - 1];
+        if (ctx.nodes[last_arg].type == NodeType::CallExpression || ctx.nodes[last_arg].type == NodeType::Vararg) {
+            if (!(is_method_call && node.as.call_expr.arg_count == 1))
+                last_expands = true;
+        }
+    }
+    bool call_name_short = is_method_call;
+    if (!call_name_short) {
+        if (ctx.nodes[tgt].type == NodeType::TableAccess)
+            call_name_short = true;
+        else if (ctx.nodes[tgt].type == NodeType::Identifier && ctx.nodes[tgt].as.ident.is_global)
+            call_name_short = true;
+    }
+
+    out << "(co_await [&]() -> clx::CoTask<" << (want_multi ? "clx::MultiValue" : "clx::LValue") << "> {\n";
+    out << "    size_t _ssave_call = _fr.mark();\n";
+    std::string _cs = emit_call_site(node.line, is_method_call, call_name_short);
+    if (is_method_call) {
+        out << "    clx::LValue _m_self = ";
+        emit_node(ctx.nodes[tgt].as.table_access.table);
+        out << ";\n";
+        out << "    _fr.push(_m_self);\n";
+        out << "    clx::LValue _m_func = clx::table_get(L, _m_self, ";
+        emit_node(ctx.nodes[tgt].as.table_access.key);
+        out << ");\n";
+        out << "    _fr.push(_m_func);\n";
+    }
+
+    std::string args_expr, count_expr;
+    if (last_expands) {
+        out << "    clx::DynArgs _dyn_buf(" << node.as.call_expr.arg_count << ");\n    size_t _dyn_count = 0;\n";
+        for (uint32_t i = 0; i + 1 < node.as.call_expr.arg_count; ++i) {
+            if (i > 0)
+                out << "    _fr.push(_dyn_buf[" << (i - 1) << "]);\n";
+            out << "    _dyn_buf[_dyn_count++] = ";
+            if (is_method_call && i == 0)
+                out << "_m_self";
+            else
+                emit_node(ctx.block_statements[node.as.call_expr.first_arg + i]);
+            out << ";\n";
+        }
+        state.expect_multivalue = true;
+        out << "    clx::MultiValue _mret = ";
+        emit_node(last_arg);
+        out << ";\n";
+        state.expect_multivalue = false;
+        out << "    _dyn_buf.reserve(_dyn_count + _mret.count);\n";
+        out << "    for (size_t _mi = 0; _mi < _mret.count; ++_mi) _dyn_buf[_dyn_count++] = _mret[_mi];\n";
+        out << "    for (size_t _mi = 0; _mi < _dyn_count; ++_mi) _fr.push(_dyn_buf[_mi]);\n";
+        args_expr = "static_cast<const clx::LValue *>(_dyn_buf)";
+        count_expr = "_dyn_count";
+    } else if (node.as.call_expr.arg_count > 0) {
+        out << "    clx::LValue args[" << node.as.call_expr.arg_count << "];\n";
+        for (uint32_t i = 0; i < node.as.call_expr.arg_count; ++i) {
+            if (i > 0)
+                out << "    _fr.push(args[" << (i - 1) << "]);\n";
+            out << "    args[" << i << "] = ";
+            if (is_method_call && i == 0)
+                out << "_m_self";
+            else
+                emit_node(ctx.block_statements[node.as.call_expr.first_arg + i]);
+            out << ";\n";
+        }
+        out << "    _fr.push(args[" << (node.as.call_expr.arg_count - 1) << "]);\n";
+        args_expr = "args";
+        count_expr = std::to_string(node.as.call_expr.arg_count);
+    } else {
+        args_expr = "nullptr";
+        count_expr = "0";
+    }
+
+    if (is_yield) {
+        out << "    clx::MultiValue _main_ret = co_await clx::co_yield_(L, " << args_expr << ", " << count_expr << ");\n";
+    } else if (state.co_pcall_calls.count(node_idx) && !is_method_call && (last_expands || node.as.call_expr.arg_count >= 1)) {
+        //------------------ pcall(f, ...): a yield inside f suspends the whole coroutine and continues after the resume
+        if (last_expands)
+            out << "    clx::MultiValue _main_ret = co_await clx::co_pcall(L, _dyn_buf[0], std::vector<clx::LValue>(_dyn_count > 1 ? &_dyn_buf[1] : nullptr, "
+                   "_dyn_count > 1 ? &_dyn_buf[0] + _dyn_count : nullptr));\n";
+        else
+            out << "    clx::MultiValue _main_ret = co_await clx::co_pcall(L, args[0], std::vector<clx::LValue>(args + 1, args + "
+                << node.as.call_expr.arg_count << "));\n";
+    } else {
+        out << "    clx::MultiValue _main_ret = co_await clx::co_call(L, ";
+        if (is_method_call)
+            out << "_m_func";
+        else
+            emit_node(tgt);
+        out << ", " << args_expr << ", " << count_expr << ", " << _cs << ");\n";
+    }
+    out << "    _fr.restore(_ssave_call);\n";
+    if (want_multi)
+        out << "    co_return _main_ret;\n";
+    else
+        out << "    co_return (_main_ret.count > 0) ? _main_ret[0] : clx::LValue();\n";
+    out << "}())";
+}
+
 void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
+    if (state.co_body && state.co_await_calls.count(node_idx)) {
+        bool want_multi_co = state.expect_multivalue;
+        state.expect_multivalue = false;
+        emit_co_call(node, node_idx, want_multi_co);
+        return;
+    }
     bool is_direct = false;
     bool is_fast = false;
     std::string_view fname;
