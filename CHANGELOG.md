@@ -25,11 +25,6 @@ The format is loosely based on Keep a Changelog and the project follows Semantic
 * `MultiValue::assign()`: reuses already-constructed inline slots when refilling a value (used for coroutine `resume_args`/`yield_args`)
 
 
-### Fixed
-
-* `coroutine.resume` (and a `coroutine.wrap` function) on a coroutine that is running or waiting on the one it resumed returned control into it and crashed; it now returns / raises "cannot resume non-suspended coroutine".
-* A collection that ran inside a coroutine skipped the main thread: its mark was never cleared, so objects held only by the main thread's frames (still young) were freed and their memory reused.
-
 ### Changed
 
 * New root-frame garbage-collector rooting model. The shadow stack is replaced by `RootRange`/`Frame`/`FrameGuard` regions: call args, returns, loader values, converted values, finalizers, sort comparators and fiber switches root through frames instead of per-value stack slots. Allocation-heavy programs spend less time rooting, and several rare use-after-free crashes are gone
@@ -49,6 +44,8 @@ The format is loosely based on Keep a Changelog and the project follows Semantic
 
 ### Fixed
 
+* `coroutine.resume` (and a `coroutine.wrap` function) on a coroutine that is running or waiting on the one it resumed returned control into it and crashed; it now returns / raises "cannot resume non-suspended coroutine".
+* A collection that ran inside a coroutine skipped the main thread: its mark was never cleared, so objects held only by the main thread's frames (still young) were freed and their memory reused.
 * Fixed return expressions evaluating after the frame was restored, integer flags desyncing after multi-assign, and call results being folded into integer-flag expressions
 * Fixed flow-reference checks for table constructors and intrinsic calls in arena analysis
 * Fixed finalizer and remembered-set handling during minor collections, and pinned byte accounting on array-churning tables
