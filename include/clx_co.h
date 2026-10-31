@@ -28,7 +28,43 @@ namespace clx {
 
 template<class T> class CoTask;
 
+//---------- coroutine frames come from per-size free lists: a call that can yield allocates and frees a frame each time, and the general
+//---------- allocator is the dominant cost of a short call. Frames of up to kCoPoolMax bytes are kept in bins of 64; larger ones use operator new.
+//---------- The runtime runs one LState on one thread, and a frame is freed on the thread that ran it.
+namespace co_detail {
+static constexpr size_t kCoPoolMax = 1024;
+struct CoFreeNode { CoFreeNode *next; };
+inline CoFreeNode *&co_bin(size_t n) {
+    static thread_local CoFreeNode *bins[kCoPoolMax / 64 + 1] = {};
+    return bins[(n + 63) / 64];
+}
+inline void *co_alloc(size_t n) {
+    if (n <= kCoPoolMax) {
+        CoFreeNode *&head = co_bin(n);
+        if (head) {
+            void *p = head;
+            head = head->next;
+            return p;
+        }
+        return ::operator new(((n + 63) / 64) * 64);
+    }
+    return ::operator new(n);
+}
+inline void co_free(void *p, size_t n) noexcept {
+    if (n <= kCoPoolMax) {
+        CoFreeNode *&head = co_bin(n);
+        CoFreeNode *node = static_cast<CoFreeNode *>(p);
+        node->next = head;
+        head = node;
+        return;
+    }
+    ::operator delete(p);
+}
+}   // namespace co_detail
+
 struct CoPromiseBase {
+    static void *operator new(size_t n) { return co_detail::co_alloc(n); }
+    static void operator delete(void *p, size_t n) noexcept { co_detail::co_free(p, n); }
     std::coroutine_handle<> cont {};   // the awaiting parent; empty for a root coroutine
     std::exception_ptr ex;
     std::suspend_always initial_suspend() noexcept { return {}; }
@@ -92,20 +128,14 @@ template<class T> CoTask<T> CoPromise<T>::get_return_object() {
 
 using CoResult = CoTask<MultiValue>;
 
-//---------- set_co_form: gives a function value its coroutine form. `make` is any callable (LState*, const LValue*, size_t) -> CoResult;
-//---------- the callable lives in a shared box, and every running coroutine of it holds the box (the function value may be collected mid-run)
-namespace co_detail {
-template<class F> CoResult run_boxed(std::shared_ptr<F> keep, LState *L, const LValue *args, size_t count) {
-    co_return co_await (*keep)(L, args, count);
-}
-}
+//---------- set_co_form: gives a function value its coroutine form. `make` is any callable (LState*, const LValue*, size_t) -> CoResult; it lives in a box
+//---------- owned by the function value. A coroutine started from it refers to the callable, so the function value must stay reachable while it runs:
+//---------- the awaiter of a call roots the callee (CoCallN), and a thread roots its body function.
 template<class F> void set_co_form(const LValue &fn, F make) {
     LCFunction *f = static_cast<LCFunction *>(fn.as_pointer());
-    // the box holds a shared_ptr<F>; each invocation copies it into the coroutine it starts (run_boxed), so the callable and its captures
-    // outlive the run even if the function value itself is collected
-    f->co_box = std::make_shared<std::shared_ptr<F>>(std::make_shared<F>(std::move(make)));
+    f->co_box = std::make_shared<F>(std::move(make));
     f->co_invoke = [](void *box, LState *L, const LValue *args, size_t count) -> void * {
-        return co_detail::run_boxed<F>(*static_cast<std::shared_ptr<F> *>(box), L, args, count).release();
+        return (*static_cast<F *>(box))(L, args, count).release();
     };
 }
 
@@ -161,6 +191,75 @@ inline CoCall co_call(LState *L, const LValue &fn, const LValue *args, size_t co
     return CoCall { L, fn, args, count, cs, {}, nullptr };
 }
 
+//---------- CoSite: a call-site descriptor with static storage that an expression can name (a statement cannot be declared in the middle of one)
+template<int Line, bool Method, bool Short, const char *File> struct CoSite {
+    static constexpr CallSite value { File, Line, Method, Short };
+};
+
+inline LValue co_first(MultiValue &&m) { return m.count > 0 ? m[0] : LValue(); }
+
+//---------- CoCallN<N>: an awaited call of a callee with N arguments, written as one expression: `co_await CoCallN<2>(L, fn, cs).a(x).a(y)`.
+//---------- The callee and the arguments live in `slot` as soon as they are evaluated, and `root` keeps them reachable for the collector from
+//---------- the first one on (an argument can allocate before the next is evaluated) until the call has returned. A callee with a coroutine form
+//---------- runs as a child coroutine, anything else runs to completion in await_ready.
+template<size_t N> struct CoCallN {
+    LState *L;
+    const CallSite *cs;
+    LValue slot[N + 1];   // slot[0]: the callee, slot[1..N]: the arguments
+    RootRange root;
+    size_t n = 0;
+    MultiValue ready;
+    void *child = nullptr;
+
+    CoCallN(LState *L_, const LValue &fn, const CallSite *cs_)
+        : L(L_)
+        , cs(cs_)
+        , root(L_, slot, N + 1) {
+        slot[0] = fn;
+    }
+    CoCallN(const CoCallN &) = delete;
+    CoCallN &a(const LValue &v) {
+        slot[1 + n++] = v;
+        return *this;
+    }
+    // a method call: the receiver is evaluated once, it is the first argument, and the callee is looked up in it
+    CoCallN &method(const LValue &recv, const LValue &key) {
+        slot[1] = recv;
+        n = 1;
+        slot[0] = table_get(L, recv, key);
+        return *this;
+    }
+
+    bool await_ready() {
+        if (slot[0].type == Function) {
+            LCFunction *f = static_cast<LCFunction *>(slot[0].as_pointer());
+            if (f->co_invoke) {
+                LThread *t = L->running_thread;
+                if (t->co_depth >= kCoMaxDepth)
+                    error(L, "stack overflow");
+                ++t->co_depth;
+                child = f->co_invoke(f->co_box.get(), L, &slot[1], n);
+                return false;
+            }
+        }
+        ready = call_function_rooted(L, slot[0], &slot[1], n, cs);
+        return true;
+    }
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<> parent) {
+        auto c = std::coroutine_handle<CoPromise<MultiValue>>::from_address(child);
+        c.promise().cont = parent;
+        return c;
+    }
+    MultiValue await_resume() {
+        if (!child)
+            return std::move(ready);
+        --L->running_thread->co_depth;
+        CoResult task = CoResult::adopt(child);   // destroys the child frame on scope exit
+        child = nullptr;
+        return task.await_resume();
+    }
+};
+
 //---------- co_yield_: coroutine.yield from a coroutine form
 struct CoYield {
     LState *L;
@@ -171,6 +270,30 @@ struct CoYield {
     MultiValue await_resume();                        // costack.cpp
 };
 CoYield co_yield_(LState *L, const LValue *args, size_t count);
+
+//---------- CoYieldN<N>: `co_await CoYieldN<2>(L).a(x).a(y)` is coroutine.yield(x, y); the awaited value is what the next resume passes
+template<size_t N> struct CoYieldN {
+    LState *L;
+    LValue slot[N ? N : 1];
+    RootRange root;
+    size_t n = 0;
+    CoYield inner { nullptr, nullptr, 0 };
+
+    explicit CoYieldN(LState *L_)
+        : L(L_)
+        , root(L_, slot, N ? N : 1) { }
+    CoYieldN(const CoYieldN &) = delete;
+    CoYieldN &a(const LValue &v) {
+        slot[n++] = v;
+        return *this;
+    }
+    bool await_ready() {
+        inner = co_yield_(L, slot, n);   // raises when this thread cannot yield here
+        return false;
+    }
+    void await_suspend(std::coroutine_handle<> h) { inner.await_suspend(h); }
+    MultiValue await_resume() { return inner.await_resume(); }
+};
 
 //---------- co_pcall: pcall from a coroutine form; a yield inside the called function suspends the whole coroutine and continues after resume
 inline CoResult co_pcall(LState *L, LValue fn, std::vector<LValue> args) {

@@ -107,6 +107,8 @@ static void gc_dispose_swept(LState *L, LHeader *curr) {
         f->env = nullptr;
         f->self_ref = LValue();
         f->gc_cells.clear();
+        f->co_invoke = nullptr;   // a recycled function must not keep the coroutine form of its previous life
+        f->co_box.reset();
         f->next = L->free_functions;
         L->free_functions = f;
     } else if (curr->type == static_cast<uint8_t>(Thread)) {

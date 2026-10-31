@@ -654,6 +654,47 @@ void CodeEmitter::emit_co_call(const ASTNode &node, uint32_t node_idx, bool want
             call_name_short = true;
     }
 
+    //------------------ no trailing multi-value expansion and not pcall: one expression, no lambda and no coroutine frame of its own (CoCallN)
+    if (!last_expands && !state.co_pcall_calls.count(node_idx)) {
+        const uint32_t na = node.as.call_expr.arg_count;
+        const bool nameshort = call_name_short;
+        if (!want_multi)
+            out << "clx::co_first(";
+        out << "(co_await ";
+        if (is_yield) {
+            out << "clx::CoYieldN<" << na << ">(L)";
+            for (uint32_t i = 0; i < na; ++i) {
+                out << ".a(";
+                emit_node(ctx.block_statements[node.as.call_expr.first_arg + i]);
+                out << ")";
+            }
+        } else {
+            out << "clx::CoCallN<" << na << ">(L, ";
+            if (is_method_call)
+                out << "clx::LValue()";
+            else
+                emit_node(tgt);
+            out << ", &clx::CoSite<" << node.line << ", " << (is_method_call ? "true" : "false") << ", " << (nameshort ? "true" : "false")
+                << ", _clx_src>::value)";
+            if (is_method_call) {
+                out << ".method(";
+                emit_node(ctx.nodes[tgt].as.table_access.table);
+                out << ", ";
+                emit_node(ctx.nodes[tgt].as.table_access.key);
+                out << ")";
+            }
+            for (uint32_t i = is_method_call ? 1 : 0; i < na; ++i) {
+                out << ".a(";
+                emit_node(ctx.block_statements[node.as.call_expr.first_arg + i]);
+                out << ")";
+            }
+        }
+        out << ")";
+        if (!want_multi)
+            out << ")";
+        return;
+    }
+
     out << "(co_await [&]() -> clx::CoTask<" << (want_multi ? "clx::MultiValue" : "clx::LValue") << "> {\n";
     out << "    size_t _ssave_call = _fr.mark();\n";
     std::string _cs = emit_call_site(node.line, is_method_call, call_name_short);

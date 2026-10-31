@@ -665,8 +665,10 @@ void CodeEmitter::emit(uint32_t root_node, std::string_view module_name) {
     }
 
     out << "#include <clx.h>\n";
-    if (!state.co_lowered.empty())
+    if (!state.co_lowered.empty()) {
         out << "#include <clx_co.h>\n";   // coroutine forms (C++20; the driver selects the standard)
+        out << "static constexpr char _clx_src[] = \"" << ctx.filename << "\";   // the source file of the call-site descriptors clx::CoSite names\n";
+    }
     out << "#include <atomic>\n\n";
     if (!native_registry().empty()) {   // the natives manifest's C functions (clx --natives)
         for (const auto &ne : native_registry()) {
