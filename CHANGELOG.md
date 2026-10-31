@@ -10,6 +10,7 @@ The format is loosely based on Keep a Changelog and the project follows Semantic
 
 ### Added
 
+* `--stackless`: coroutine forms. A function that calls something that may yield (`coroutine.yield`, `pcall`, a method, a field or a parameter, or a known function that may) also gets a C++20 coroutine form that the ordinary form stays beside; a call in a statement, an assignment or local declaration, a returned value or an argument of another awaited call is awaited, so a yield suspends the chain of frames and a resume continues the innermost one, and no stack is switched. It is how coroutines run on a target with no stacks to switch (`-DCLX_STACKLESS_ONLY`, selected automatically on WebAssembly without stack switching, and a build option of the same name). A call that is certain to yield where it cannot be awaited (an `if` condition, a loop bound, an operand, a table constructor) is reported with `CLX_STACKLESS_DIAG=1` and raises Lua's "attempt to yield across a C-call boundary" if it runs under a coroutine; nesting of coroutine frames is limited to 200000 ("stack overflow"). On WebAssembly compile with `-mtail-call`. `tests/stackless/oracle.sh` runs programs with fibers and with the stackless-only build and compares the output.
 * Incremental major collection. A full collection is a cycle the program advances between allocations (scan, roots, incremental marking behind a write barrier, one short atomic pause, incremental sweep) instead of one pause over the whole heap; `collectgarbage("startmajor")` begins one, `"step"` advances it, `"stats"` reports `cycles`, `major_steps`, `major_step_max_ms`, `atomic_max_ms` and `phase`, and `collectgarbage("param", "incmajor", 0)` (or `CLX_GC_INCREMENTAL=0`) restores the single pause. No minor collection runs during a cycle. `CLX_GC_VERIFY=1` and `CLX_GC_STRESS_INCR=n` check the barrier.
 * Error positions inside multi-line statements: a call, index or operator that starts on a different line than its statement reports its own line, as Lua does. `os.exit` flushes buffered output and accepts a boolean.
 * WebAssembly (wasm32-wasip3) target, coroutines on WebAssembly stack switching and a stackless coroutine runtime, native numeric arrays and direct engine calls (`--natives`), Lua local scoping fixes, tiered loading of changed modules, and `collectgarbage("minor")` / `param` options for programs that drive the collector from their frame loop.
@@ -22,6 +23,12 @@ The format is loosely based on Keep a Changelog and the project follows Semantic
 * MinGW and clang-cl toolchain support on Windows, with `CLX_CXX` dialect selection documented in the CLI reference
 * `MultiValue` primitive constructors (`int64_t`/`bool`, `(bool, LValue)`, 3x`int64_t`) and in-place `push_back` overloads: single-value returns construct directly with no `LValue` temporary, and result lists grow in the inline slots instead of detouring through a `std::vector`
 * `MultiValue::assign()`: reuses already-constructed inline slots when refilling a value (used for coroutine `resume_args`/`yield_args`)
+
+
+### Fixed
+
+* `coroutine.resume` (and a `coroutine.wrap` function) on a coroutine that is running or waiting on the one it resumed returned control into it and crashed; it now returns / raises "cannot resume non-suspended coroutine".
+* A collection that ran inside a coroutine skipped the main thread: its mark was never cleared, so objects held only by the main thread's frames (still young) were freed and their memory reused.
 
 ### Changed
 
