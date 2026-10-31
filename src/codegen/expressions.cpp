@@ -572,6 +572,14 @@ void CodeEmitter::emitIntrinsicCall(const ASTNode &node, uint32_t node_idx) {
 }
 
 //------------------ impl_call: call expression for a direct-callable's impl; heap holder cells are deref-ed
+//------------------ self_impl_call: the callable of a direct call. Inside the body of the function being called (a recursive call) it is the callable of the function value the body already reaches through its cell (l_<fname>):
+//------------------ naming _impl_<fname> there would capture the shared holder in the lambda the holder owns, a reference cycle that is never freed.
+std::string CodeEmitter::self_impl_call(std::string_view fname, uint32_t node_idx) {
+    if (state.self_func_def != 0xFFFFFFFFu && fname == state.raw_lambda_cell && owner_of_node(state, node_idx) == state.self_func_def)
+        return "static_cast<clx::LCFunction*>(l_" + std::string(fname) + ".as_pointer())->func";
+    return impl_call(fname);
+}
+
 std::string CodeEmitter::impl_call(std::string_view fname) {
     if (state.holder_cell_callables.count(fname))
         return "(*_impl_" + std::string(fname) + ")";
@@ -979,7 +987,7 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
         out << "    for (size_t _mi = 0; _mi < _dyn_count; ++_mi) _fr.push(_dyn_buf[_mi]);\n";
 
         if (is_direct) {
-            out << "    const clx::CFunctionType &_gc_self = " << impl_call(fname) << ";\n";
+            out << "    const clx::CFunctionType &_gc_self = " << self_impl_call(fname, node_idx) << ";\n";
             out << "    clx::MultiValue _main_ret = clx::call_cfunc_direct(L, _gc_self, _dyn_buf, _dyn_count, "
                 << _cs << ");\n";
         } else if (!is_method_call && node.as.call_expr.target < ctx.nodes.size()
@@ -1125,7 +1133,7 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
                 out << "    }\n";
                 out << "    _fr.restore(_ssaved);\n";
             } else if (is_direct) {
-                out << "    const clx::CFunctionType &_gc_self = " << impl_call(fname) << ";\n";
+                out << "    const clx::CFunctionType &_gc_self = " << self_impl_call(fname, node_idx) << ";\n";
                 out << "    clx::MultiValue _main_ret = clx::call_cfunc_direct(L, _gc_self, args, "
                     << node.as.call_expr.arg_count << ", " << _cs << ");\n";
             } else if (!is_method_call && node.as.call_expr.target < ctx.nodes.size()
@@ -1169,7 +1177,7 @@ void CodeEmitter::emitCallExpression(const ASTNode &node, uint32_t node_idx) {
             }
         } else {
             if (is_direct) {
-                out << "    const clx::CFunctionType &_gc_self = " << impl_call(fname) << ";\n";
+                out << "    const clx::CFunctionType &_gc_self = " << self_impl_call(fname, node_idx) << ";\n";
                 out << "    clx::MultiValue _main_ret = clx::call_cfunc_rooted(L, _gc_self, nullptr, 0, "
                     << _cs << ");\n";
             } else if (!is_method_call && node.as.call_expr.target < ctx.nodes.size()

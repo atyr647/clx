@@ -483,7 +483,10 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                 if (mixed)
                                     state.generic_body_func = v_idx;
                                 state.emit_raw_lambda = true;
+                                const uint32_t _prev_self = state.self_func_def;
+                                state.self_func_def = v_idx;
                                 emit_node(v_idx);
+                                state.self_func_def = _prev_self;
                                 state.emit_raw_lambda = false;
                                 state.generic_body_func = _prev_gbf;
                                 state.raw_lambda_cell = saved_raw_cell;
@@ -807,7 +810,10 @@ void CodeEmitter::emitAssignmentLike(const ASTNode &node, uint32_t node_idx) {
                                 if (mixed)
                                     state.generic_body_func = v_idx;
                                 state.emit_raw_lambda = true;
+                                const uint32_t _prev_self = state.self_func_def;
+                                state.self_func_def = v_idx;
                                 emit_node(v_idx);
+                                state.self_func_def = _prev_self;
                                 state.emit_raw_lambda = false;
                                 state.generic_body_func = _prev_gbf;
                                 out << ";\n";

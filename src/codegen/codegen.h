@@ -144,6 +144,7 @@ private:
 
     //------------------ impl_call: call expression for a direct-callable's impl, deref-ing heap holder cells
     std::string impl_call(std::string_view fname);
+    std::string self_impl_call(std::string_view fname, uint32_t node_idx);
     //------------------ hoisted_table_ptr: header pointer for a hoisted index-base local, else ""; callers emit the checked path.
     std::string hoisted_table_ptr(uint32_t table_idx);
 

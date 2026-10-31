@@ -172,6 +172,7 @@ struct AnalysisState {
     std::string_view current_fast_func;
     std::string ref_capture;
     std::string raw_lambda_cell;
+    uint32_t self_func_def = 0xFFFFFFFF;   // the FunctionDef whose body is being emitted into _impl_<raw_lambda_cell>: a direct call to that function from its own body goes through its function value (naming _impl_ there would make the body own itself)
     std::set<std::string_view> holder_cell_callables;
     std::map<std::pair<uint32_t, std::string_view>, bool> register_friendly_locals;
     uint32_t current_func_body = 0xFFFFFFFF;

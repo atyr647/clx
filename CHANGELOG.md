@@ -44,6 +44,8 @@ The format is loosely based on Keep a Changelog and the project follows Semantic
 * C++17 conformance: `using enum` in the lexer/parser is replaced by qualified enumerators, and two lambdas no longer capture structured bindings. The build is warning-free under the pinned C++17 standard
 
 ### Fixed
+
+* A recursive local function that can yield leaked its closure when the state was closed: the function's own body named the shared holder of its callable for the recursive call, so the holder owned a lambda that owned the holder. The recursive call now goes through the running function. `tests/stackless/leak/run.sh` ends a program inside such a function (AddressSanitizer, leak check on).
 * The first table allocation of a state computed `nullptr + sizeof(LTable)` (undefined behaviour, reported by UBSan); the room left in the slab is now a difference.
 
 * `coroutine.resume` (and a `coroutine.wrap` function) on a coroutine that is running or waiting on the one it resumed returned control into it and crashed; it now returns / raises "cannot resume non-suspended coroutine".
